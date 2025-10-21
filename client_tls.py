@@ -353,11 +353,39 @@ class TLSSecureMessenger:
             self.log_message(f"Channel key derivation error: {e}")
             return None
     
-    def derive_message_key(self, master_key, nonce):
-        """Derive message-specific key from user's own master key"""
+    def derive_channel_key_symmetric(self, user1, user2):
+        """Derive a symmetric channel key using only usernames - no master token needed"""
         try:
-            # Create unique salt from message nonce
-            salt_data = f"{self.username}:{nonce}".encode()
+            # Sort usernames alphabetically to ensure both users derive the same key
+            users = sorted([user1, user2])
+            # Create deterministic salt from usernames only
+            channel_salt = f"channel:{users[0]}:{users[1]}".encode()
+            # Create a fixed base key derived from the channel salt itself
+            # This ensures both parties can independently compute the same key
+            base_key = hashlib.sha256(channel_salt).digest()
+            
+            # Derive final channel key using HKDF with the base key
+            channel_key = HKDF(
+                base_key,
+                32,  # 256-bit key
+                channel_salt,
+                SHA256,
+                context=b'pager_symmetric_channel'
+            )
+            return channel_key
+        except Exception as e:
+            self.log_message(f"Symmetric channel key derivation error: {e}")
+            return None
+    
+    def derive_message_key(self, master_key, nonce, sender=None):
+        """Derive message-specific key from master key and message metadata"""
+        try:
+            # Create unique salt from message nonce and optionally sender name
+            # If sender is provided, include it so different senders have different keys
+            if sender:
+                salt_data = f"{sender}:{nonce}".encode()
+            else:
+                salt_data = f"{self.username}:{nonce}".encode()
             
             # Use HKDF to derive message key from master key
             # Signature: HKDF(master, key_len, salt, hashmod, num_keys=1, context=None)
@@ -440,7 +468,11 @@ class TLSSecureMessenger:
         return False
             
     def encrypt_message_advanced(self, message, recipient_username, sender_master_token=None):
-        """Double encryption: sender's master token + recipient's channel key"""
+        """Hybrid encryption: AES for message + RSA for key exchange
+        
+        Layer 1: Encrypt message with sender's master token-derived key (AES-256-GCM)
+        Layer 2: Encrypt the AES key with receiver's RSA public key (PKCS1-OAEP)
+        """
         try:
             # Validate sender's master token
             if not sender_master_token:
@@ -457,7 +489,7 @@ class TLSSecureMessenger:
             message_nonce = self.generate_message_nonce()
             
             # Derive message-specific key from sender's master key
-            sender_message_key = self.derive_message_key(sender_master_key, message_nonce)
+            sender_message_key = self.derive_message_key(sender_master_key, message_nonce, sender=self.username)
             if not sender_message_key:
                 SecureMemory.secure_clear(sender_master_key)
                 return None
@@ -473,45 +505,50 @@ class TLSSecureMessenger:
             
             message_json = json.dumps(message_with_metadata)
             
-            # LAYER 1: Encrypt with sender's key (for sender's authentication)
-            layer1_encrypted = self.encrypt_with_aes_gcm(message_json, sender_message_key)
-            if not layer1_encrypted:
+            # LAYER 1: Encrypt message with sender's AES key (AES-256-GCM)
+            aes_encrypted = self.encrypt_with_aes_gcm(message_json, sender_message_key)
+            if not aes_encrypted:
                 SecureMemory.secure_clear(sender_master_key)
                 SecureMemory.secure_clear(sender_message_key)
                 return None
             
-            # Derive a channel key that receiver can compute
-            # Use a deterministic derivation based on usernames (sorted alphabetically)
-            channel_key = self.derive_channel_key(sender_master_key, self.username, recipient_username)
-            
-            # LAYER 2: Encrypt layer1 with channel key (for receiver access)
-            layer1_json = json.dumps(layer1_encrypted)
-            layer2_encrypted = self.encrypt_with_aes_gcm(layer1_json, channel_key)
-            
-            if not layer2_encrypted:
+            # Get recipient's public key for RSA encryption of the AES key
+            recipient_public_key = self.get_public_key_tls(recipient_username)
+            if not recipient_public_key:
+                self.log_message(f"❌ Could not get public key for {recipient_username}")
                 SecureMemory.secure_clear(sender_master_key)
                 SecureMemory.secure_clear(sender_message_key)
-                SecureMemory.secure_clear(channel_key)
                 return None
             
-            self.log_message(f"🔐 Using double-layer AES-256-GCM encryption")
+            # LAYER 2: Encrypt the AES key with recipient's RSA public key (PKCS1-OAEP)
+            try:
+                rsa_cipher = PKCS1_OAEP.new(recipient_public_key)
+                encrypted_aes_key = rsa_cipher.encrypt(sender_message_key)
+                encrypted_aes_key_b64 = base64.b64encode(encrypted_aes_key).decode()
+            except Exception as e:
+                self.log_message(f"RSA encryption error: {e}")
+                SecureMemory.secure_clear(sender_master_key)
+                SecureMemory.secure_clear(sender_message_key)
+                return None
+            
+            self.log_message(f"🔐 Using hybrid RSA+AES-256-GCM encryption")
             
             # Package everything
-            aes_payload = {
-                "encrypted_message": layer2_encrypted,  # Double encrypted
-                "method": "double_aes_gcm",
+            hybrid_payload = {
+                "encrypted_message": aes_encrypted,  # AES-256-GCM encrypted message
+                "encrypted_key": encrypted_aes_key_b64,  # RSA encrypted AES key
+                "method": "hybrid_rsa_aes_gcm",
                 "sender": self.username,
                 "recipient": recipient_username,
                 "nonce": message_nonce,
-                "version": "3.1"
+                "version": "4.0"
             }
             
             # Clear keys from memory
             SecureMemory.secure_clear(sender_master_key)
             SecureMemory.secure_clear(sender_message_key)
-            SecureMemory.secure_clear(channel_key)
             
-            return json.dumps(aes_payload)
+            return json.dumps(hybrid_payload)
             
         except Exception as e:
             self.log_message(f"Encryption error: {e}")
@@ -534,15 +571,33 @@ class TLSSecureMessenger:
                     payload = json.loads(encrypted_payload)
                     method = payload.get("method", "unknown")
                     
-                    if method == "pure_aes_gcm":
+                    if method == "hybrid_rsa_aes_gcm":
+                        # New RSA+AES hybrid method
+                        return self._decrypt_hybrid_rsa_aes(payload, master_key)
+                    elif method == "pure_aes_gcm":
+                        return self._decrypt_pure_aes_gcm(payload, master_key)
+                    elif method == "double_aes_gcm":
+                        # Double-layer AES-GCM encryption (old format)
                         return self._decrypt_pure_aes_gcm(payload, master_key)
                     elif method == "advanced_hybrid_aes_gcm_rsa":
                         # Legacy RSA support (will show compatibility warning)
                         self.log_message("⚠️  Decrypting legacy RSA message - consider upgrading")
                         return self._decrypt_advanced_hybrid(payload)
                     else:
-                        # Fallback to legacy methods
-                        return self._decrypt_hybrid_legacy(payload)
+                        # Try to auto-detect format
+                        # Check if it looks like hybrid RSA+AES format
+                        if "encrypted_key" in payload and "encrypted_message" in payload and isinstance(payload["encrypted_message"], dict):
+                            return self._decrypt_hybrid_rsa_aes(payload, master_key)
+                        # Check if it looks like new pure_aes_gcm format
+                        elif "encrypted_message" in payload and "sender" in payload and "recipient" in payload:
+                            return self._decrypt_pure_aes_gcm(payload, master_key)
+                        # Check if it looks like legacy RSA format
+                        elif "encrypted_key" in payload and "iv" in payload:
+                            return self._decrypt_hybrid_legacy(payload)
+                        else:
+                            self.log_message(f"⚠️  Unknown encryption method: {method}")
+                            # Fallback to legacy methods
+                            return self._decrypt_hybrid_legacy(payload)
                 except json.JSONDecodeError:
                     return "[INVALID PAYLOAD FORMAT]"
             
@@ -551,12 +606,16 @@ class TLSSecureMessenger:
         except Exception as e:
             self.log_message(f"Advanced decryption error: {e}")
             return "[DECRYPTION FAILED]"
-            
-    def _decrypt_pure_aes_gcm(self, payload, master_key):
-        """Decrypt double-encrypted AES-GCM message using receiver's master token"""
+    
+    def _decrypt_hybrid_rsa_aes(self, payload, master_key):
+        """Decrypt hybrid RSA+AES encrypted message
+        
+        Layer 2: RSA decrypt the AES key using receiver's private key
+        Layer 1: AES decrypt the message using the recovered AES key
+        """
         try:
             # Validate payload structure
-            required_fields = ["encrypted_message", "sender", "recipient", "nonce"]
+            required_fields = ["encrypted_key", "encrypted_message", "sender", "recipient", "nonce"]
             for field in required_fields:
                 if field not in payload:
                     return f"[MISSING FIELD: {field}]"
@@ -569,40 +628,37 @@ class TLSSecureMessenger:
             if recipient != self.username:
                 return f"[MESSAGE NOT FOR YOU: intended for {recipient}]"
             
-            # LAYER 2 DECRYPTION: Derive channel key (same as sender used)
-            channel_key = self.derive_channel_key(master_key, sender, recipient)
-            if not channel_key:
-                return "[CHANNEL KEY DERIVATION FAILED]"
+            # LAYER 2: Decrypt the AES key using our RSA private key
+            try:
+                encrypted_aes_key = base64.b64decode(payload["encrypted_key"])
+                rsa_cipher = PKCS1_OAEP.new(self.private_key)
+                aes_key = rsa_cipher.decrypt(encrypted_aes_key)
+            except ValueError as e:
+                self.log_message(f"RSA decryption error: {e}")
+                return "[RSA DECRYPTION FAILED - Could not decrypt AES key]"
+            except Exception as e:
+                self.log_message(f"RSA decryption error: {e}")
+                return f"[RSA DECRYPTION FAILED: {e}]"
             
-            # Decrypt layer 2 to get layer 1 encrypted data
+            # LAYER 1: Decrypt the message using the recovered AES key
             encrypted_msg_data = payload["encrypted_message"]
             if not isinstance(encrypted_msg_data, dict):
-                SecureMemory.secure_clear(channel_key)
+                SecureMemory.secure_clear(aes_key)
                 return "[INVALID AES-GCM DATA FORMAT]"
             
-            layer1_json = self.decrypt_with_aes_gcm(encrypted_msg_data, channel_key)
-            SecureMemory.secure_clear(channel_key)
-            
-            if not layer1_json:
-                return "[LAYER 2 DECRYPTION FAILED]"
-            
-            # Parse layer 1 data
-            layer1_encrypted = json.loads(layer1_json)
-            
-            # LAYER 1 DECRYPTION: Derive sender's message key
-            sender_message_key = self.derive_message_key(master_key, message_nonce)
-            if not sender_message_key:
-                return "[MESSAGE KEY DERIVATION FAILED]"
-            
-            # Decrypt layer 1 to get original message
-            decrypted_json = self.decrypt_with_aes_gcm(layer1_encrypted, sender_message_key)
-            SecureMemory.secure_clear(sender_message_key)
+            decrypted_json = self.decrypt_with_aes_gcm(encrypted_msg_data, aes_key)
+            SecureMemory.secure_clear(aes_key)
             
             if not decrypted_json:
-                return "[LAYER 1 DECRYPTION FAILED - Message may have been tampered with]"
+                self.log_message("⚠️  Failed to decrypt message - AES authentication failed")
+                return "[AES DECRYPTION FAILED - Message may have been tampered with]"
             
             # Parse decrypted message
-            message_data = json.loads(decrypted_json)
+            try:
+                message_data = json.loads(decrypted_json)
+            except json.JSONDecodeError as je:
+                self.log_message(f"JSON parsing error: {je}")
+                return "[MESSAGE DATA CORRUPT]"
             
             # Verify timestamp (prevent replay attacks)
             msg_timestamp = message_data.get("timestamp", 0)
@@ -621,7 +677,86 @@ class TLSSecureMessenger:
             self.log_message(f"JSON parsing error: {e}")
             return "[INVALID MESSAGE FORMAT]"
         except Exception as e:
-            self.log_message(f"Double AES-GCM decryption error: {e}")
+            self.log_message(f"Hybrid RSA+AES decryption error: {e}")
+            return f"[DECRYPTION FAILED: {e}]"
+            
+    def _decrypt_pure_aes_gcm(self, payload, master_key):
+        """Decrypt double-encrypted AES-GCM message using receiver's master token"""
+        try:
+            # Validate payload structure
+            required_fields = ["encrypted_message", "sender", "recipient", "nonce"]
+            for field in required_fields:
+                if field not in payload:
+                    return f"[MISSING FIELD: {field}]"
+            
+            sender = payload["sender"]
+            recipient = payload["recipient"]
+            message_nonce = payload["nonce"]
+            
+            # Verify this message is for us
+            if recipient != self.username:
+                return f"[MESSAGE NOT FOR YOU: intended for {recipient}]"
+            
+            # LAYER 2 DECRYPTION: Derive symmetric channel key from usernames
+            # Both sender and receiver can independently compute this key
+            channel_key = self.derive_channel_key_symmetric(sender, recipient)
+            if not channel_key:
+                return "[CHANNEL KEY DERIVATION FAILED]"
+            
+            # Decrypt layer 2 to get layer 1 encrypted data
+            encrypted_msg_data = payload["encrypted_message"]
+            if not isinstance(encrypted_msg_data, dict):
+                SecureMemory.secure_clear(channel_key)
+                return "[INVALID AES-GCM DATA FORMAT]"
+            
+            layer1_json = self.decrypt_with_aes_gcm(encrypted_msg_data, channel_key)
+            SecureMemory.secure_clear(channel_key)
+            
+            if not layer1_json:
+                return "[LAYER 2 DECRYPTION FAILED]"
+            
+            # Parse layer 1 data
+            layer1_encrypted = json.loads(layer1_json)
+            
+            # LAYER 1 DECRYPTION: Derive message key using receiver's master key
+            # The sender included their name in the key derivation, so we can reconstruct it
+            sender_message_key = self.derive_message_key(master_key, message_nonce, sender=sender)
+            if not sender_message_key:
+                return "[MESSAGE KEY DERIVATION FAILED]"
+            
+            # Decrypt layer 1 to get original message
+            decrypted_json = self.decrypt_with_aes_gcm(layer1_encrypted, sender_message_key)
+            SecureMemory.secure_clear(sender_message_key)
+            
+            if not decrypted_json:
+                self.log_message("⚠️  Failed to decrypt layer 1 - master token may be incorrect")
+                return "[LAYER 1 DECRYPTION FAILED - Master token may be incorrect]"
+            
+            # Parse decrypted message
+            try:
+                message_data = json.loads(decrypted_json)
+            except json.JSONDecodeError as je:
+                self.log_message(f"JSON parsing error in layer 1: {je}")
+                return "[MESSAGE DATA CORRUPT]"
+            
+            # Verify timestamp (prevent replay attacks)
+            msg_timestamp = message_data.get("timestamp", 0)
+            current_time = time.time()
+            if abs(current_time - msg_timestamp) > 3600:  # 1 hour window
+                return "[MESSAGE EXPIRED - Potential replay attack detected]"
+            
+            # Verify sender matches
+            if message_data.get("sender") != sender:
+                return "[SENDER MISMATCH - Potential forgery attempt]"
+            
+            # Return the actual message content
+            return message_data["content"]
+            
+        except json.JSONDecodeError as e:
+            self.log_message(f"JSON parsing error: {e}")
+            return "[INVALID MESSAGE FORMAT]"
+        except Exception as e:
+            self.log_message(f"AES-GCM decryption error: {e}")
             return f"[DECRYPTION FAILED: {e}]"
             return message_data["content"]
             
@@ -1006,17 +1141,29 @@ class TLSSecureMessenger:
         # Setup master decrypt token system
         self.setup_master_decrypt_token()
         
+        # Load or generate RSA key pair for this user
+        if not self.load_private_key():
+            # No existing key, generate new one
+            self.log_message("🆕 Generating new RSA key pair for this user...")
+            if not self.generate_key_pair():
+                self.log_message("❌ Failed to generate RSA key pair")
+                return False
+        
         # Check if user exists (simple check)
         user_exists = os.path.exists(f"{self.username}_master_salt.dat")
         
+        # Get the public key to send to server (always send it to ensure sync)
+        public_key_pem = self.public_key.export_key().decode()
+        
         if user_exists:
-            # Existing user - login
+            # Existing user - login (but also update public key in case it changed)
             self.log_message("🔍 Existing user detected, logging in...")
             
             login_data = {
                 "action": "login",
                 "username": self.username,
                 "safetoken": self.safetoken,
+                "public_key": public_key_pem,  # Always sync public key
                 "timestamp": time.time(),
                 "nonce": self.generate_message_nonce()
             }
@@ -1028,7 +1175,8 @@ class TLSSecureMessenger:
                 "action": "register",
                 "username": self.username,
                 "safetoken": self.safetoken,
-                "encryption_method": "pure_aes_gcm",
+                "public_key": public_key_pem,  # Send public key for new users
+                "encryption_method": "hybrid_rsa_aes_gcm",
                 "timestamp": time.time(),
                 "nonce": self.generate_message_nonce()
             }
@@ -1055,6 +1203,7 @@ class TLSSecureMessenger:
                         "action": "login",
                         "username": self.username,
                         "safetoken": self.safetoken,
+                        "public_key": public_key_pem,  # Include public key in retry
                         "timestamp": time.time(),
                         "nonce": self.generate_message_nonce()
                     }

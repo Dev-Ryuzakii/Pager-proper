@@ -442,6 +442,11 @@ def handle_client_connection(client_socket, client_address):
             if username in user_public_keys:
                 stored_token = user_public_keys[username].get("token")
                 if stored_token == token:
+                    # Update public key if provided (for key sync)
+                    if "public_key" in login:
+                        user_public_keys[username]["public_key"] = login["public_key"]
+                        log_message(f"🔄 Updated public key for {username}")
+                    
                     connected_users[username] = {
                         "socket": client_socket,
                         "token": token,
