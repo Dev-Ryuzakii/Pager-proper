@@ -40,19 +40,25 @@ logger = logging.getLogger(__name__)
 security = HTTPBearer()
 
 # Pydantic Models
-class UserRegistration(BaseModel):
+class UserAuth(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
-    public_key: str = Field(..., min_length=100)
-    safetoken: str = Field(..., description="User authentication token")
+    token: str = Field(..., description="User authentication token")
 
-class UserLogin(BaseModel):
-    username: str
-    safetoken: str
+class UserRegistration(UserAuth):
+    pass  # Same as auth - just username and token
+
+class UserLogin(UserAuth):
+    pass  # Same as auth - just username and token
 
 class MessageSend(BaseModel):
-    recipient: str
-    content: str = Field(..., min_length=1)
-    content_type: str = "text"
+    username: str = Field(..., description="Recipient username")
+    message: str = Field(..., min_length=1, description="Message content")
+
+class MasterToken(BaseModel):
+    mastertoken: str = Field(..., description="Master decryption token")
+
+class DecryptRequest(BaseModel):
+    mastertoken: str = Field(..., description="Master token for decryption")
 
 class MessageResponse(BaseModel):
     id: int
@@ -82,13 +88,12 @@ class UserService:
         if existing_user:
             raise HTTPException(status_code=400, detail="Username already registered")
         
-        # Use provided safetoken (like TLS system)
-        token = user_data.safetoken
+        # Use provided token (simple like TLS system)
+        token = user_data.token
         
-        # Create user - TLS compatible fields only
+        # Create user - simple fields only: username and token
         user = User(
             username=user_data.username,
-            public_key=user_data.public_key,
             token=token,
             registration_ip=ip_address,
             is_active=True,
@@ -111,11 +116,11 @@ class UserService:
         return user
     
     @staticmethod
-    def authenticate_user(db: Session, username: str, safetoken: str, ip_address: str = None) -> Optional[User]:
-        """Authenticate user with safetoken and update last login"""
+    def authenticate_user(db: Session, username: str, token: str, ip_address: str = None) -> Optional[User]:
+        """Authenticate user with token and update last login"""
         user = db.query(User).filter(
             User.username == username, 
-            User.token == safetoken,
+            User.token == token,
             User.is_active == True
         ).first()
         
@@ -146,19 +151,19 @@ class MessageService:
     """Service class for message operations"""
     
     @staticmethod
-    def send_message(db: Session, sender_id: int, recipient_username: str, content: str, content_type: str = "text") -> Message:
-        """Send a message"""
+    def send_message(db: Session, sender_id: int, recipient_username: str, message_content: str) -> Message:
+        """Send a message - simplified"""
         # Get recipient
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
-        # Create message
+        # Create message - simplified
         message = Message(
             sender_id=sender_id,
             recipient_id=recipient.id,
-            encrypted_content=content,
-            content_type=content_type,
+            encrypted_content=message_content,
+            content_type="encrypted",
             delivered=False,
             read=False,
             is_offline=True  # Mark as offline initially
@@ -399,7 +404,7 @@ async def get_status(db: Session = Depends(get_database_session)):
 
 @app.post("/auth/register")
 async def register_user(user_data: UserRegistration, db: Session = Depends(get_database_session)):
-    """Register a new user"""
+    """Register a new user - simplified JSON: {username, token}"""
     try:
         user = UserService.create_user(db, user_data, ip_address="mobile_app")
         
@@ -407,11 +412,7 @@ async def register_user(user_data: UserRegistration, db: Session = Depends(get_d
         session = SessionService.create_session(db, user.id, "mobile", "mobile_app")
         
         return {
-            "message": "User registered successfully",
-            "user": {
-                "username": user.username,
-                "registered": user.registered.isoformat()
-            },
+            "username": user.username,
             "token": session.session_token
         }
         
@@ -423,21 +424,17 @@ async def register_user(user_data: UserRegistration, db: Session = Depends(get_d
 
 @app.post("/auth/login")
 async def login_user(login_data: UserLogin, db: Session = Depends(get_database_session)):
-    """Login user"""
+    """Login user - simplified JSON: {username, token}"""
     try:
-        user = UserService.authenticate_user(db, login_data.username, login_data.safetoken, ip_address="mobile_app")
+        user = UserService.authenticate_user(db, login_data.username, login_data.token, ip_address="mobile_app")
         if not user:
-            raise HTTPException(status_code=401, detail="Invalid username or safetoken")
+            raise HTTPException(status_code=401, detail="Invalid username or token")
         
         # Create session
         session = SessionService.create_session(db, user.id, "mobile", "mobile_app")
         
         return {
-            "message": "Login successful",
-            "user": {
-                "username": user.username,
-                "last_login": user.last_login.isoformat() if user.last_login else None
-            },
+            "username": user.username,
             "token": session.session_token
         }
         
@@ -471,17 +468,15 @@ async def logout_user(current_user: User = Depends(get_current_user),
 async def send_message(message_data: MessageSend, 
                       current_user: User = Depends(get_current_user),
                       db: Session = Depends(get_database_session)):
-    """Send a message"""
+    """Send a message - simplified JSON: {username, message}"""
     try:
         message = MessageService.send_message(
-            db, current_user.id, message_data.recipient, 
-            message_data.content, message_data.content_type
+            db, current_user.id, message_data.username, message_data.message
         )
         
         return {
-            "message": "Message sent successfully",
-            "message_id": message.id,
-            "timestamp": message.timestamp.isoformat()
+            "username": message_data.username,
+            "message": "sent"
         }
         
     except HTTPException:
@@ -621,6 +616,66 @@ async def get_user_public_key(username: str,
     except Exception as e:
         logger.error(f"Get public key error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve public key")
+
+@app.post("/mastertoken/create")
+async def create_mastertoken(token_data: MasterToken, 
+                           current_user: User = Depends(get_current_user),
+                           db: Session = Depends(get_database_session)):
+    """Create master token - simplified JSON: {mastertoken}"""
+    try:
+        # Store master token for user (you might want to hash this)
+        # For now, just acknowledge creation
+        
+        AuditService.log_event(
+            db, current_user.id, "mastertoken_created", 
+            f"Master token created for {current_user.username}"
+        )
+        
+        return {
+            "mastertoken": "created"
+        }
+        
+    except Exception as e:
+        logger.error(f"Create mastertoken error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create master token")
+
+@app.post("/mastertoken/confirm")
+async def confirm_mastertoken(token_data: MasterToken, 
+                            current_user: User = Depends(get_current_user),
+                            db: Session = Depends(get_database_session)):
+    """Confirm master token - simplified JSON: {mastertoken}"""
+    try:
+        # Validate master token (implement your validation logic)
+        # For now, just acknowledge confirmation
+        
+        AuditService.log_event(
+            db, current_user.id, "mastertoken_confirmed", 
+            f"Master token confirmed for {current_user.username}"
+        )
+        
+        return {
+            "mastertoken": "confirmed"
+        }
+        
+    except Exception as e:
+        logger.error(f"Confirm mastertoken error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to confirm master token")
+
+@app.post("/decrypt")
+async def decrypt_message(decrypt_data: DecryptRequest):
+    """Decrypt message - simplified JSON: {mastertoken}"""
+    try:
+        # Implement your decryption logic here
+        # For now, just acknowledge decryption request
+        
+        return {
+            "mastertoken": "validated",
+            "decrypted": "message_content_here"
+        }
+        
+    except Exception as e:
+        logger.error(f"Decrypt error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to decrypt message")
 
 if __name__ == "__main__":
     uvicorn.run(

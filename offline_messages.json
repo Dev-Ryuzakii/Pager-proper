@@ -1,0 +1,22 @@
+{
+  "yami": [
+    {
+      "message_id": "msg_1761082396545",
+      "sender_id": "testuser_mobile",
+      "recipient_id": "yami",
+      "timestamp": 1761082396.5450659,
+      "message_type": "hybrid_rsa_aes",
+      "encrypted_content": {
+        "encrypted_aes_key": "base64_mock_encrypted_aes_key",
+        "encrypted_message": "base64_mock_encrypted_message",
+        "nonce": "base64_mock_nonce",
+        "message_hash": "sha256_mock_hash"
+      },
+      "metadata": {
+        "message_type": "text",
+        "timestamp": 1761082396.4722922
+      },
+      "status": "sent"
+    }
+  ]
+}
