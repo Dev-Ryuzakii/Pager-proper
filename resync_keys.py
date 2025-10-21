@@ -42,7 +42,7 @@ def resync_user_keys():
         print(f"\n🔍 Checking {username}:")
         
         # Load private key file
-        key_file = f"{username}_user_private_key.pem"
+        key_file = f"auth/private_keys/{username}_user_private_key.pem"
         if not os.path.exists(key_file):
             print(f"   ❌ No private key file: {key_file}")
             continue

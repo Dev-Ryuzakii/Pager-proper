@@ -29,11 +29,9 @@ from Crypto.Signature import pkcs1_15
 from Crypto.Protocol.KDF import PBKDF2, HKDF
 
 # TLS Configuration
-TLS_SERVER_CERT = "server_tls_certificate.pem"
-TLS_CLIENT_CERT = "client_tls_default_certificate.pem"  
-TLS_CLIENT_KEY = "client_tls_default_private_key.pem"
-
-# DNS over HTTPS configuration (anti-DNS poisoning)
+TLS_SERVER_CERT = "auth/certificates/server_tls_certificate.pem"
+TLS_CLIENT_CERT = "auth/certificates/client_tls_default_certificate.pem"
+TLS_CLIENT_KEY = "auth/certificates/client_tls_default_private_key.pem"# DNS over HTTPS configuration (anti-DNS poisoning)
 DNS_OVER_HTTPS_SERVERS = [
     "https://1.1.1.1/dns-query",      # Cloudflare
     "https://8.8.8.8/dns-query",       # Google
@@ -50,7 +48,7 @@ MAX_MESSAGE_SIZE = 65536  # Increased to 64KB for large encrypted payloads
 SECURE_MEMORY_CLEAR_PATTERN = b'\x00' * 1024  # For memory clearing
 
 # File paths for key storage (with secure naming)
-PRIVATE_KEY_FILE = "user_private_key.pem"
+PRIVATE_KEY_FILE = "auth/private_keys/user_private_key.pem"
 PUBLIC_KEY_CACHE = "public_keys_cache.json"
 
 class SecureMemory:
@@ -251,7 +249,7 @@ class TLSSecureMessenger:
             
     def setup_master_decrypt_token(self):
         """Setup master decrypt token with enhanced security"""
-        salt_file = f"{self.username}_master_salt.dat"
+        salt_file = f"auth/master_salts/{self.username}_master_salt.dat"
         
         if os.path.exists(salt_file):
             # Load existing salt
@@ -868,7 +866,10 @@ class TLSSecureMessenger:
             # Save with secure permissions
             pem = self.private_key.export_key()
             
-            key_file = f"{self.username}_{PRIVATE_KEY_FILE}"
+            # Ensure the auth directory exists
+            os.makedirs("auth/private_keys", exist_ok=True)
+            
+            key_file = f"auth/private_keys/{self.username}_{PRIVATE_KEY_FILE}"
             with open(key_file, "wb") as f:
                 f.write(pem)
                 
@@ -888,7 +889,7 @@ class TLSSecureMessenger:
     def load_private_key(self):
         """Load private key with secure handling"""
         try:
-            key_file = f"{self.username}_{PRIVATE_KEY_FILE}"
+            key_file = f"auth/private_keys/{self.username}_{PRIVATE_KEY_FILE}"
             if os.path.exists(key_file):
                 with open(key_file, "rb") as f:
                     pem = f.read()
@@ -1150,7 +1151,7 @@ class TLSSecureMessenger:
                 return False
         
         # Check if user exists (simple check)
-        user_exists = os.path.exists(f"{self.username}_master_salt.dat")
+        user_exists = os.path.exists(f"auth/master_salts/{self.username}_master_salt.dat")
         
         # Get the public key to send to server (always send it to ensure sync)
         public_key_pem = self.public_key.export_key().decode()

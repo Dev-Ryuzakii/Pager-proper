@@ -63,30 +63,18 @@ Security Layer:
 ```
 ✅ Individual Messaging
   - Real-time encrypted messaging
-  - Rich text formatting
-  - Message reactions/emojis
-  - Reply/forward capabilities
-  - Message status indicators
+  - Offline message delivery (stored on server)
+  - Message status indicators (sent/delivered/read)
+  - Reply capabilities
+  - Simple text messaging (no rich formatting)
+  - Automatic message retry on connection restore
 
-✅ Group Messaging
-  - Encrypted group chats (up to 500 members)
-  - Admin controls and permissions
-  - Group info/settings management
-  - Member management (add/remove)
-
-✅ Media & Files
-  - Photo/video sharing (encrypted)
-  - Document sharing (encrypted)
-  - Voice messages
-  - Location sharing (optional)
-  - File size limits and compression
-
-✅ Advanced Communication
-  - Voice calls (encrypted)
-  - Video calls (encrypted)
-  - Screen sharing
-  - Message scheduling
-  - Auto-delete messages
+✅ Offline Support
+  - Messages stored on server when recipient offline
+  - Automatic delivery when user comes online
+  - Message queue with persistent storage
+  - Connection status indicators
+  - Automatic reconnection handling
 ```
 
 ### 🎨 User Experience Features
@@ -339,116 +327,71 @@ Response:
 }
 ```
 
-### Group Chat Endpoints
+### Offline Messaging Endpoints
 
-#### POST /api/v1/groups/create
+#### GET /api/v1/messages/offline
+```json
+Response:
+{
+  "messages": [
+    {
+      "message_id": "msg_98765",
+      "sender_id": "usr_12345",
+      "timestamp": 1635724800,
+      "encrypted_content": {
+        "encrypted_aes_key": "base64_rsa_encrypted_key",
+        "encrypted_message": "base64_aes_gcm_encrypted_content",
+        "nonce": "base64_aes_gcm_nonce"
+      },
+      "status": "offline_stored"
+    }
+  ],
+  "count": 5
+}
+```
+
+#### POST /api/v1/messages/mark_delivered
 ```json
 Request:
 {
-  "group_name": "Project Team",
-  "description": "Work discussion group",
-  "members": ["usr_12345", "usr_67890", "usr_11111"],
-  "group_settings": {
-    "admin_only_messages": false,
-    "disappearing_messages": 604800,
-    "group_picture": "base64_encrypted_image"
-  }
+  "message_ids": ["msg_98765", "msg_98766"]
 }
 
 Response:
 {
   "success": true,
-  "group_id": "grp_abc123",
-  "group_key": "encrypted_group_aes_key",
-  "invite_link": "https://securechat.app/invite/xyz789"
+  "delivered_count": 2
 }
 ```
 
-#### POST /api/v1/groups/{group_id}/messages
+### Connection Status Endpoints
+
+#### GET /api/v1/users/online_status
 ```json
-Request:
-{
-  "message_type": "group_encrypted",
-  "encrypted_content": {
-    "encrypted_message": "base64_aes_gcm_group_encrypted",
-    "nonce": "base64_aes_gcm_nonce",
-    "key_version": "v1"
-  },
-  "metadata": {
-    "message_type": "text",
-    "mentions": ["usr_12345"]
-  }
-}
-```
-
-#### PUT /api/v1/groups/{group_id}/members
-```json
-Request:
-{
-  "action": "add", // or "remove", "promote", "demote"
-  "user_id": "usr_33333",
-  "role": "member" // or "admin"
-}
-```
-
-### File & Media Endpoints
-
-#### POST /api/v1/files/upload
-```json
-Request: (Multipart form data)
-- file: encrypted_file_binary
-- recipient_id: "usr_67890"
-- file_key: "base64_encrypted_aes_key"
-- file_hash: "sha256_file_integrity"
-- metadata: {
-    "original_name": "document.pdf",
-    "file_size": 2048576,
-    "mime_type": "application/pdf"
-  }
-
 Response:
 {
-  "success": true,
-  "file_id": "file_xyz789",
-  "download_url": "encrypted_temporary_url",
-  "expires_at": 1635724800
+  "online_users": [
+    {
+      "user_id": "usr_67890",
+      "username": "bob_2025",
+      "last_seen": 1635724800,
+      "status": "online"
+    }
+  ]
 }
 ```
 
-#### GET /api/v1/files/{file_id}
-```json
-Query Parameters:
-- decrypt_key: "user_specific_key"
-
-Response: Binary file data (encrypted)
-```
-
-### Voice/Video Call Endpoints
-
-#### POST /api/v1/calls/initiate
+#### POST /api/v1/users/heartbeat
 ```json
 Request:
 {
-  "recipient_id": "usr_67890",
-  "call_type": "voice", // or "video"
-  "encryption_key": "base64_call_encryption_key"
-}
-
-Response:
-{
-  "success": true,
-  "call_id": "call_abc123",
-  "signaling_server": "wss://calls.securechat.app",
-  "ice_servers": [...]
-}
-```
-
-#### PUT /api/v1/calls/{call_id}/status
-```json
-Request:
-{
-  "status": "accepted", // "declined", "ended", "missed"
   "timestamp": 1635724800
+}
+
+Response:
+{
+  "success": true,
+  "server_time": 1635724801
 }
 ```
 
@@ -527,35 +470,31 @@ Request:
 }
 ```
 
-## 📊 Database Schema Extensions
+## 📊 Database Schema for Simple Messaging
 
-### Messages Table Enhancement
+### Messages Table (Simplified)
 ```sql
 CREATE TABLE messages (
   id VARCHAR(255) PRIMARY KEY,
   sender_id VARCHAR(255) NOT NULL,
-  recipient_id VARCHAR(255),
-  group_id VARCHAR(255),
-  message_type ENUM('text', 'image', 'video', 'audio', 'file', 'location'),
-  encryption_type ENUM('hybrid_rsa_aes', 'group_aes'),
+  recipient_id VARCHAR(255) NOT NULL,
+  message_type ENUM('text') DEFAULT 'text',
+  encryption_type ENUM('hybrid_rsa_aes') DEFAULT 'hybrid_rsa_aes',
   encrypted_content LONGTEXT NOT NULL,
-  encrypted_aes_key TEXT,
-  nonce VARCHAR(255),
+  encrypted_aes_key TEXT NOT NULL,
+  nonce VARCHAR(255) NOT NULL,
   message_hash VARCHAR(255),
   reply_to_id VARCHAR(255),
-  forwarded_from VARCHAR(255),
-  expires_at TIMESTAMP NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  status ENUM('sent', 'delivered', 'read', 'failed') DEFAULT 'sent',
-  deleted_at TIMESTAMP NULL,
+  status ENUM('sent', 'delivered', 'read', 'failed', 'offline_stored') DEFAULT 'sent',
+  delivered_at TIMESTAMP NULL,
+  read_at TIMESTAMP NULL,
   
-  INDEX idx_recipient_timestamp (recipient_id, created_at),
+  INDEX idx_recipient_status (recipient_id, status),
   INDEX idx_sender_timestamp (sender_id, created_at),
-  INDEX idx_group_timestamp (group_id, created_at),
+  INDEX idx_recipient_timestamp (recipient_id, created_at),
   FOREIGN KEY (sender_id) REFERENCES users(id),
-  FOREIGN KEY (recipient_id) REFERENCES users(id),
-  FOREIGN KEY (group_id) REFERENCES groups(id)
+  FOREIGN KEY (recipient_id) REFERENCES users(id)
 );
 ```
 
@@ -681,25 +620,25 @@ CREATE TABLE calls (
   - Progressive loading with cached_network_image
 ```
 
-### Phase 3: Advanced Features (Weeks 7-9)
+### Phase 3: Offline & Reliability Features (Weeks 7-9)
 ```
-✅ Group Messaging
-  - Group creation/management with custom widgets
-  - Member administration with permission handling
-  - Group encryption keys with secure key sharing
-  - Group settings with preference screens
+✅ Offline Messaging
+  - Offline message queue implementation
+  - Message persistence with local database
+  - Automatic retry mechanisms
+  - Connection state management
 
-✅ Voice & Video Calls
-  - WebRTC integration with flutter_webrtc
-  - Call signaling through WebSocket
-  - Encrypted voice/video streams
-  - Call history with local database
+✅ Reliability Features
+  - Network connectivity monitoring
+  - Automatic reconnection logic
+  - Message delivery confirmation
+  - Failed message retry queue
 
-✅ File Sharing
-  - Document picker with file_picker plugin
-  - File encryption/upload with background tasks
-  - Download management with flutter_downloader
-  - File preview with custom viewers
+✅ User Experience
+  - Connection status indicators
+  - Message status badges (sent/delivered/read)
+  - Offline user indicators
+  - Loading states and animations
 
 ✅ Advanced Security
   - Key rotation with automated background tasks
@@ -894,36 +833,36 @@ lib/
 
 ## 💰 Monetization Strategy
 
-### Freemium Model
+### Simple Pricing Model
 ```
 Free Tier:
-- Up to 100 messages per month
+- Up to 50 messages per month
 - Individual messaging only
 - Basic encryption
 - Standard support
+- Offline message storage (7 days)
 
-Pro Tier ($4.99/month):
+Pro Tier ($2.99/month):
 - Unlimited messaging
-- Group chats (up to 50 members)
-- Voice calls (encrypted)
+- Priority message delivery
+- Extended offline storage (30 days)
 - Priority support
 - Advanced security features
+- Message history backup
 
-Business Tier ($19.99/month):
+Premium Tier ($7.99/month):
 - Everything in Pro
-- Large groups (up to 500 members)
-- Video calls
-- File sharing (up to 1GB)
-- Admin controls
-- Audit logs
-- API access
+- Custom encryption settings
+- Extended message retention (1 year)
+- Priority customer support
+- Early access to new features
 
 Enterprise Tier (Custom):
 - On-premise deployment
 - Custom integration
 - Dedicated support
 - Compliance features
-- Custom encryption
+- Custom encryption protocols
 ```
 
 ## 🎯 Success Metrics & KPIs

@@ -20,7 +20,7 @@ def load_user_keys():
 
 def load_private_key(username):
     """Load user's private RSA key"""
-    key_file = f"{username}_user_private_key.pem"
+    key_file = f"auth/private_keys/{username}_user_private_key.pem"
     if os.path.exists(key_file):
         with open(key_file, 'rb') as f:
             return RSA.import_key(f.read())

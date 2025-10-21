@@ -1,16 +1,17 @@
 {
   "users": {
     "shadow": {
-      "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjmWCh4QpR2BC+/o9iFjV\nawHSaauOYUQeZ86dQujGcPL+tdcbc9YLcXFusjlwiFDe8XWDJZYXUQD3BiB6LfJT\nYdZjgfjwsQyh5n0DOLnoqTdkVFmSyNKiXoUeCxGsXAcTxKdHB9hzgOP09gpl6boK\nVwazHACNfeN3K0a+C8EspzhoV0/1Q7RwN93w2n8er99UIOMinEG26VbzviLVh4xR\nlI+iYHvjqGYvgSiJIbGqKTzcBF1AmTCl58wWNuOgnxnc5HlzGKh3ky70H7Z6XoKV\nrNPcIGXLNCLp/YKQjn2pddUkIzcZONqj9NeypnZznWz62JRD3eMYIwBXQFUNvqTR\nJQIDAQAB\n-----END PUBLIC KEY-----",
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAwQQ3b/riHa/ONeMDz+mS\nMxn3PR+TXAm/SvMNYTGb2yADzJ86iiHb+QpPZO1Fj9rA+M+YxLwSYNVMnhsaEcdD\nRjDfllGCFyfFICjaqBctIwWzrFCyADn7C8A8rbALz2j0qNQ89m42dNlwDz/oDNIa\nbpdgFs9xeMpznq8pFHzOgfw5NgQ2uhayqalNuRxqCXDoQm/Mtm81U8IDBG5nR1Cn\ncKAjHFa5z+WS+eS6VO04ChR+zFnd/SsS3oYvLS8JVQq3iWFz7TdbWtgpyDeb17N8\nbPIUxqyG5cP22O5Sp5C774iwGYK3YlTkOTd8xaBKAL8rlOTlXW2XwhOB44/YuQMT\nRJUERct43RG32jS+/HWhEfVhkR4UaCvUCqoUhD89nVL3moyZzPnzjCpLDaq4vhI3\nbRJXGw/2Z8PuA9n1gCSeh/yWOAcbafbBHZlYSoTBoOHf3JwUrUeE41itkKjkob7u\nTnlCaIXt8p7T6PXurs7qsub9B+MVD6nM7EJ+wZUdY5yyLBpOU5+95EUSdOiuErft\nJ3hRGymu7HXACzqAwJ3OVSebY23J/75INkOYUCtD+7tRmp7tHaHiTBKMs1ucW7qG\navwpdB/Wjp+/akSXvs/UVdVbJPVdSMsXkanoel+ugxrd55pk3L7MEH4LqiFT80v2\n+kilYpy957UmYSmHrA+AbJECAwEAAQ==\n-----END PUBLIC KEY-----",
       "registered": 1761054508.030725,
-      "token": "token123"
+      "token": "token123",
+      "last_login": 1761079779.974079
     },
     "kami": {
       "public_key": "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAzqvPrwb6/LjeR84P/2RW\nNZBxldAqCfnYQ12QLQ9dB7Ly+IcrEGop/PEuLd7rQl/zK9aIyaPaRlDpPHSYjh7Y\n0yWXUzkeEzP+yOzlfLEaHisijkEIocLQW10wV1IDuPIK4+V8m1P0t+NNdvqyOjwx\n1JyPVelkHjo5kAJHMQjxGU+KZUddzGJ8IK178YUzeDB9NJI+dT7sdTViE2x78NxW\nY0dhpznjD0u7mwoI5+Pv3FYMxtrUdUBag17ddxsx6xxIavGCkFavQLcH4uKqi9tG\nLqhgNtnpz3RcO7o2AAVZbdb3O2wX7gI2xd0fSl/B52urU9NlyuY6zQMicmWUMJ4T\nK5MXXD9LMFJwhglRdbfNyw0odFuqoUulW4gZqcwUL8j0X2HCfaQZSupUCMoUY8eB\nW++CMh2Qmipi8JPRnlaU7mNEBv2p7Gxlg5i+oPdJ7TpFN9T3fq0nlW4CotMFuyTE\nu8aSF/Mu0aJLdZFW1owuxapMwOnoH6DatpoKPpJMfmB7Yt6LE7hWkypO4vYIxGCr\n2LJTpHc1YlzUtty/A3pHlGx74zlyk+f5UxEp3f8bO2OsSJdK5DOYE88IdUCDsDsq\na8dgSKWYEp2QZsuRx2FBS+kfRn3Jt0boYe4oOIAWSuEDTcO2N/JFSDN5OHl1HenA\nYEsNQM7nRG2wsOTAmoSOxaECAwEAAQ==\n-----END PUBLIC KEY-----",
       "token": "token432",
       "registered": 1761064855.8376021,
       "registration_ip": "127.0.0.1",
-      "last_login": 1761078173.409119
+      "last_login": 1761079750.926265
     },
     "users": {
       "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs8Vzvdd+hnycCxXCwBgm\niesqxhG0SqGlbk0R+H5ORo3Hj7W3MxLmDmYZtiI6r/vqKXrkOT9BJeWnV5tMy735\nvMzF1+SC9Dw04wBPPLlFiMw5hIrL6yU1tmNabLhOqx8tBvyAfTKwj9GEx5kkGBKP\nlZ6zjkdqfELhXTt0Cs4M8uXgl29B5nWg/rHP5VVy1Gp6XW3UakMzVS0IUzvD8k82\ntw45wd1lWHB90vHmPDEPUoRrrsvmoDYXp3ZeJbnXhjAOdpHcrdASJvuB0+xPAh9r\nwO4YCbp9CMl/5hhjfE+crJc7kARy2xR/zUpM9OQ8l8LNlRQGhTNwAdOm77nP8mQE\nUQIDAQAB\n-----END PUBLIC KEY-----",
@@ -27,7 +28,7 @@
       "token": "token789",
       "registered": 1761066117.388851,
       "registration_ip": "127.0.0.1",
-      "last_login": 1761078148.300472
+      "last_login": 1761080748.626397
     },
     "togen": {
       "public_key": "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAiyejvEBkNOnhGlnb6LMs\ncMOzEeMrpLZbuEvdpG6LdpuZszImVHVcCWCeTtNMkvqAM84zjyRE8UiaB4FgPt29\nLUCxwVSd9bHISjpurrOCZpzIA7VLqIvkucFG9jKD0i0ma95l0+/x+GB9hoajZSk3\nqNe0qpmEztzJf2eMNszDLrZChNfboi0SyP0sjJ22qboRqNRomMkZu5iNzVo9PyRo\n1H3tp+ulMCK0FJecsmIsTHVqV+G9ApEEgxD1gDgCkXazCtXtjcNau/YMf46Bkcil\nQDcoqzVjXfwjsCZZ/LDiUCjU9vBgUdRxsKO1Epo1TqNv0FqZWllDlR3B4rHItc7P\nAfYdeNd8G+NZsesFdkczJzYFTwsYOBalkozoOciFJwhYVjAlbSiXzq4cKF+oR+Ne\nUjDwgrWa4Bx0ToZxbbBbr5iW/8GwhZUO5Tw9y8YSmxzNlTeDQLz9NSdmnqKj9ul4\n78+YVaOGmc/BE1vYXULVfLyDakhpQoXQMCj3/v+grIYQTuBvnAGSi7xZGPA7EN++\n/gizskapfxTXIZGPcClu607yKZO7bXaIa5hxPj4JvRtUpUcVZ2PZPOvTBeLEF6Hb\nhDfFaw+wwxgXLAv8ow6p5e083sAby31k+2zpHp7emXWVpk60+71La3onWaQhyar/\n+bLyLGnXumqoNPfWNE+eK6UCAwEAAQ==\n-----END PUBLIC KEY-----",
@@ -35,8 +36,30 @@
       "registered": 1761066399.0464709,
       "registration_ip": "127.0.0.1",
       "last_login": 1761066399.0464718
+    },
+    "yami": {
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAsBsaw8a7mu5cVIt4OmkY\nVuu1w1PR3wjPV5HvmbrONUI6yWYmhZCKpibyytySnLO/A0Pedjg3bctKSw9h7CSO\nRU8SnkQGAxVP7EWTAKsV7v34zQ3KEgcGzEPwe7XnD5SQlvxb/nsSD8OsCfGqqZts\nhPPNU3mnaqdA6Ztm1JNjCXrMC9r0EUamJZErlmkSsSsQq5kSap/5VNaPJOdrb8UM\nVRIfEwu13+yYOAduduQ0/MaqRsEu9Xzn7krUWJXqkEQ8Pi9bNj2YAdmSLlDc+RGs\nnAgxV67RFwx+NcT9fSFWcixFPiGLW13OnY9SafzHLKXkb473M3ZUd6hkpshkqobf\nKup/NgbPIQE2q5yXmE1zHTrF/If647K5/mD44eBIgzdWBy1RmTLHV4KHqn3rzIrf\nDhgR8eRVm/iKet1UwcsANYrJP1vcF7pkAaoxFTbxMMkFX8gBlQLoZxnPqOnicQt0\noONtpdR4MpeHnQQgYjbLuDD7aNn9nMbLP0QfcXb80uHUQHCsvPXdLVPn21tMSfMI\n0Co9e5Jtk/kplrDwB2WYMG0vrIz5i8yvC333w4bJI2lciWYypOykqQ8QxGJrNP8v\np6MZibLsCEUafuCaC9HGNXWAq+5LY2pAbg+LsdksxR1IzbMfUz77hzGwVBF4mG9g\n6fSmEwLzbulvO6Dfa6iILdECAwEAAQ==\n-----END PUBLIC KEY-----",
+      "token": "token123",
+      "registered": 1761080547.026093,
+      "registration_ip": "127.0.0.1",
+      "last_login": 1761080701.147431
+    },
+    "testuser_mobile": {
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs8Vzvdd+hnycCxXCwBgm\niesqxhG0SqGlbk0R+H5ORo3Hj7W3MxLmDmYZtiI6r/vqKXrkOT9BJeWnV5tMy735\nvMzF1+SC9Dw04wBPPLlFiMw5hIrL6yU1tmNabLhOqx8tBvyAfTKwj9GEx5kkGBKP\nlZ6zjkdqfELhXTt0Cs4M8uXgl29B5nWg/rHP5VVy1Gp6XW3UakMzVS0IUzvD8k82\ntw45wd1lWHB90vHmPDEPUoRrrsvmoDYXp3ZeJbnXhjAOdpHcrdASJvuB0+xPAh9r\nwO4YCbp9CMl/5hhjfE+crJc7kARy2xR/zUpM9OQ8l8LNlRQGhTNwAdOm77nP8mQE\nUQIDAQAB\n-----END PUBLIC KEY-----",
+      "token": "token_1761082394",
+      "email": "testuser_mobile@example.com",
+      "device_id": "test_device_123",
+      "push_token": "test_push_token",
+      "registered": 1761082394.827168,
+      "registration_ip": "mobile_app",
+      "last_login": 1761082395.3828638,
+      "device_info": {
+        "device_id": "test_device_123",
+        "os_version": "iOS 17.1",
+        "app_version": "1.0.0"
+      }
     }
   },
-  "last_updated": 1761078173.409121,
-  "server_version": "2.0-TLS"
+  "last_updated": 1761086278.412556,
+  "server_version": "2.0-FastAPI"
 }

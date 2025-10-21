@@ -23,8 +23,8 @@ import os
 # ===== TLS CONFIGURATION =====
 HOST = "0.0.0.0"
 PORT = 5050
-TLS_SERVER_CERT = "server_tls_certificate.pem"
-TLS_SERVER_KEY = "server_tls_private_key.pem"
+TLS_SERVER_CERT = "auth/certificates/server_tls_certificate.pem"
+TLS_SERVER_KEY = "auth/certificates/server_tls_private_key.pem"
 USE_TLS = os.path.exists(TLS_SERVER_CERT) and os.path.exists(TLS_SERVER_KEY)
 
 # Security configuration
@@ -153,7 +153,7 @@ def save_user_keys():
             "server_version": "2.0-TLS"
         }
         
-        filename = "user_keys_secure.json" if USE_TLS else "user_keys.json"
+        filename = "auth/user_keys/user_keys_secure.json" if USE_TLS else "auth/user_keys/user_keys.json"
         with open(filename, "w") as f:
             json.dump(data_to_save if USE_TLS else user_public_keys, f, indent=2)
     except Exception as e:
@@ -164,7 +164,7 @@ def load_user_keys():
     global user_public_keys
     try:
         # Try new secure format first, then legacy
-        for filename in ["user_keys_secure.json", "user_keys.json"]:
+        for filename in ["auth/user_keys/user_keys_secure.json", "auth/user_keys/user_keys.json"]:
             if os.path.exists(filename):
                 with open(filename, "r") as f:
                     data = json.load(f)

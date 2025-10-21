@@ -23,8 +23,8 @@ import os
 # Configuration
 HOST = "0.0.0.0"
 PORT = 5050
-TLS_SERVER_CERT = "server_tls_certificate.pem"
-TLS_SERVER_KEY = "server_tls_private_key.pem"
+TLS_SERVER_CERT = "auth/certificates/server_tls_certificate.pem"
+TLS_SERVER_KEY = "auth/certificates/server_tls_private_key.pem"
 
 # Security configuration
 RATE_LIMIT_REQUESTS = 10  # Max requests per minute per IP
@@ -170,8 +170,8 @@ def load_user_keys():
                 data = json.load(f)
                 user_public_keys = data.get("users", {})
             log_message(f"Loaded {len(user_public_keys)} user keys")
-        elif os.path.exists("user_keys.json"):  # Backward compatibility
-            with open("user_keys.json", "r") as f:
+        elif os.path.exists("auth/user_keys/user_keys.json"):  # Backward compatibility
+            with open("auth/user_keys/user_keys.json", "r") as f:
                 user_public_keys = json.load(f)
             log_message(f"Loaded {len(user_public_keys)} user keys (legacy format)")
     except Exception as e:

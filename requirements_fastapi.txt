@@ -1,0 +1,25 @@
+# FastAPI Mobile Backend Dependencies
+# Add these to your existing requirements.txt
+
+# FastAPI and server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Security and authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# WebSocket support (for real-time features)
+websockets==12.0
+
+# HTTP client (for testing)
+httpx==0.25.2
+
+# Background tasks
+celery==5.3.4  # Optional: for heavy background processing
+redis==5.0.1   # Optional: for task queue and caching
+
+# Development tools
+pytest==7.4.3
+pytest-asyncio==0.21.1

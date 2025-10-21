@@ -18,11 +18,11 @@ def monitor_test():
     
     # Read user keys to show registered users
     try:
-        with open("user_keys.json", "r") as f:
+        with open("auth/user_keys/user_keys.json", "r") as f:
             users = json.load(f)
         print(f"- Registered Users: {len(users)} ({', '.join(users.keys())})")
     except:
-        print("- Registered Users: Could not read user_keys.json")
+        print("- Registered Users: Could not read auth/user_keys/user_keys.json")
     
     print("\n📋 Current Test Status:")
     print("✅ ryuzakii: Connected and sending message to kami")
