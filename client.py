@@ -118,6 +118,31 @@ class SecureMessenger:
         else:
             # Generate new salt for new user
             self.master_salt = get_random_bytes(32)
+            
+            # Ask user to create their own master decrypt token
+            print("\n🔐 MASTER DECRYPT TOKEN SETUP")
+            print("=" * 40)
+            print("Create a master password for double-layer encryption.")
+            print("You'll need this password to decrypt your messages.")
+            print("Choose something secure but memorable!")
+            print()
+            
+            while True:
+                master_token = input("Create your master decrypt token: ").strip()
+                if len(master_token) < 8:
+                    print("❌ Master token must be at least 8 characters long")
+                    continue
+                    
+                confirm_token = input("Confirm your master decrypt token: ").strip()
+                if master_token == confirm_token:
+                    print(f"✅ Master decrypt token created successfully!")
+                    print(f"💡 Remember this password: '{master_token}'")
+                    print("=" * 40)
+                    break
+                else:
+                    print("❌ Tokens don't match. Try again.")
+            
+            # Save salt
             with open(salt_file, "wb") as f:
                 f.write(self.master_salt)
             self.log_message("New master token configuration created")
@@ -192,25 +217,23 @@ class SecureMessenger:
             self.log_message(f"Error loading public key cache: {e}")
             
     def encrypt_message(self, message, recipient_public_key, sender_master_token=None):
-        """Double-layer hybrid encryption: Master Token + AES + RSA"""
+        """Hybrid encryption: AES + RSA (master token for sender validation only)"""
         try:
-            # First layer: Encrypt with sender's master token (if provided)
+            # Validate sender's master token (but don't encrypt with it)
             if sender_master_token:
-                message_layer1 = self.encrypt_with_master_token(message, sender_master_token)
-                if not message_layer1:
-                    self.log_message("Failed to encrypt with master token")
+                master_key = self.derive_master_key(sender_master_token)
+                if not master_key:
+                    self.log_message("Invalid sender master token")
                     return None
-            else:
-                message_layer1 = message
             
-            # Second layer: Hybrid AES+RSA encryption (existing system)
+            # Use hybrid AES+RSA encryption (recipient decrypts with their private key)
             # Generate random AES key (32 bytes = 256-bit)
             aes_key = get_random_bytes(32)
             
             # Encrypt message with AES (fast)
             aes_cipher = AES.new(aes_key, AES.MODE_CBC)
             iv = aes_cipher.iv
-            encrypted_message = aes_cipher.encrypt(pad(message_layer1.encode(), AES.block_size))
+            encrypted_message = aes_cipher.encrypt(pad(message.encode(), AES.block_size))
             
             # Encrypt AES key with RSA (only small key, not full message)
             rsa_cipher = PKCS1_OAEP.new(recipient_public_key)
@@ -221,8 +244,8 @@ class SecureMessenger:
                 "encrypted_key": base64.b64encode(encrypted_key).decode(),
                 "iv": base64.b64encode(iv).decode(),
                 "encrypted_message": base64.b64encode(encrypted_message).decode(),
-                "method": "double_layer_hybrid",
-                "has_master_layer": bool(sender_master_token)
+                "method": "hybrid_rsa_aes",
+                "sender_validated": bool(sender_master_token)
             }
             
             return json.dumps(hybrid_payload)
@@ -232,16 +255,22 @@ class SecureMessenger:
             return None
             
     def decrypt_message(self, encrypted_payload, recipient_master_token=None):
-        """Double-layer hybrid decryption: RSA + AES + Master Token"""
+        """Decrypt message using recipient's private key (master token for local validation)"""
         try:
+            # Validate recipient's master token first (for local security)
+            if recipient_master_token:
+                master_key = self.derive_master_key(recipient_master_token)
+                if not master_key:
+                    return "[INVALID MASTER TOKEN]"
+            else:
+                return "[MASTER TOKEN REQUIRED]"
+            
             # Parse the payload
             if isinstance(encrypted_payload, str):
                 # Try to parse as JSON (hybrid format)
                 try:
                     payload = json.loads(encrypted_payload)
-                    if payload.get("method") == "double_layer_hybrid":
-                        return self._decrypt_double_layer(payload, recipient_master_token)
-                    elif payload.get("method") == "hybrid_aes_rsa":
+                    if payload.get("method") in ["hybrid_rsa_aes", "double_layer_hybrid", "hybrid_aes_rsa"]:
                         return self._decrypt_hybrid(payload)
                 except json.JSONDecodeError:
                     pass

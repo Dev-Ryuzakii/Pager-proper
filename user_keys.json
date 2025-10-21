@@ -18,5 +18,10 @@
     "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmBJaWuvxxgX54tmjYzNg\nyki+f+N1pxjssSqbrnNhw0f2Y9x/xn+WkewDW4bC9/Pj+AUtZYCk2zKrEVoJRoFB\nT+ybcbvxumsGrnJFHy01P5lPqe53XsA6Tryf4+hABe8Hz3fC6GDSKo0Zqt5tjygM\nUL+8zkih3mRTqHAENgVbe8Lo/Wy4QOccvqWaU/m0jVS8+xtd5aOiAzpF13IUt+yq\nmsD64d41Ey+wTTsdVUdBNI5lE0Nf1eaXl9tpPzeCeqn1iW5aWRC40IvaTvcPBbbo\nPYW7xYsmM+tReU2OAPqRuxPndptvcToKlcEDMxIN4SXDKZ+NSfC832OPmY4S1Fw1\nMwIDAQAB\n-----END PUBLIC KEY-----",
     "registered": 1761055207.838526,
     "token": "token567"
+  },
+  "tougen": {
+    "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1dWmV4G45vM0VvY8+adc\nkTnkbQi0sSu+a2Xs6hpZmRgkmOyEnnxpPEHSt3Ho5GMRGDeFvOh3ojvgKRVc2bYt\nUyBT6q42a8OSY+bGVBSN6cwB58ikOb1AjqHF/oF/AL03Nn3zm6IsxmgDA8JC0vGn\n8VfwdBwwlz4KMXjWhh9KOAdaldIfsZqwm6kMnG/tZp0fpfvlA6MqRDLe9YnXlKRn\nJnQM8+HCanRnJDIaaLCnaKyUX0+wh3ajUjtwhVWVUuXEf6/SS8PhAe20yDDKSbhy\nLsp8ZQYyeQ4pSVxftiWP2Vfp6JyW420l07e8NJiSoKeKBxUGdX6qGHFJmaSWf9m6\nOwIDAQAB\n-----END PUBLIC KEY-----",
+    "registered": 1761061697.009757,
+    "token": "token789"
   }
 }
