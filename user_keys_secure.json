@@ -1,0 +1,42 @@
+{
+  "users": {
+    "shadow": {
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjmWCh4QpR2BC+/o9iFjV\nawHSaauOYUQeZ86dQujGcPL+tdcbc9YLcXFusjlwiFDe8XWDJZYXUQD3BiB6LfJT\nYdZjgfjwsQyh5n0DOLnoqTdkVFmSyNKiXoUeCxGsXAcTxKdHB9hzgOP09gpl6boK\nVwazHACNfeN3K0a+C8EspzhoV0/1Q7RwN93w2n8er99UIOMinEG26VbzviLVh4xR\nlI+iYHvjqGYvgSiJIbGqKTzcBF1AmTCl58wWNuOgnxnc5HlzGKh3ky70H7Z6XoKV\nrNPcIGXLNCLp/YKQjn2pddUkIzcZONqj9NeypnZznWz62JRD3eMYIwBXQFUNvqTR\nJQIDAQAB\n-----END PUBLIC KEY-----",
+      "registered": 1761054508.030725,
+      "token": "token123"
+    },
+    "kami": {
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAzqvPrwb6/LjeR84P/2RW\nNZBxldAqCfnYQ12QLQ9dB7Ly+IcrEGop/PEuLd7rQl/zK9aIyaPaRlDpPHSYjh7Y\n0yWXUzkeEzP+yOzlfLEaHisijkEIocLQW10wV1IDuPIK4+V8m1P0t+NNdvqyOjwx\n1JyPVelkHjo5kAJHMQjxGU+KZUddzGJ8IK178YUzeDB9NJI+dT7sdTViE2x78NxW\nY0dhpznjD0u7mwoI5+Pv3FYMxtrUdUBag17ddxsx6xxIavGCkFavQLcH4uKqi9tG\nLqhgNtnpz3RcO7o2AAVZbdb3O2wX7gI2xd0fSl/B52urU9NlyuY6zQMicmWUMJ4T\nK5MXXD9LMFJwhglRdbfNyw0odFuqoUulW4gZqcwUL8j0X2HCfaQZSupUCMoUY8eB\nW++CMh2Qmipi8JPRnlaU7mNEBv2p7Gxlg5i+oPdJ7TpFN9T3fq0nlW4CotMFuyTE\nu8aSF/Mu0aJLdZFW1owuxapMwOnoH6DatpoKPpJMfmB7Yt6LE7hWkypO4vYIxGCr\n2LJTpHc1YlzUtty/A3pHlGx74zlyk+f5UxEp3f8bO2OsSJdK5DOYE88IdUCDsDsq\na8dgSKWYEp2QZsuRx2FBS+kfRn3Jt0boYe4oOIAWSuEDTcO2N/JFSDN5OHl1HenA\nYEsNQM7nRG2wsOTAmoSOxaECAwEAAQ==\n-----END PUBLIC KEY-----",
+      "token": "token432",
+      "registered": 1761064855.8376021,
+      "registration_ip": "127.0.0.1",
+      "last_login": 1761073108.96145
+    },
+    "users": {
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs8Vzvdd+hnycCxXCwBgm\niesqxhG0SqGlbk0R+H5ORo3Hj7W3MxLmDmYZtiI6r/vqKXrkOT9BJeWnV5tMy735\nvMzF1+SC9Dw04wBPPLlFiMw5hIrL6yU1tmNabLhOqx8tBvyAfTKwj9GEx5kkGBKP\nlZ6zjkdqfELhXTt0Cs4M8uXgl29B5nWg/rHP5VVy1Gp6XW3UakMzVS0IUzvD8k82\ntw45wd1lWHB90vHmPDEPUoRrrsvmoDYXp3ZeJbnXhjAOdpHcrdASJvuB0+xPAh9r\nwO4YCbp9CMl/5hhjfE+crJc7kARy2xR/zUpM9OQ8l8LNlRQGhTNwAdOm77nP8mQE\nUQIDAQAB\n-----END PUBLIC KEY-----",
+      "registered": 1761054826.3012018,
+      "token": "quit"
+    },
+    "ryuzakii": {
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmBJaWuvxxgX54tmjYzNg\nyki+f+N1pxjssSqbrnNhw0f2Y9x/xn+WkewDW4bC9/Pj+AUtZYCk2zKrEVoJRoFB\nT+ybcbvxumsGrnJFHy01P5lPqe53XsA6Tryf4+hABe8Hz3fC6GDSKo0Zqt5tjygM\nUL+8zkih3mRTqHAENgVbe8Lo/Wy4QOccvqWaU/m0jVS8+xtd5aOiAzpF13IUt+yq\nmsD64d41Ey+wTTsdVUdBNI5lE0Nf1eaXl9tpPzeCeqn1iW5aWRC40IvaTvcPBbbo\nPYW7xYsmM+tReU2OAPqRuxPndptvcToKlcEDMxIN4SXDKZ+NSfC832OPmY4S1Fw1\nMwIDAQAB\n-----END PUBLIC KEY-----",
+      "registered": 1761055207.838526,
+      "token": "token567"
+    },
+    "tougen": {
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEApCb6IilSUILrxNLWjDUc\nurIkILrZB/naNfL1RVgUknK1mkADf2T8oJ+IDPYwPmykX+5tmaRubiLO8lecUSze\n0VmboGazFJeio2XQR5ib5AxmoOrUSF+V/2cRk9bHCJ576WnruEtf6T87ehLEwou7\nTEtcP4439j5aYlIVoMk6Gv6Khu3Ag31/1408919r6e6FRlEEPhPthlKNCrZncUgv\nYcxwIMMXwtE9flIe1v7Uj3N+Gh2x4Z9vr+XPJBG4xb9QrVzOgThIyOMPqc9kNF4a\nJ6tM2J6cTVmWSNaTuRzktuKUY16GIPFwOrns+E0q7jy1MfMEdZTfq7FZyVNDLWk2\nyBQfmsf8GGfMkqbankiixWyh9SqYpL9owd+8fjiLGwwBstWi8WBB9/pY2f3Gy9k+\nk5SyzjABlPZHHmmkcsurfpBIK1Rrx3+KVgXUAZWCZs7quSXiRdbocw3PHz8gle9X\n8mIhVCGhwMhbcZoM0gBGLDd+e69cLjWdFvGwowRwczcOwjfkEcRXp/OcifYg5ZwV\nyLdvBZe5giG+35EdEofpc6NuIE1y2ghLmiIjdV5JQ/Da49DGvZoBUOSJQGniwxdL\npLZhkX4miG6oWa8nkSSYK16ObYOQSo+cbN6gzCq7XcHRLNfKA9/W9X1YQ58je3Ra\nGN0KGGWo9IdT5dJY3U35jf0CAwEAAQ==\n-----END PUBLIC KEY-----",
+      "token": "token789",
+      "registered": 1761066117.388851,
+      "registration_ip": "127.0.0.1",
+      "last_login": 1761073070.79096
+    },
+    "togen": {
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAiyejvEBkNOnhGlnb6LMs\ncMOzEeMrpLZbuEvdpG6LdpuZszImVHVcCWCeTtNMkvqAM84zjyRE8UiaB4FgPt29\nLUCxwVSd9bHISjpurrOCZpzIA7VLqIvkucFG9jKD0i0ma95l0+/x+GB9hoajZSk3\nqNe0qpmEztzJf2eMNszDLrZChNfboi0SyP0sjJ22qboRqNRomMkZu5iNzVo9PyRo\n1H3tp+ulMCK0FJecsmIsTHVqV+G9ApEEgxD1gDgCkXazCtXtjcNau/YMf46Bkcil\nQDcoqzVjXfwjsCZZ/LDiUCjU9vBgUdRxsKO1Epo1TqNv0FqZWllDlR3B4rHItc7P\nAfYdeNd8G+NZsesFdkczJzYFTwsYOBalkozoOciFJwhYVjAlbSiXzq4cKF+oR+Ne\nUjDwgrWa4Bx0ToZxbbBbr5iW/8GwhZUO5Tw9y8YSmxzNlTeDQLz9NSdmnqKj9ul4\n78+YVaOGmc/BE1vYXULVfLyDakhpQoXQMCj3/v+grIYQTuBvnAGSi7xZGPA7EN++\n/gizskapfxTXIZGPcClu607yKZO7bXaIa5hxPj4JvRtUpUcVZ2PZPOvTBeLEF6Hb\nhDfFaw+wwxgXLAv8ow6p5e083sAby31k+2zpHp7emXWVpk60+71La3onWaQhyar/\n+bLyLGnXumqoNPfWNE+eK6UCAwEAAQ==\n-----END PUBLIC KEY-----",
+      "token": "token789",
+      "registered": 1761066399.0464709,
+      "registration_ip": "127.0.0.1",
+      "last_login": 1761066399.0464718
+    }
+  },
+  "last_updated": 1761073108.961451,
+  "server_version": "2.0-TLS"
+}

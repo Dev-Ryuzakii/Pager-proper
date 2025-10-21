@@ -1,0 +1,9 @@
+# IP Whitelist - one IP or CIDR range per line
+# Examples:
+# 127.0.0.1
+# 192.168.1.0/24
+# 10.0.0.0/8
+
+# Allow localhost by default
+127.0.0.1
+::1
