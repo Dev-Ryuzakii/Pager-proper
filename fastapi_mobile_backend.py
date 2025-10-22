@@ -770,15 +770,10 @@ async def shutdown_event():
     logger.info("FastAPI SecureChat Pro API stopped")
 
 if __name__ == "__main__":
-    print("🚀 Starting SecureChat Pro API Server")
-    print("📱 Mobile app backend with offline messaging support")
-    print("🔒 Integrated with existing TLS encryption system")
-    print("=" * 50)
-    
     uvicorn.run(
-        app,
+        "fastapi_mobile_backend:app",
         host="0.0.0.0",
         port=8000,
-        log_level="info",
-        access_log=True
+        reload=True,
+        log_level="info"
     )
