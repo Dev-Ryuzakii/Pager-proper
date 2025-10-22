@@ -48,7 +48,7 @@ MAX_MESSAGE_SIZE = 65536  # Increased to 64KB for large encrypted payloads
 SECURE_MEMORY_CLEAR_PATTERN = b'\x00' * 1024  # For memory clearing
 
 # File paths for key storage (with secure naming)
-PRIVATE_KEY_FILE = "auth/private_keys/user_private_key.pem"
+PRIVATE_KEY_FILE = "user_private_key.pem"
 PUBLIC_KEY_CACHE = "public_keys_cache.json"
 
 class SecureMemory:
@@ -866,10 +866,11 @@ class TLSSecureMessenger:
             # Save with secure permissions
             pem = self.private_key.export_key()
             
-            # Ensure the auth directory exists
+            # Ensure the auth/private_keys directory exists
             os.makedirs("auth/private_keys", exist_ok=True)
             
-            key_file = f"auth/private_keys/{self.username}_{PRIVATE_KEY_FILE}"
+            # Use a simpler, flat file naming structure
+            key_file = f"auth/private_keys/{self.username}_user_private_key.pem"
             with open(key_file, "wb") as f:
                 f.write(pem)
                 
@@ -889,7 +890,8 @@ class TLSSecureMessenger:
     def load_private_key(self):
         """Load private key with secure handling"""
         try:
-            key_file = f"auth/private_keys/{self.username}_{PRIVATE_KEY_FILE}"
+            # Use the same flat file naming structure
+            key_file = f"auth/private_keys/{self.username}_user_private_key.pem"
             if os.path.exists(key_file):
                 with open(key_file, "rb") as f:
                     pem = f.read()
