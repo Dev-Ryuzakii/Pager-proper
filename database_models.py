@@ -19,7 +19,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), unique=True, index=True, nullable=False)
     email = Column(String(255), unique=True, index=True, nullable=True)  # Optional for TLS users
-    public_key = Column(Text, nullable=False)  # RSA public key in PEM format
+    public_key = Column(Text, nullable=True)  # Make this optional - RSA public key in PEM format
     password_hash = Column(String(255), nullable=True)  # Optional password hash
     
     # Authentication tokens

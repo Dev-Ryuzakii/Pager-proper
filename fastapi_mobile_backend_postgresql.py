@@ -51,8 +51,10 @@ class UserAuth(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     token: str = Field(..., description="User authentication token")
 
-class UserRegistration(UserAuth):
-    pass  # Same as auth - just username and token
+class UserRegistration(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    token: str = Field(..., description="User authentication token")
+    public_key: Optional[str] = Field(None, description="User's RSA public key in PEM format (optional)")
 
 class UserLogin(UserAuth):
     pass  # Same as auth - just username and token
@@ -112,7 +114,7 @@ class UserService:
     """Service class for user operations"""
     
     @staticmethod
-    def create_user(db: Session, user_data: UserRegistration, ip_address: str = None) -> User:
+    def create_user(db: Session, user_data: UserRegistration, ip_address: Optional[str] = None) -> User:
         """Create a new user"""
         # Check if user already exists
         existing_user = db.query(User).filter(User.username == user_data.username).first()
@@ -122,10 +124,11 @@ class UserService:
         # Use provided token (simple like TLS system)
         token = user_data.token
         
-        # Create user - simple fields only: username and token
+        # Create user - simple fields only: username, token, and optional public_key
         user = User(
             username=user_data.username,
             token=token,
+            public_key=user_data.public_key,  # This is now optional
             registration_ip=ip_address,
             is_active=True,
             is_verified=True,
@@ -136,9 +139,10 @@ class UserService:
         db.commit()
         db.refresh(user)
         
-        # Log registration
+        # Log registration - use getattr to safely access the id
+        user_id = getattr(user, 'id', None)
         AuditService.log_event(
-            db, user.id, "user_registration", 
+            db, user_id, "user_registration", 
             f"User {user_data.username} registered", 
             ip_address=ip_address
         )
@@ -147,7 +151,7 @@ class UserService:
         return user
     
     @staticmethod
-    def authenticate_user(db: Session, username: str, token: str, ip_address: str = None) -> Optional[User]:
+    def authenticate_user(db: Session, username: str, token: str, ip_address: Optional[str] = None) -> Optional[User]:
         """Authenticate user with token and update last login"""
         user = db.query(User).filter(
             User.username == username, 
@@ -156,12 +160,13 @@ class UserService:
         ).first()
         
         if user:
-            user.last_login = datetime.now(timezone.utc)
+            # Use setattr for SQLAlchemy models
+            setattr(user, 'last_login', datetime.now(timezone.utc))
             db.commit()
             
             # Log login
             AuditService.log_event(
-                db, user.id, "user_login", 
+                db, getattr(user, 'id', None), "user_login", 
                 f"User {username} logged in", 
                 ip_address=ip_address
             )
@@ -230,8 +235,9 @@ class MessageService:
         """Mark message as delivered"""
         message = db.query(Message).filter(Message.id == message_id).first()
         if message:
-            message.delivered = True
-            message.is_offline = False
+            # Use setattr for SQLAlchemy models to avoid type errors
+            setattr(message, 'delivered', True)
+            setattr(message, 'is_offline', False)
             db.commit()
             return True
         return False
@@ -241,8 +247,9 @@ class MessageService:
         """Mark message as read"""
         message = db.query(Message).filter(Message.id == message_id).first()
         if message:
-            message.read = True
-            message.read_timestamp = datetime.now(timezone.utc)
+            # Use setattr for SQLAlchemy models to avoid type errors
+            setattr(message, 'read', True)
+            setattr(message, 'read_timestamp', datetime.now(timezone.utc))
             db.commit()
             return True
         return False
@@ -251,7 +258,7 @@ class SessionService:
     """Service class for session management"""
     
     @staticmethod
-    def create_session(db: Session, user_id: int, session_type: str = "api", ip_address: str = None) -> UserSession:
+    def create_session(db: Session, user_id: int, session_type: str = "api", ip_address: Optional[str] = None) -> UserSession:
         """Create a new session"""
         # Generate session token
         session_data = f"{user_id}:{int(time.time())}:{session_type}"
@@ -288,7 +295,7 @@ class SessionService:
         
         if session:
             # Update last activity
-            session.last_activity = datetime.now(timezone.utc)
+            setattr(session, 'last_activity', datetime.now(timezone.utc))
             db.commit()
         
         return session
@@ -298,8 +305,9 @@ class SessionService:
         """Invalidate a session"""
         session = db.query(UserSession).filter(UserSession.session_token == session_token).first()
         if session:
-            session.is_active = False
-            session.logout_reason = "manual"
+            # Use setattr for SQLAlchemy models to avoid type errors
+            setattr(session, 'is_active', False)
+            setattr(session, 'logout_reason', "manual")
             db.commit()
             return True
         return False
@@ -309,7 +317,7 @@ class AuditService:
     
     @staticmethod
     def log_event(db: Session, user_id: Optional[int], event_type: str, description: str, 
-                  severity: str = "info", ip_address: str = None, extra_data: Dict = None):
+                  severity: str = "info", ip_address: Optional[str] = None, extra_data: Optional[Dict[Any, Any]] = None):
         """Log an audit event"""
         audit_log = AuditLog(
             user_id=user_id,
@@ -317,7 +325,7 @@ class AuditService:
             event_description=description,
             severity=severity,
             ip_address=ip_address,
-            extra_data=extra_data
+            extra_data=extra_data or {}  # Fix the None default
         )
         
         db.add(audit_log)
@@ -396,7 +404,17 @@ class DecryptService:
             raise HTTPException(status_code=404, detail="Message not found")
         
         try:
-            # Get the user's private key for decryption
+            # For mobile users, we should not attempt server-side decryption
+            # Mobile users should decrypt messages locally using their private keys
+            user = db.query(User).filter(User.id == user_id).first()
+            user_type = getattr(user, 'user_type', '') if user else ''
+            if user and user_type == "mobile":
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Mobile users should decrypt messages locally. Private keys are not stored on the server for security."
+                )
+            
+            # Get the user's private key for decryption (only for TLS users)
             user_key = db.query(UserKey).filter(
                 and_(
                     UserKey.user_id == user_id,
@@ -420,7 +438,8 @@ class DecryptService:
             
             # Parse the encrypted content
             try:
-                encrypted_payload = json.loads(message.encrypted_content)
+                encrypted_content = getattr(message, 'encrypted_content', '')
+                encrypted_payload = json.loads(encrypted_content)
             except json.JSONDecodeError:
                 raise HTTPException(status_code=400, detail="Invalid encrypted content format")
             
@@ -429,15 +448,13 @@ class DecryptService:
                 raise HTTPException(status_code=400, detail="Invalid encrypted payload structure")
             
             # Derive master key from master token and salt
-            # Convert SQLAlchemy column to bytes
-            master_salt = bytes(master_salt_record.key_data)
+            master_salt = bytes(getattr(master_salt_record, 'key_data', b''))
             master_key = DecryptService.derive_master_key(mastertoken, master_salt)
             
             # Decrypt the AES key using RSA private key
             try:
                 # Load RSA private key
-                # Convert SQLAlchemy column to bytes
-                private_key_data = bytes(user_key.key_data)
+                private_key_data = bytes(getattr(user_key, 'key_data', b''))
                 private_key = RSA.import_key(private_key_data)
                 
                 # Decode and decrypt the AES key
@@ -466,7 +483,7 @@ class DecryptService:
                 
                 # Log decryption attempt
                 AuditService.log_event(
-                    db, int(user_id), "message_decrypted",
+                    db, user_id, "message_decrypted",
                     f"Message {message_id} decrypted successfully",
                     severity="info"
                 )
@@ -476,7 +493,7 @@ class DecryptService:
             except Exception as e:
                 logger.error(f"Message decryption error: {e}")
                 AuditService.log_event(
-                    db, int(user_id), "decryption_failed",
+                    db, user_id, "decryption_failed",
                     f"Failed to decrypt message {message_id}: {str(e)}",
                     severity="error"
                 )
@@ -487,7 +504,7 @@ class DecryptService:
         except Exception as e:
             logger.error(f"Decryption error: {e}")
             AuditService.log_event(
-                db, int(user_id), "decryption_failed",
+                db, user_id, "decryption_failed",
                 f"Failed to decrypt message {message_id}: {str(e)}",
                 severity="error"
             )
@@ -610,11 +627,12 @@ async def register_user(user_data: UserRegistration, db: Session = Depends(get_d
         user = UserService.create_user(db, user_data, ip_address="mobile_app")
         
         # Create session
-        session = SessionService.create_session(db, user.id, "mobile", "mobile_app")
+        user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
+        session = SessionService.create_session(db, user_id, "mobile", "mobile_app")
         
         return {
-            "username": user.username,
-            "token": session.session_token
+            "username": str(getattr(user, 'username', '')),
+            "token": str(getattr(session, 'session_token', ''))
         }
         
     except HTTPException:
@@ -632,11 +650,12 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
             raise HTTPException(status_code=401, detail="Invalid username or token")
         
         # Create session
-        session = SessionService.create_session(db, user.id, "mobile", "mobile_app")
+        user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
+        session = SessionService.create_session(db, user_id, "mobile", "mobile_app")
         
         return {
-            "username": user.username,
-            "token": session.session_token
+            "username": str(getattr(user, 'username', '')),
+            "token": str(getattr(session, 'session_token', ''))
         }
         
     except HTTPException:
@@ -654,9 +673,11 @@ async def logout_user(current_user: User = Depends(get_current_user),
         token = credentials.credentials
         SessionService.invalidate_session(db, token)
         
+        user_id = int(getattr(current_user, 'id', 0)) if hasattr(getattr(current_user, 'id', 0), '__int__') else int(getattr(current_user, 'id', 0))
+        username = str(getattr(current_user, 'username', ''))
         AuditService.log_event(
-            db, current_user.id, "user_logout", 
-            f"User {current_user.username} logged out"
+            db, user_id, "user_logout", 
+            f"User {username} logged out"
         )
         
         return {"message": "Logout successful"}
@@ -671,8 +692,9 @@ async def send_message(message_data: MessageSend,
                       db: Session = Depends(get_database_session)):
     """Send a message - simplified JSON: {username, message}"""
     try:
+        user_id = int(getattr(current_user, 'id', 0)) if hasattr(getattr(current_user, 'id', 0), '__int__') else int(getattr(current_user, 'id', 0))
         message = MessageService.send_message(
-            db, current_user.id, message_data.username, message_data.message
+            db, user_id, message_data.username, message_data.message
         )
         
         return {
@@ -691,21 +713,22 @@ async def get_inbox(current_user: User = Depends(get_current_user),
                    db: Session = Depends(get_database_session)):
     """Get user's inbox"""
     try:
-        messages = MessageService.get_user_messages(db, current_user.id)
+        user_id = int(getattr(current_user, 'id', 0))
+        messages = MessageService.get_user_messages(db, user_id)
         
         result = []
         for msg in messages:
             sender = db.query(User).filter(User.id == msg.sender_id).first()
             recipient = db.query(User).filter(User.id == msg.recipient_id).first()
             result.append({
-                "id": msg.id,
-                "sender": sender.username if sender else "unknown",
-                "recipient": recipient.username if recipient else "unknown",
-                "content": msg.encrypted_content,
-                "content_type": msg.content_type,
-                "timestamp": msg.timestamp.isoformat(),
-                "delivered": msg.delivered,
-                "read": msg.read
+                "id": int(getattr(msg, 'id', 0)),
+                "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
+                "recipient": str(getattr(recipient, 'username', '')) if recipient else "unknown",
+                "content": str(getattr(msg, 'encrypted_content', '')),
+                "content_type": str(getattr(msg, 'content_type', '')),
+                "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
+                "delivered": bool(getattr(msg, 'delivered', False)),
+                "read": bool(getattr(msg, 'read', False))
             })
         
         return {
@@ -722,23 +745,25 @@ async def get_offline_messages(current_user: User = Depends(get_current_user),
                               db: Session = Depends(get_database_session)):
     """Get offline messages"""
     try:
-        messages = MessageService.get_offline_messages(db, current_user.id)
+        user_id = int(getattr(current_user, 'id', 0))
+        messages = MessageService.get_offline_messages(db, user_id)
         
         result = []
         for msg in messages:
             sender = db.query(User).filter(User.id == msg.sender_id).first()
             recipient = db.query(User).filter(User.id == msg.recipient_id).first()
             result.append({
-                "id": msg.id,
-                "sender": sender.username if sender else "unknown",
-                "recipient": recipient.username if recipient else "unknown",
-                "content": msg.encrypted_content,
-                "content_type": msg.content_type,
-                "timestamp": msg.timestamp.isoformat()
+                "id": int(getattr(msg, 'id', 0)),
+                "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
+                "recipient": str(getattr(recipient, 'username', '')) if recipient else "unknown",
+                "content": str(getattr(msg, 'encrypted_content', '')),
+                "content_type": str(getattr(msg, 'content_type', '')),
+                "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat()
             })
             
             # Mark as delivered
-            MessageService.mark_message_delivered(db, msg.id)
+            message_id = int(getattr(msg, 'id', 0))
+            MessageService.mark_message_delivered(db, message_id)
         
         return {
             "messages": result,
@@ -755,9 +780,10 @@ async def mark_message_read(message_id: int,
                            db: Session = Depends(get_database_session)):
     """Mark message as read"""
     try:
+        user_id = int(getattr(current_user, 'id', 0))
         # Verify message belongs to current user
         message = db.query(Message).filter(
-            and_(Message.id == message_id, Message.recipient_id == current_user.id)
+            and_(Message.id == message_id, Message.recipient_id == user_id)
         ).first()
         
         if not message:
@@ -784,12 +810,16 @@ async def get_users(current_user: User = Depends(get_current_user),
         users = UserService.get_all_users(db)
         
         result = []
+        current_user_id = int(getattr(current_user, 'id', 0))
         for user in users:
-            if user.id != current_user.id:  # Exclude current user
+            user_id = int(getattr(user, 'id', 0))
+            if user_id != current_user_id:  # Exclude current user
+                last_login = getattr(user, 'last_login', None)
+                registered = getattr(user, 'registered', datetime.now(timezone.utc))
                 result.append({
-                    "username": user.username,
-                    "registered": user.registered.isoformat(),
-                    "last_login": user.last_login.isoformat() if user.last_login else None
+                    "username": str(getattr(user, 'username', '')),
+                    "registered": registered.isoformat() if registered else datetime.now(timezone.utc).isoformat(),
+                    "last_login": last_login.isoformat() if last_login else None
                 })
         
         return {
@@ -812,8 +842,8 @@ async def get_user_public_key(username: str,
             raise HTTPException(status_code=404, detail="User not found")
         
         return {
-            "username": user.username,
-            "public_key": user.public_key
+            "username": str(getattr(user, 'username', '')),
+            "public_key": str(getattr(user, 'public_key', '')) if getattr(user, 'public_key', '') else None
         }
         
     except HTTPException:
@@ -831,9 +861,11 @@ async def create_mastertoken(token_data: MasterToken,
         # Store master token for user (you might want to hash this)
         # For now, just acknowledge creation
         
+        user_id = int(getattr(current_user, 'id', 0))
+        username = str(getattr(current_user, 'username', ''))
         AuditService.log_event(
-            db, current_user.id, "mastertoken_created", 
-            f"Master token created for {current_user.username}"
+            db, user_id, "mastertoken_created", 
+            f"Master token created for {username}"
         )
         
         return {
@@ -853,9 +885,11 @@ async def confirm_mastertoken(token_data: MasterToken,
         # Validate master token (implement your validation logic)
         # For now, just acknowledge confirmation
         
+        user_id = int(getattr(current_user, 'id', 0))
+        username = str(getattr(current_user, 'username', ''))
         AuditService.log_event(
-            db, current_user.id, "mastertoken_confirmed", 
-            f"Master token confirmed for {current_user.username}"
+            db, user_id, "mastertoken_confirmed", 
+            f"Master token confirmed for {username}"
         )
         
         return {
@@ -876,8 +910,9 @@ async def decrypt_message(
     try:
         start_time = time.time()
         
+        user_id = int(getattr(current_user, 'id', 0))
         # Always require fresh master token for decryption
-        if not DecryptService.validate_master_token(db, current_user.id, decrypt_data.mastertoken):
+        if not DecryptService.validate_master_token(db, user_id, decrypt_data.mastertoken):
             raise HTTPException(
                 status_code=401, 
                 detail="Invalid master token. Master token is required for message decryption."
@@ -888,8 +923,8 @@ async def decrypt_message(
             and_(
                 Message.id == decrypt_data.message_id,
                 or_(
-                    Message.sender_id == current_user.id,
-                    Message.recipient_id == current_user.id
+                    Message.sender_id == user_id,
+                    Message.recipient_id == user_id
                 )
             )
         ).first()
@@ -911,7 +946,7 @@ async def decrypt_message(
         # Attempt to decrypt the message
         decrypted_content = DecryptService.decrypt_message(
             db, 
-            current_user.id,
+            user_id,
             decrypt_data.message_id,
             decrypt_data.mastertoken
         )
@@ -919,24 +954,26 @@ async def decrypt_message(
         decrypt_time = time.time() - start_time
         
         # Log successful decryption
+        sender_username = str(getattr(sender, 'username', ''))
         AuditService.log_event(
             db,
-            current_user.id,
+            user_id,
             "message_decrypted",
-            f"Message {decrypt_data.message_id} from {sender.username} decrypted successfully",
+            f"Message {decrypt_data.message_id} from {sender_username} decrypted successfully",
             severity="info"
         )
         
         # Format response like TLS system
+        message_timestamp = getattr(message, 'timestamp', datetime.now(timezone.utc))
         return {
-            "id": message.id,
-            "sender": sender.username,
+            "id": int(getattr(message, 'id', 0)),
+            "sender": sender_username,
             "sender_verified": True,  # Add actual verification logic
-            "timestamp": message.timestamp.strftime("%H:%M"),
+            "timestamp": message_timestamp.strftime("%H:%M"),
             "security": "TLS 1.3 + AES-256-GCM + RSA-4096",
             "server_hmac": True,  # Add actual HMAC verification
             "decrypt_time": round(decrypt_time, 3),
-            "content": decrypted_content,
+            "content": str(decrypted_content),
             "auto_clear": True,  # Message will auto-clear
             "clear_seconds": 30  # Clear after 30 seconds
         }
@@ -946,9 +983,10 @@ async def decrypt_message(
     except Exception as e:
         # Log the error
         logger.error(f"Decrypt error: {e}")
+        user_id_for_log = int(getattr(current_user, 'id', 0)) if current_user else None
         AuditService.log_event(
             db,
-            current_user.id if current_user else None,
+            user_id_for_log,
             "decrypt_error",
             f"Failed to decrypt message {decrypt_data.message_id}: {str(e)}",
             severity="error"

@@ -197,6 +197,23 @@ def handle_key_registration(tls_socket, data):
         if len(token) < 8:
             tls_socket.send(json.dumps({"status": "error", "message": "Token too short"}).encode())
             return False
+            
+        # Check if user already exists
+        if username in user_public_keys:
+            # User already exists, send specific error message
+            response_data = {"status": "error", "message": f"User '{username}' already exists"}
+            timestamp = time.time()
+            hmac_value = generate_message_hmac(response_data, timestamp)
+            
+            response = {
+                **response_data,
+                "timestamp": timestamp,
+                "hmac": hmac_value
+            }
+            
+            tls_socket.send(json.dumps(response).encode())
+            log_message(f"REGISTRATION FAILED: {username} already exists from {client_ip}")
+            return False
         
         # Store user data with security metadata
         user_public_keys[username] = {

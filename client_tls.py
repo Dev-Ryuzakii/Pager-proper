@@ -1152,37 +1152,21 @@ class TLSSecureMessenger:
                 self.log_message("❌ Failed to generate RSA key pair")
                 return False
         
-        # Check if user exists (simple check)
-        user_exists = os.path.exists(f"auth/master_salts/{self.username}_master_salt.dat")
-        
         # Get the public key to send to server (always send it to ensure sync)
         public_key_pem = self.public_key.export_key().decode()
         
-        if user_exists:
-            # Existing user - login (but also update public key in case it changed)
-            self.log_message("🔍 Existing user detected, logging in...")
+        # Always try registration first, then fall back to login if user exists
+        self.log_message("🆕 Attempting registration...")
             
-            login_data = {
-                "action": "login",
-                "username": self.username,
-                "safetoken": self.safetoken,
-                "public_key": public_key_pem,  # Always sync public key
-                "timestamp": time.time(),
-                "nonce": self.generate_message_nonce()
-            }
-        else:
-            # New user - register
-            self.log_message("🆕 New user detected, registering...")
-                
-            login_data = {
-                "action": "register",
-                "username": self.username,
-                "safetoken": self.safetoken,
-                "public_key": public_key_pem,  # Send public key for new users
-                "encryption_method": "hybrid_rsa_aes_gcm",
-                "timestamp": time.time(),
-                "nonce": self.generate_message_nonce()
-            }
+        login_data = {
+            "action": "register",
+            "username": self.username,
+            "safetoken": self.safetoken,
+            "public_key": public_key_pem,  # Send public key for new users
+            "encryption_method": "hybrid_rsa_aes_gcm",
+            "timestamp": time.time(),
+            "nonce": self.generate_message_nonce()
+        }
         
         # Send authentication data over TLS
         try:
@@ -1193,15 +1177,15 @@ class TLSSecureMessenger:
             response = json.loads(response_data)
             
             if response.get("status") == "success":
-                self.log_message("✅ TLS authentication successful")
+                self.log_message("✅ TLS registration successful")
                 return True
             else:
                 error_msg = response.get('message', 'Unknown error')
-                self.log_message(f"❌ TLS authentication failed: {error_msg}")
+                self.log_message(f"❌ TLS registration failed: {error_msg}")
                 
                 # If it's a duplicate registration error, try to login instead
                 if "already" in error_msg.lower() or "exist" in error_msg.lower():
-                    self.log_message("🔄 User seems to exist, trying login instead...")
+                    self.log_message("🔍 User exists, attempting login...")
                     login_data = {
                         "action": "login",
                         "username": self.username,
