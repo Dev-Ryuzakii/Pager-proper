@@ -39,6 +39,9 @@ if os.path.exists('.env'):
 from database_config import get_database_session, db_config
 from database_models import User, Message, UserKey, UserSession, AuditLog
 
+# Import the fake text generator
+from fake_text_generator import FakeTextGenerator
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -113,7 +116,7 @@ def validate_master_token(db: Session, user_id: int, mastertoken: str) -> bool:
 class UserService:
     """Service class for user operations"""
     
-    
+    @staticmethod
     def create_user(db: Session, user_data: UserRegistration, ip_address: Optional[str] = None) -> User:
         """Create a new user"""
         # Check if user already exists
@@ -150,7 +153,7 @@ class UserService:
         logger.info(f"✅ User registered: {user_data.username}")
         return user
     
-    
+    @staticmethod
     def authenticate_user(db: Session, username: str, token: str, ip_address: Optional[str] = None) -> Optional[User]:
         """Authenticate user with token and update last login"""
         user = db.query(User).filter(
@@ -173,12 +176,12 @@ class UserService:
         
         return user
     
-    
+    @staticmethod
     def get_user_by_username(db: Session, username: str) -> Optional[User]:
         """Get user by username"""
         return db.query(User).filter(User.username == username, User.is_active == True).first()
     
-    
+    @staticmethod
     def get_all_users(db: Session) -> List[User]:
         """Get all active users"""
         return db.query(User).filter(User.is_active == True).all()
@@ -186,13 +189,20 @@ class UserService:
 class MessageService:
     """Service class for message operations"""
     
-    
+    @staticmethod
     def send_message(db: Session, sender_id: int, recipient_username: str, message_content: str) -> Message:
         """Send a message - simplified"""
         # Get recipient
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
+        
+        # Generate decoy text for the message
+        try:
+            decoy_text = FakeTextGenerator.generate_decoy_text_for_message(message_content)
+        except Exception as e:
+            print(f"⚠️  Error generating decoy text: {e}")
+            decoy_text = "[ENCRYPTED MESSAGE] Tap to decrypt"
         
         # Create message - simplified
         message = Message(
@@ -205,6 +215,13 @@ class MessageService:
             is_offline=True  # Mark as offline initially
         )
         
+        # Try to set decoy_content, but handle case where column might not exist yet
+        try:
+            setattr(message, 'decoy_content', decoy_text)
+        except Exception as e:
+            print(f"⚠️  Could not set decoy_content: {e}")
+            # Continue without setting decoy_content
+        
         db.add(message)
         db.commit()
         db.refresh(message)
@@ -212,14 +229,14 @@ class MessageService:
         logger.info(f"📤 Message sent: {sender_id} → {recipient.id}")
         return message
     
-    
+    @staticmethod
     def get_user_messages(db: Session, user_id: int, limit: int = 50) -> List[Message]:
         """Get messages for a user (inbox)"""
         return db.query(Message).filter(
             Message.recipient_id == user_id
         ).order_by(Message.timestamp.desc()).limit(limit).all()
     
-    
+    @staticmethod
     def get_offline_messages(db: Session, user_id: int) -> List[Message]:
         """Get offline messages for a user"""
         return db.query(Message).filter(
@@ -230,7 +247,7 @@ class MessageService:
             )
         ).order_by(Message.timestamp.asc()).all()
     
-    
+    @staticmethod
     def mark_message_delivered(db: Session, message_id: int) -> bool:
         """Mark message as delivered"""
         message = db.query(Message).filter(Message.id == message_id).first()
@@ -242,7 +259,7 @@ class MessageService:
             return True
         return False
     
-    
+    @staticmethod
     def mark_message_read(db: Session, message_id: int) -> bool:
         """Mark message as read"""
         message = db.query(Message).filter(Message.id == message_id).first()
@@ -257,7 +274,7 @@ class MessageService:
 class SessionService:
     """Service class for session management"""
     
-    
+    @staticmethod
     def create_session(db: Session, user_id: int, session_type: str = "api", ip_address: Optional[str] = None) -> UserSession:
         """Create a new session"""
         # Generate session token
@@ -282,7 +299,7 @@ class SessionService:
         
         return session
     
-    
+    @staticmethod
     def validate_session(db: Session, session_token: str) -> Optional[UserSession]:
         """Validate a session token"""
         session = db.query(UserSession).filter(
@@ -300,7 +317,7 @@ class SessionService:
         
         return session
     
-    
+    @staticmethod
     def invalidate_session(db: Session, session_token: str) -> bool:
         """Invalidate a session"""
         session = db.query(UserSession).filter(UserSession.session_token == session_token).first()
@@ -315,9 +332,9 @@ class SessionService:
 class AuditService:
     """Service class for audit logging"""
     
-    
+    @staticmethod
     def log_event(db: Session, user_id: Optional[int], event_type: str, description: str, 
-                  severity: str = "info", ip_address: Optional[str] = None, extra_data: Optional[Dict[Any, Any]] = None):
+                  severity: str = "info", ip_address: Optional[str] = None, extra_data: Optional[Dict[Any, Any]] = None) -> None:
         """Log an audit event"""
         audit_log = AuditLog(
             user_id=user_id,
@@ -334,7 +351,7 @@ class AuditService:
 class DecryptService:
     """Service class for decryption operations"""
     
-    
+    @staticmethod
     def validate_master_token(db: Session, user_id: int, mastertoken: str) -> bool:
         """Validate the master token for a user"""
         # Check if the master token has been confirmed for this user
@@ -348,7 +365,7 @@ class DecryptService:
         
         return audit_record is not None
     
-    
+    @staticmethod
     def derive_master_key(mastertoken: str, salt: bytes) -> bytes:
         """Derive encryption key using PBKDF2"""
         try:
@@ -363,7 +380,7 @@ class DecryptService:
             logger.error(f"Key derivation error: {e}")
             raise HTTPException(status_code=500, detail="Key derivation failed")
     
-    
+    @staticmethod
     def decrypt_with_aes_gcm(encrypted_data: Dict[str, str], key: bytes) -> str:
         """Decrypt using AES-256-GCM (authenticated decryption)"""
         try:
@@ -386,7 +403,7 @@ class DecryptService:
             logger.error(f"AES-GCM decryption error: {e}")
             raise HTTPException(status_code=500, detail="AES-GCM decryption failed")
     
-    
+    @staticmethod
     def decrypt_message(db: Session, user_id: int, message_id: int, mastertoken: str) -> Optional[str]:
         """Decrypt a message using the master token"""
         # Get the message
