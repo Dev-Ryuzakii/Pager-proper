@@ -46,6 +46,7 @@ class User(Base):
     received_messages = relationship("Message", foreign_keys="Message.recipient_id", back_populates="recipient")
     user_keys = relationship("UserKey", back_populates="user")
     sessions = relationship("UserSession", back_populates="user")
+    master_tokens = relationship("MasterToken", back_populates="user")  # Add this line
     
     def __repr__(self):
         return f"<User(username='{self.username}', type='{self.user_type}', email='{self.email}')>"
@@ -61,6 +62,9 @@ class Message(Base):
     # Message content (encrypted)
     encrypted_content = Column(Text, nullable=False)
     content_type = Column(String(50), default="text")  # text, file, image, etc.
+    
+    # Add decoy text field
+    decoy_content = Column(Text, nullable=True)  # Fake text shown as placeholder
     
     # Message metadata
     timestamp = Column(DateTime, default=func.now())
@@ -178,6 +182,28 @@ class AuditLog(Base):
     
     def __repr__(self):
         return f"<AuditLog(event_type='{self.event_type}', severity='{self.severity}', timestamp={self.timestamp})>"
+
+class MasterToken(Base):
+    """Master token storage for user authentication"""
+    __tablename__ = "master_tokens"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    # Token data (hashed for security)
+    token_hash = Column(String(255), nullable=False)  # Hashed master token
+    salt = Column(String(255), nullable=False)  # Salt used for hashing
+    
+    # Token metadata
+    created_at = Column(DateTime, default=func.now())
+    expires_at = Column(DateTime, nullable=True)  # Optional expiration
+    is_active = Column(Boolean, default=True)
+    
+    # Relationships
+    user = relationship("User", back_populates="master_tokens")
+    
+    def __repr__(self):
+        return f"<MasterToken(user_id={self.user_id}, created_at={self.created_at})>"
 
 # Database connection configuration
 DATABASE_URL = os.getenv(

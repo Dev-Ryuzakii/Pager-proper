@@ -20,6 +20,16 @@ from datetime import datetime, timedelta
 import ipaddress
 import os
 
+# Import database utilities for master token storage and validation
+try:
+    from tls_database_utils import store_master_token, validate_master_token
+    DATABASE_AVAILABLE = True
+except ImportError:
+    store_master_token = None
+    validate_master_token = None
+    DATABASE_AVAILABLE = False
+    print("⚠️  Database utilities not available. Database features will be disabled.")
+
 # Configuration
 HOST = "0.0.0.0"
 PORT = 5050
@@ -226,6 +236,10 @@ def handle_key_registration(tls_socket, data):
         
         save_user_keys()
         
+        # Store master token in database if available
+        if DATABASE_AVAILABLE and store_master_token:
+            store_master_token(username, token)
+        
         # Generate response HMAC
         response_data = {"status": "success", "message": "Registration successful"}
         timestamp = time.time()
@@ -309,6 +323,10 @@ def handle_client_connection(tls_socket, client_address):
                     user_public_keys[username]["last_login"] = time.time()
                     save_user_keys()
                     
+                    # Store master token in database if available
+                    if DATABASE_AVAILABLE and store_master_token:
+                        store_master_token(username, token)
+                    
                     # Send success with HMAC
                     response_data = {"status": "success", "message": "Login successful"}
                     timestamp = time.time()
@@ -378,6 +396,8 @@ def handle_client_connection(tls_socket, client_address):
                     handle_user_list(tls_socket, message_json)
                 elif msg_type == "heartbeat":
                     handle_heartbeat(tls_socket, username)
+                elif msg_type == "decrypt":
+                    handle_decrypt_request(tls_socket, message_json, username)
                 else:
                     log_message(f"Unknown message type '{msg_type}' from {client_ip}")
                     
@@ -601,6 +621,65 @@ def handle_heartbeat(tls_socket, username):
         tls_socket.send(json.dumps(response).encode())
     except Exception as e:
         log_message(f"Heartbeat error: {e}")
+
+def handle_decrypt_request(tls_socket, data, username):
+    """Handle decrypt request with master token validation"""
+    try:
+        # Extract required fields
+        message_id = data.get("message_id")
+        mastertoken = data.get("mastertoken")
+        
+        if not all([message_id, mastertoken]):
+            error_response = {
+                "status": "error", 
+                "message": "Missing required fields: message_id or mastertoken",
+                "timestamp": time.time()
+            }
+            tls_socket.send(json.dumps(error_response).encode())
+            return
+        
+        # Validate master token against database
+        if DATABASE_AVAILABLE and validate_master_token:
+            if not validate_master_token(username, mastertoken):
+                error_response = {
+                    "status": "error", 
+                    "message": "Invalid master token. Master token is required for message decryption.",
+                    "timestamp": time.time()
+                }
+                tls_socket.send(json.dumps(error_response).encode())
+                log_message(f"❌ Invalid master token for user: {username}")
+                return
+        
+        # For TLS system, we don't actually decrypt messages on the server
+        # The client should decrypt messages locally using their private key
+        # But we can validate the request and respond appropriately
+        
+        # In a real implementation, you would:
+        # 1. Retrieve the encrypted message from storage
+        # 2. Validate that the user has permission to decrypt it
+        # 3. Return the encrypted message for client-side decryption
+        
+        # For now, we'll just simulate a successful validation
+        success_response = {
+            "status": "success",
+            "message": "Master token validated. Please decrypt message locally using your private key.",
+            "message_id": message_id,
+            "timestamp": time.time()
+        }
+        tls_socket.send(json.dumps(success_response).encode())
+        log_message(f"✅ Decrypt request validated for user: {username}, message: {message_id}")
+        
+    except Exception as e:
+        log_message(f"Decrypt request error: {e}")
+        try:
+            error_response = {
+                "status": "error", 
+                "message": "Decrypt request failed",
+                "timestamp": time.time()
+            }
+            tls_socket.send(json.dumps(error_response).encode())
+        except:
+            pass
 
 def store_offline_message(recipient, message_data):
     """Store message for offline users (encrypted storage)"""

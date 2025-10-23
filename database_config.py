@@ -20,8 +20,8 @@ class DatabaseConfig:
         self.DB_HOST = os.getenv("DB_HOST", "localhost")
         self.DB_PORT = os.getenv("DB_PORT", "5432")
         self.DB_NAME = os.getenv("DB_NAME", "secure_messaging")
-        self.DB_USER = os.getenv("DB_USER", "postgres")
-        self.DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
+        self.DB_USER = os.getenv("DB_USER", os.getenv("USER", "postgres"))  # Use system user as default
+        self.DB_PASSWORD = os.getenv("DB_PASSWORD", "")  # Empty password for local development
         
         # Connection pool settings
         self.POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
@@ -38,7 +38,10 @@ class DatabaseConfig:
         
     def _build_database_url(self) -> str:
         """Build database URL from configuration"""
-        return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        if self.DB_PASSWORD:
+            return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        else:
+            return f"postgresql://{self.DB_USER}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
     
     def initialize_database(self):
         """Initialize database engine and session factory"""
@@ -69,32 +72,45 @@ class DatabaseConfig:
         """Create all database tables"""
         try:
             if not self.engine:
-                self.initialize_database()
+                if not self.initialize_database():
+                    return False
+                    
+            if self.engine:
+                Base.metadata.create_all(bind=self.engine)
+                logger.info("✅ Database tables created successfully!")
+                return True
+            else:
+                logger.error("❌ Database engine not available")
+                return False
                 
-            Base.metadata.create_all(bind=self.engine)
-            logger.info("✅ Database tables created successfully!")
-            return True
-            
         except Exception as e:
             logger.error(f"❌ Failed to create tables: {e}")
             return False
     
-    def get_session(self) -> Session:
+    def get_session(self) -> Optional[Session]:
         """Get a database session"""
         if not self.SessionLocal:
-            self.initialize_database()
-        return self.SessionLocal()
+            if not self.initialize_database():
+                return None
+        if self.SessionLocal:
+            return self.SessionLocal()
+        return None
     
     def test_connection(self) -> bool:
         """Test database connection"""
         try:
             if not self.engine:
-                self.initialize_database()
-                
-            with self.engine.connect() as connection:
-                result = connection.execute(text("SELECT 1"))
-                logger.info("✅ Database connection test successful!")
-                return True
+                if not self.initialize_database():
+                    return False
+                    
+            if self.engine:
+                with self.engine.connect() as connection:
+                    result = connection.execute(text("SELECT 1"))
+                    logger.info("✅ Database connection test successful!")
+                    return True
+            else:
+                logger.error("❌ Database engine not available for testing")
+                return False
                 
         except Exception as e:
             logger.error(f"❌ Database connection test failed: {e}")
@@ -106,10 +122,13 @@ db_config = DatabaseConfig()
 def get_database_session():
     """Dependency function for FastAPI to get database session"""
     session = db_config.get_session()
-    try:
-        yield session
-    finally:
-        session.close()
+    if session:
+        try:
+            yield session
+        finally:
+            session.close()
+    else:
+        raise Exception("❌ Database session not available")
 
 def init_database():
     """Initialize database for the application"""
@@ -145,7 +164,9 @@ if __name__ == "__main__":
     print(f"Database Port: {db_config.DB_PORT}")
     print(f"Database Name: {db_config.DB_NAME}")
     print(f"Database User: {db_config.DB_USER}")
-    print(f"Database URL: {db_config.DATABASE_URL.replace(db_config.DB_PASSWORD, '*****')}")
+    password_display = "*****" if db_config.DB_PASSWORD else "(empty)"
+    print(f"Database Password: {password_display}")
+    print(f"Database URL: {db_config.DATABASE_URL}")
     
     # Test initialization
     success = init_database()

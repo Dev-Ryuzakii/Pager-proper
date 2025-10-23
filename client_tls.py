@@ -28,6 +28,14 @@ from Crypto.Hash import SHA256
 from Crypto.Signature import pkcs1_15
 from Crypto.Protocol.KDF import PBKDF2, HKDF
 
+# Try to import the fake text generator, but handle if it's not available
+try:
+    from fake_text_generator import FakeTextGenerator
+    FAKE_TEXT_AVAILABLE = True
+except ImportError:
+    FAKE_TEXT_AVAILABLE = False
+    print("⚠️  Fake text generator not available, using placeholder text")
+
 # TLS Configuration
 TLS_SERVER_CERT = "auth/certificates/server_tls_certificate.pem"
 TLS_CLIENT_CERT = "auth/certificates/client_tls_default_certificate.pem"
@@ -1380,7 +1388,13 @@ class TLSSecureMessenger:
                         if not self.verify_message_hmac(message, timestamp, server_hmac):
                             self.log_message("⚠️  Server HMAC verification failed")
                     
-                    # Store encrypted message
+                    # Generate decoy text for display
+                    if FAKE_TEXT_AVAILABLE:
+                        decoy_text = FakeTextGenerator.generate_decoy_text_for_message(str(payload))
+                    else:
+                        decoy_text = "[ENCRYPTED MESSAGE] Tap to decrypt"
+                    
+                    # Store encrypted message with decoy text
                     encrypted_msg = {
                         "id": len(self.encrypted_messages),
                         "sender": sender,
@@ -1388,12 +1402,15 @@ class TLSSecureMessenger:
                         "signature": signature,
                         "timestamp": timestamp,
                         "time_str": time_str,
-                        "server_hmac": server_hmac
+                        "server_hmac": server_hmac,
+                        "decoy_text": decoy_text
                     }
                     self.encrypted_messages.append(encrypted_msg)
                     
-                    # Show notification
+                    # Show notification with decoy text preview
+                    decoy_preview = encrypted_msg.get('decoy_text', '[ENCRYPTED MESSAGE]')[:50] + '...'
                     print(f"\n🔒 [TLS-ENCRYPTED] MESSAGE from {sender} (ID: {encrypted_msg['id']}) at {time_str}")
+                    print(f"📝 Preview: {decoy_preview}")
                     print("🔐 Type 'decrypt <ID>' to read this message")
                     
             except json.JSONDecodeError:
@@ -1419,7 +1436,10 @@ class TLSSecureMessenger:
                 security_indicators.append("SIG✓")
             
             security_str = f" [{', '.join(security_indicators)}]" if security_indicators else ""
+            # Display decoy text instead of just showing that it's encrypted
+            decoy_text = msg.get('decoy_text', '[ENCRYPTED MESSAGE]')
             print(f"🔒 ID {msg['id']}: [{msg['time_str']}] from {msg['sender']}{security_str}")
+            print(f"   {decoy_text}")
         
         print("🔓 Type 'decrypt <ID>' to read a message")
         print("=" * 35)
@@ -1433,6 +1453,10 @@ class TLSSecureMessenger:
             
             msg = self.encrypted_messages[msg_id]
             print(f"\n🔓 Decrypting TLS message from {msg['sender']} at {msg['time_str']}")
+            
+            # Show what the decoy text was
+            decoy_text = msg.get('decoy_text', '[ENCRYPTED MESSAGE]')
+            print(f"📝 Previously shown as: {decoy_text}")
             
             # ALWAYS prompt for master token for message decryption (security requirement)
             print("🔐 Master token required for message decryption")
