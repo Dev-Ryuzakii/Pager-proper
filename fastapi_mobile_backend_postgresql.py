@@ -36,10 +36,9 @@ if os.path.exists('.env'):
                 key, value = line.strip().split('=', 1)
                 os.environ[key] = value
 
+# Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog
-
-# Import the fake text generator
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken
 from fake_text_generator import FakeTextGenerator
 
 # Configure logging
@@ -185,6 +184,52 @@ class UserService:
     def get_all_users(db: Session) -> List[User]:
         """Get all active users"""
         return db.query(User).filter(User.is_active == True).all()
+    
+    @staticmethod
+    def delete_user(db: Session, username: str) -> bool:
+        """Delete a user account and all associated data"""
+        try:
+            # Get the user
+            user = db.query(User).filter(User.username == username).first()
+            if not user:
+                return False
+            
+            # Get user ID for logging
+            user_id = getattr(user, 'id', None)
+            
+            # Log the deletion
+            AuditService.log_event(
+                db, user_id, "account_deleted", 
+                f"User account {username} deleted by system"
+            )
+            
+            # Delete associated data first due to foreign key constraints
+            # Delete user sessions
+            db.query(UserSession).filter(UserSession.user_id == user_id).delete()
+            
+            # Delete user keys
+            db.query(UserKey).filter(UserKey.user_id == user_id).delete()
+            
+            # Delete user master tokens
+            db.query(DBMasterToken).filter(DBMasterToken.user_id == user_id).delete()
+            
+            # Delete messages sent by user
+            db.query(Message).filter(Message.sender_id == user_id).delete()
+            
+            # Delete messages received by user
+            db.query(Message).filter(Message.recipient_id == user_id).delete()
+            
+            # Finally delete the user
+            db.delete(user)
+            db.commit()
+            
+            logger.info(f"✅ User account and all associated data deleted: {username}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error deleting user {username}: {e}")
+            db.rollback()
+            return False
 
 class MessageService:
     """Service class for message operations"""
@@ -319,10 +364,9 @@ class SessionService:
     
     @staticmethod
     def invalidate_session(db: Session, session_token: str) -> bool:
-        """Invalidate a session"""
+        """Invalidate a session (logout)"""
         session = db.query(UserSession).filter(UserSession.session_token == session_token).first()
         if session:
-            # Use setattr for SQLAlchemy models to avoid type errors
             setattr(session, 'is_active', False)
             setattr(session, 'logout_reason', "manual")
             db.commit()
@@ -334,7 +378,7 @@ class AuditService:
     
     @staticmethod
     def log_event(db: Session, user_id: Optional[int], event_type: str, description: str, 
-                  severity: str = "info", ip_address: Optional[str] = None, extra_data: Optional[Dict[Any, Any]] = None) -> None:
+                  severity: str = "info", ip_address: Optional[str] = None, extra_data: Optional[Dict[Any, Any]] = None):
         """Log an audit event"""
         audit_log = AuditLog(
             user_id=user_id,
@@ -916,6 +960,31 @@ async def confirm_mastertoken(token_data: MasterToken,
     except Exception as e:
         logger.error(f"Confirm mastertoken error: {e}")
         raise HTTPException(status_code=500, detail="Failed to confirm master token")
+
+@app.delete("/users/{username}")
+async def delete_user_account(
+    username: str,
+    db: Session = Depends(get_database_session)
+):
+    """Delete a user account and all associated data.
+    This endpoint is intended for system use, not for users to call directly."""
+    try:
+        # Delete the user account
+        success = UserService.delete_user(db, username)
+        
+        if success:
+            return {
+                "message": f"User account '{username}' deleted successfully",
+                "deleted": True
+            }
+        else:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete user error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete user account")
 
 @app.post("/decrypt")
 async def decrypt_message(
