@@ -26,6 +26,8 @@ After your database is created:
 2. Find the "External Database URL" in the "Connections" section
 3. Copy this URL - you'll need it for the web service configuration
 
+**Important**: The database needs to be created before deploying the web service, as the web service will try to connect to the database during startup.
+
 ### 3. Create the Web Service
 
 1. Go to your Render Dashboard
@@ -49,6 +51,9 @@ PORT=8000
 
 Replace `your_render_database_url_here` with the actual database URL from step 2.
 
+**Note**: Make sure to use the full DATABASE_URL from Render's dashboard, which should look something like:
+`postgres://username:password@host:port/database_name`
+
 ### 5. Deploy
 
 Click "Create Web Service" and Render will automatically deploy your application.
@@ -63,9 +68,19 @@ The application provides a `/health` endpoint that Render can use for health che
 
 If you see database connection errors:
 
-1. Verify the DATABASE_URL environment variable is correctly set
-2. Ensure your database and web service are in the same region
-3. Check that your database is not suspended or paused
+1. **Verify the DATABASE_URL environment variable is correctly set**
+   - Check that it's not empty
+   - Make sure it's the full URL from Render's dashboard
+   - Ensure there are no extra spaces or characters
+
+2. **Ensure your database and web service are in the same region**
+   - This minimizes latency and enables communication over your private network
+
+3. **Check that your database is not suspended or paused**
+   - Go to your database's dashboard and verify its status
+
+4. **Wait for the database to be fully ready**
+   - Sometimes there's a delay between database creation and it being ready to accept connections
 
 ### Port Binding Issues
 

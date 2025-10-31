@@ -11,6 +11,10 @@ mkdir -p uploads
 # Set environment variables
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 
+# Debug database configuration
+echo "🔍 Debugging database configuration..."
+python debug_db.py
+
 # Wait for database to be ready (in case of race conditions)
 echo "⏳ Waiting for database to be ready..."
 sleep 15

@@ -7,6 +7,7 @@ This script initializes the PostgreSQL database for the Secure Messaging API.
 import os
 import sys
 import logging
+import time
 from database_config import db_config, init_database
 
 # Configure logging
@@ -19,8 +20,18 @@ def main():
     print("=" * 50)
     
     # Show configuration
-    if hasattr(db_config, 'DATABASE_URL'):
-        print(f"Database URL: {db_config.DATABASE_URL}")
+    print("Database Configuration:")
+    print(f"  DATABASE_URL: {getattr(db_config, 'DATABASE_URL', 'Not set')}")
+    
+    if hasattr(db_config, 'DB_HOST'):
+        print(f"  DB_HOST: {db_config.DB_HOST}")
+        print(f"  DB_PORT: {db_config.DB_PORT}")
+        print(f"  DB_NAME: {db_config.DB_NAME}")
+        print(f"  DB_USER: {db_config.DB_USER}")
+    
+    # Wait a bit for database to be ready
+    print("⏳ Waiting for database to be ready...")
+    time.sleep(10)
     
     # Initialize database with retry logic
     try:

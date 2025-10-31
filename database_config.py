@@ -19,15 +19,36 @@ class DatabaseConfig:
     """Database configuration class"""
     
     def __init__(self):
+        # Connection pool settings (set these first)
+        self.POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
+        self.MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+        self.POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+        self.POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "3600"))
+        
         # Handle Render's DATABASE_URL environment variable
         database_url = os.getenv("DATABASE_URL")
         
-        if database_url:
+        # Log all relevant environment variables for debugging
+        logger.info("Environment variables:")
+        for key, value in os.environ.items():
+            if "DATABASE" in key.upper() or "DB_" in key.upper():
+                # Don't log sensitive information
+                if "PASSWORD" in key.upper() or "SECRET" in key.upper():
+                    logger.info(f"  {key}: ***")
+                else:
+                    logger.info(f"  {key}: {value}")
+        
+        if database_url and database_url.strip():
             # Use Render's provided DATABASE_URL
             logger.info("Using Render DATABASE_URL")
-            self.DATABASE_URL = database_url
+            logger.info(f"Raw DATABASE_URL: {database_url}")
+            
+            # Validate and normalize the database URL
+            self.DATABASE_URL = self._normalize_database_url(database_url)
+            logger.info(f"Normalized DATABASE_URL: {self.DATABASE_URL}")
         else:
             # Fallback to individual environment variables
+            logger.warning("DATABASE_URL not found or empty, using fallback configuration")
             self.DB_HOST = os.getenv("DB_HOST", "localhost")
             self.DB_PORT = os.getenv("DB_PORT", "5432")
             self.DB_NAME = os.getenv("DB_NAME", "secure_messaging")
@@ -36,17 +57,35 @@ class DatabaseConfig:
             
             # Connection string
             self.DATABASE_URL = self._build_database_url()
-        
-        # Connection pool settings
-        self.POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
-        self.MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
-        self.POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
-        self.POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "3600"))
+            logger.info(f"Using fallback DATABASE_URL: {self.DATABASE_URL}")
         
         # Engine and session
         self.engine = None
         self.SessionLocal = None
+
+    def _normalize_database_url(self, database_url: str) -> str:
+        """Normalize database URL for proper connection"""
+        # Handle common issues with database URLs
+        normalized_url = database_url.strip()
         
+        # Add postgresql:// prefix if missing
+        if not normalized_url.startswith(("postgresql://", "postgres://")):
+            normalized_url = "postgresql://" + normalized_url
+        
+        # Replace postgres:// with postgresql:// if needed
+        if normalized_url.startswith("postgres://"):
+            normalized_url = "postgresql://" + normalized_url[11:]
+        
+        # Add SSL requirement for Render if not already present
+        if "render.com" in normalized_url and "sslmode=" not in normalized_url:
+            logger.info("Adding SSL requirement for Render database")
+            if "?" in normalized_url:
+                normalized_url += "&sslmode=require"
+            else:
+                normalized_url += "?sslmode=require"
+        
+        return normalized_url
+    
     def _build_database_url(self) -> str:
         """Build database URL from configuration"""
         if hasattr(self, 'DB_PASSWORD') and self.DB_PASSWORD:
@@ -63,12 +102,16 @@ class DatabaseConfig:
             try:
                 # Handle special case for Render's DATABASE_URL which might need SSL settings
                 database_url = self.DATABASE_URL
+                logger.info(f"Processing database URL: {database_url}")
+                
                 if "render.com" in database_url and "sslmode=require" not in database_url:
                     # Add SSL requirement for Render
+                    logger.info("Adding SSL requirement for Render database")
                     if "?" in database_url:
                         database_url += "&sslmode=require"
                     else:
                         database_url += "?sslmode=require"
+                    logger.info(f"Modified database URL: {database_url}")
                 
                 self.engine = create_engine(
                     database_url,
@@ -134,17 +177,14 @@ class DatabaseConfig:
         for attempt in range(max_retries):
             try:
                 if not self.engine:
-                    if not self.initialize_database():
-                        return False
-                        
-                if self.engine:
-                    with self.engine.connect() as connection:
-                        result = connection.execute(text("SELECT 1"))
-                        logger.info("✅ Database connection test successful!")
-                        return True
-                else:
                     logger.error("❌ Database engine not available for testing")
                     return False
+                        
+                logger.info("Attempting to connect to database...")
+                with self.engine.connect() as connection:
+                    result = connection.execute(text("SELECT 1"))
+                    logger.info("✅ Database connection test successful!")
+                    return True
                     
             except OperationalError as e:
                 logger.error(f"❌ Database connection test failed (attempt {attempt + 1}/{max_retries}): {e}")
@@ -155,6 +195,7 @@ class DatabaseConfig:
                     return False
             except Exception as e:
                 logger.error(f"❌ Database connection test failed with unexpected error: {e}")
+                logger.error(f"Error type: {type(e)}")
                 return False
 
 # Global database configuration instance
