@@ -577,17 +577,18 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("🚀 Starting FastAPI Mobile Backend with PostgreSQL...")
     
-    # Initialize database
-    if not db_config.initialize_database():
-        logger.error("❌ Failed to initialize database")
-        raise Exception("Database initialization failed")
-    
-    # Test connection
-    if not db_config.test_connection():
-        logger.error("❌ Database connection test failed")
-        raise Exception("Database connection failed")
-    
-    logger.info("✅ PostgreSQL database connected successfully")
+    # Initialize database with retry logic
+    if not db_config.initialize_database(max_retries=5, retry_delay=10):
+        logger.error("❌ Failed to initialize database after multiple attempts")
+        # Don't raise exception, let the app start but with database issues
+        logger.warning("⚠️  App will start but database functionality may be limited")
+    else:
+        # Test connection
+        if not db_config.test_connection(max_retries=3, retry_delay=5):
+            logger.error("❌ Database connection test failed after multiple attempts")
+            logger.warning("⚠️  App will start but database functionality may be limited")
+        else:
+            logger.info("✅ PostgreSQL database connected successfully")
     
     yield
     
@@ -659,6 +660,11 @@ async def root():
         "status": "running",
         "database": "PostgreSQL"
     }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Render"""
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/status")
 async def get_status(db: Session = Depends(get_database_session)):
@@ -1083,10 +1089,12 @@ async def decrypt_message(
         )
 
 if __name__ == "__main__":
+    # Use Render's PORT environment variable, default to 8000 for local development
+    port = int(os.getenv("PORT", 8000))
     uvicorn.run(
         "fastapi_mobile_backend_postgresql:app",
         host="0.0.0.0",
-        port=8001,
-        reload=True,
+        port=port,
+        reload=False,  # Disable reload in production
         log_level="info"
     )

@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: secure-messaging-api
+    runtime: python
+    buildCommand: "pip install -r requirements_postgresql.txt"
+    preDeployCommand: "python init_db.py"
+    startCommand: "./start_render.sh"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.4
+      - key: PORT
+        value: 8000

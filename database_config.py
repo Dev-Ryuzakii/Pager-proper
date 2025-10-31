@@ -4,9 +4,12 @@ Settings and utilities for database connections
 """
 
 import os
+import re
+import time
 from typing import Optional
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import OperationalError
 from database_models import Base
 import logging
 
@@ -16,12 +19,23 @@ class DatabaseConfig:
     """Database configuration class"""
     
     def __init__(self):
-        # Database connection settings
-        self.DB_HOST = os.getenv("DB_HOST", "localhost")
-        self.DB_PORT = os.getenv("DB_PORT", "5432")
-        self.DB_NAME = os.getenv("DB_NAME", "secure_messaging")
-        self.DB_USER = os.getenv("DB_USER", os.getenv("USER", "postgres"))  # Use system user as default
-        self.DB_PASSWORD = os.getenv("DB_PASSWORD", "")  # Empty password for local development
+        # Handle Render's DATABASE_URL environment variable
+        database_url = os.getenv("DATABASE_URL")
+        
+        if database_url:
+            # Use Render's provided DATABASE_URL
+            logger.info("Using Render DATABASE_URL")
+            self.DATABASE_URL = database_url
+        else:
+            # Fallback to individual environment variables
+            self.DB_HOST = os.getenv("DB_HOST", "localhost")
+            self.DB_PORT = os.getenv("DB_PORT", "5432")
+            self.DB_NAME = os.getenv("DB_NAME", "secure_messaging")
+            self.DB_USER = os.getenv("DB_USER", os.getenv("USER", "postgres"))  # Use system user as default
+            self.DB_PASSWORD = os.getenv("DB_PASSWORD", "")  # Empty password for local development
+            
+            # Connection string
+            self.DATABASE_URL = self._build_database_url()
         
         # Connection pool settings
         self.POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
@@ -29,63 +43,82 @@ class DatabaseConfig:
         self.POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
         self.POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "3600"))
         
-        # Connection string
-        self.DATABASE_URL = self._build_database_url()
-        
         # Engine and session
         self.engine = None
         self.SessionLocal = None
         
     def _build_database_url(self) -> str:
         """Build database URL from configuration"""
-        if self.DB_PASSWORD:
+        if hasattr(self, 'DB_PASSWORD') and self.DB_PASSWORD:
             return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
-        else:
+        elif hasattr(self, 'DB_USER'):
             return f"postgresql://{self.DB_USER}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        else:
+            # This case should not happen if DATABASE_URL is not set
+            return "postgresql://postgres@localhost:5432/secure_messaging"
     
-    def initialize_database(self):
-        """Initialize database engine and session factory"""
-        try:
-            self.engine = create_engine(
-                self.DATABASE_URL,
-                pool_size=self.POOL_SIZE,
-                max_overflow=self.MAX_OVERFLOW,
-                pool_timeout=self.POOL_TIMEOUT,
-                pool_recycle=self.POOL_RECYCLE,
-                echo=False  # Set to True for SQL debugging
-            )
-            
-            self.SessionLocal = sessionmaker(
-                autocommit=False,
-                autoflush=False,
-                bind=self.engine
-            )
-            
-            logger.info(f"✅ Database connection initialized: {self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize database: {e}")
-            return False
+    def initialize_database(self, max_retries=3, retry_delay=5):
+        """Initialize database engine and session factory with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                # Handle special case for Render's DATABASE_URL which might need SSL settings
+                database_url = self.DATABASE_URL
+                if "render.com" in database_url and "sslmode=require" not in database_url:
+                    # Add SSL requirement for Render
+                    if "?" in database_url:
+                        database_url += "&sslmode=require"
+                    else:
+                        database_url += "?sslmode=require"
+                
+                self.engine = create_engine(
+                    database_url,
+                    pool_size=self.POOL_SIZE,
+                    max_overflow=self.MAX_OVERFLOW,
+                    pool_timeout=self.POOL_TIMEOUT,
+                    pool_recycle=self.POOL_RECYCLE,
+                    echo=False  # Set to True for SQL debugging
+                )
+                
+                self.SessionLocal = sessionmaker(
+                    autocommit=False,
+                    autoflush=False,
+                    bind=self.engine
+                )
+                
+                logger.info(f"✅ Database connection initialized")
+                return True
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize database (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"⏳ Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    return False
     
-    def create_tables(self):
-        """Create all database tables"""
-        try:
-            if not self.engine:
-                if not self.initialize_database():
+    def create_tables(self, max_retries=3, retry_delay=5):
+        """Create all database tables with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                if not self.engine:
+                    if not self.initialize_database():
+                        return False
+                        
+                if self.engine:
+                    Base.metadata.create_all(bind=self.engine)
+                    logger.info("✅ Database tables created successfully!")
+                    return True
+                else:
+                    logger.error("❌ Database engine not available")
                     return False
                     
-            if self.engine:
-                Base.metadata.create_all(bind=self.engine)
-                logger.info("✅ Database tables created successfully!")
-                return True
-            else:
-                logger.error("❌ Database engine not available")
-                return False
-                
-        except Exception as e:
-            logger.error(f"❌ Failed to create tables: {e}")
-            return False
+            except Exception as e:
+                logger.error(f"❌ Failed to create tables (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"⏳ Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    return False
     
     def get_session(self) -> Optional[Session]:
         """Get a database session"""
@@ -96,25 +129,33 @@ class DatabaseConfig:
             return self.SessionLocal()
         return None
     
-    def test_connection(self) -> bool:
-        """Test database connection"""
-        try:
-            if not self.engine:
-                if not self.initialize_database():
+    def test_connection(self, max_retries=3, retry_delay=5):
+        """Test database connection with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                if not self.engine:
+                    if not self.initialize_database():
+                        return False
+                        
+                if self.engine:
+                    with self.engine.connect() as connection:
+                        result = connection.execute(text("SELECT 1"))
+                        logger.info("✅ Database connection test successful!")
+                        return True
+                else:
+                    logger.error("❌ Database engine not available for testing")
                     return False
                     
-            if self.engine:
-                with self.engine.connect() as connection:
-                    result = connection.execute(text("SELECT 1"))
-                    logger.info("✅ Database connection test successful!")
-                    return True
-            else:
-                logger.error("❌ Database engine not available for testing")
+            except OperationalError as e:
+                logger.error(f"❌ Database connection test failed (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"⏳ Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    return False
+            except Exception as e:
+                logger.error(f"❌ Database connection test failed with unexpected error: {e}")
                 return False
-                
-        except Exception as e:
-            logger.error(f"❌ Database connection test failed: {e}")
-            return False
 
 # Global database configuration instance
 db_config = DatabaseConfig()
@@ -130,22 +171,22 @@ def get_database_session():
     else:
         raise Exception("❌ Database session not available")
 
-def init_database():
-    """Initialize database for the application"""
+def init_database(max_retries=3, retry_delay=5):
+    """Initialize database for the application with retry logic"""
     logger.info("🔧 Initializing PostgreSQL database...")
     
     # Initialize connection
-    if not db_config.initialize_database():
+    if not db_config.initialize_database(max_retries, retry_delay):
         logger.error("❌ Failed to initialize database connection")
         return False
     
     # Test connection
-    if not db_config.test_connection():
+    if not db_config.test_connection(max_retries, retry_delay):
         logger.error("❌ Database connection test failed")
         return False
     
     # Create tables
-    if not db_config.create_tables():
+    if not db_config.create_tables(max_retries, retry_delay):
         logger.error("❌ Failed to create database tables")
         return False
     
@@ -160,13 +201,8 @@ if __name__ == "__main__":
     print("=" * 50)
     
     # Show configuration
-    print(f"Database Host: {db_config.DB_HOST}")
-    print(f"Database Port: {db_config.DB_PORT}")
-    print(f"Database Name: {db_config.DB_NAME}")
-    print(f"Database User: {db_config.DB_USER}")
-    password_display = "*****" if db_config.DB_PASSWORD else "(empty)"
-    print(f"Database Password: {password_display}")
-    print(f"Database URL: {db_config.DATABASE_URL}")
+    if hasattr(db_config, 'DATABASE_URL'):
+        print(f"Database URL: {db_config.DATABASE_URL}")
     
     # Test initialization
     success = init_database()
