@@ -9,7 +9,7 @@ import json
 import time
 
 # API base URL
-BASE_URL = "http://localhost:8000"
+BASE_URL = "http://localhost:8001"
 
 class APITester:
     def __init__(self):
@@ -272,7 +272,7 @@ async def run_comprehensive_test():
         print("⚠️  Some tests failed. Check the output above.")
 
 if __name__ == "__main__":
-    print("📱 Make sure the FastAPI server is running on http://localhost:8000")
+    print("📱 Make sure the FastAPI server is running on http://localhost:8001")
     print("   Start with: python fastapi_mobile_backend.py")
     print()
     

@@ -1147,8 +1147,8 @@ async def decrypt_message(
         )
 
 if __name__ == "__main__":
-    # Use Render's PORT environment variable, default to 8000 for local development
-    port = int(os.getenv("PORT", 8000))
+    # Use Render's PORT environment variable, default to 8001 for local development
+    port = int(os.getenv("PORT", 8001))
     uvicorn.run(
         "fastapi_mobile_backend_postgresql:app",
         host="0.0.0.0",

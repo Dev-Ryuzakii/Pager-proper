@@ -9,7 +9,7 @@ services:
       - key: PYTHON_VERSION
         value: 3.13.4
       - key: PORT
-        value: 8000
+        value: 8001
   - type: worker
     name: message-cleanup-worker
     runtime: python

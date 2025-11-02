@@ -58,7 +58,7 @@ Add these environment variables to both your web service and background worker:
 
 ```
 DATABASE_URL=your_render_database_url_here
-PORT=8000
+PORT=8001
 ```
 
 For the background worker, you can also add:

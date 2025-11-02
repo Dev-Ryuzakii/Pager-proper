@@ -38,9 +38,9 @@ echo "   🔒 End-to-End Encryption Integration"
 echo "   📊 Real-time API Documentation"
 echo ""
 
-echo "🌐 Starting server on http://localhost:8000"
-echo "📖 API Documentation: http://localhost:8000/api/docs"
-echo "📚 Alternative Docs: http://localhost:8000/api/redoc"
+echo "🌐 Starting server on http://localhost:8001"
+echo "📖 API Documentation: http://localhost:8001/api/docs"
+echo "📚 Alternative Docs: http://localhost:8001/api/redoc"
 echo ""
 
 echo "Press Ctrl+C to stop the server"

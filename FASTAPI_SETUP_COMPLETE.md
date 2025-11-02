@@ -3,7 +3,7 @@
 ## ✅ What's Been Accomplished
 
 ### 🏗️ **Complete FastAPI Backend Setup**
-- ✅ FastAPI server running on `http://localhost:8000`
+- ✅ FastAPI server running on `http://localhost:8001`
 - ✅ All dependencies installed successfully
 - ✅ Integration with existing TLS encryption system
 - ✅ **7/7 API tests passed** - Full functionality verified
@@ -68,9 +68,9 @@ python3 fastapi_mobile_backend.py
 ```
 
 ### Access API Documentation
-- **Swagger UI**: http://localhost:8000/api/docs
-- **ReDoc**: http://localhost:8000/api/redoc
-- **Health Check**: http://localhost:8000/api/v1/health
+- **Swagger UI**: http://localhost:8001/api/docs
+- **ReDoc**: http://localhost:8001/api/redoc
+- **Health Check**: http://localhost:8001/api/v1/health
 
 ### Run Tests
 ```bash
@@ -86,7 +86,7 @@ import 'package:dio/dio.dart';
 
 class ApiService {
   final Dio _dio = Dio(BaseOptions(
-    baseUrl: 'http://localhost:8000/api/v1',
+    baseUrl: 'http://localhost:8001/api/v1',
     headers: {'Content-Type': 'application/json'},
   ));
   

@@ -5,7 +5,7 @@ from typing import Optional
 class Settings:
     # Server Configuration
     HOST: str = "0.0.0.0"
-    PORT: int = 8000
+    PORT: int = 8001
     DEBUG: bool = True
     
     # Security Configuration
