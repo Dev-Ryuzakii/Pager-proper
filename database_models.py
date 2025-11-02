@@ -72,6 +72,10 @@ class Message(Base):
     read = Column(Boolean, default=False)
     read_timestamp = Column(DateTime, nullable=True)
     
+    # Disappearing messages
+    expires_at = Column(DateTime, nullable=True)  # When the message should be deleted
+    auto_delete = Column(Boolean, default=False)  # Whether the message should auto-delete
+    
     # Message encryption info
     encryption_algorithm = Column(String(50), default="RSA+AES256-GCM")
     message_hash = Column(String(64), nullable=True)  # SHA-256 hash for integrity

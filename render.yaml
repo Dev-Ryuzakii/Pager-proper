@@ -10,3 +10,13 @@ services:
         value: 3.13.4
       - key: PORT
         value: 8000
+  - type: worker
+    name: message-cleanup-worker
+    runtime: python
+    buildCommand: "pip install -r requirements_postgresql.txt"
+    startCommand: "python background_cleanup.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.4
+      - key: CLEANUP_INTERVAL_SECONDS
+        value: "3600"

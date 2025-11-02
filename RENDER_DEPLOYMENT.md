@@ -40,13 +40,31 @@ After your database is created:
    - Start Command: `./start_render.sh`
    - Plan: Choose an appropriate plan (Starter is fine for testing)
 
-### 4. Configure Environment Variables
+### 4. Create the Background Worker for Message Cleanup
 
-Add these environment variables to your web service:
+1. Go to your Render Dashboard
+2. Click "+ New" → "Background Worker"
+3. Connect your Git repository
+4. Configure the service:
+   - Name: `message-cleanup-worker`
+   - Runtime: Python 3
+   - Build Command: `pip install -r requirements_postgresql.txt`
+   - Start Command: `python background_cleanup.py`
+   - Plan: Choose an appropriate plan (Free is fine for the worker)
+
+### 5. Configure Environment Variables
+
+Add these environment variables to both your web service and background worker:
 
 ```
 DATABASE_URL=your_render_database_url_here
 PORT=8000
+```
+
+For the background worker, you can also add:
+
+```
+CLEANUP_INTERVAL_SECONDS=3600
 ```
 
 Replace `your_render_database_url_here` with the actual database URL from step 2.
@@ -54,13 +72,17 @@ Replace `your_render_database_url_here` with the actual database URL from step 2
 **Note**: Make sure to use the full DATABASE_URL from Render's dashboard, which should look something like:
 `postgres://username:password@host:port/database_name`
 
-### 5. Deploy
+### 6. Deploy
 
-Click "Create Web Service" and Render will automatically deploy your application.
+Click "Create Web Service" and "Create Background Worker" and Render will automatically deploy your application.
 
 ## Health Checks
 
 The application provides a `/health` endpoint that Render can use for health checks.
+
+## Disappearing Messages Feature
+
+The application now includes support for disappearing messages that automatically delete after a specified time period. The background worker handles the automatic cleanup of expired messages.
 
 ## Troubleshooting
 

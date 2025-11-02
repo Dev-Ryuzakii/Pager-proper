@@ -8,7 +8,8 @@ import os
 import sys
 import logging
 import time
-from database_config import db_config, init_database
+from database_config import db_config
+from database_models import Base, engine
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,17 +34,15 @@ def main():
     print("⏳ Waiting for database to be ready...")
     time.sleep(10)
     
-    # Initialize database with retry logic
     try:
-        success = init_database(max_retries=5, retry_delay=10)
+        # Create all database tables
+        print("📦 Creating database tables...")
+        Base.metadata.create_all(bind=engine)
+        print("✅ Database tables created successfully!")
         
-        if success:
-            print("\n🎉 Database initialization completed successfully!")
-            print("You can now use PostgreSQL with your secure messaging system.")
-            return 0
-        else:
-            print("\n❌ Database initialization failed after multiple attempts!")
-            return 1
+        print("\n🎉 Database initialization completed successfully!")
+        print("You can now use PostgreSQL with your secure messaging system.")
+        return 0
             
     except Exception as e:
         logger.error(f"Database initialization error: {e}")

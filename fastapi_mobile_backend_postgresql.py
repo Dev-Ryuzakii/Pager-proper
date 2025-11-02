@@ -64,6 +64,7 @@ class UserLogin(UserAuth):
 class MessageSend(BaseModel):
     username: str = Field(..., description="Recipient username")
     message: str = Field(..., min_length=1, description="Message content")
+    disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
 
 class MasterToken(BaseModel):
     mastertoken: str = Field(..., description="Master decryption token")
@@ -235,7 +236,7 @@ class MessageService:
     """Service class for message operations"""
     
     @staticmethod
-    def send_message(db: Session, sender_id: int, recipient_username: str, message_content: str) -> Message:
+    def send_message(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = None) -> Message:
         """Send a message - simplified"""
         # Get recipient
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
@@ -249,6 +250,13 @@ class MessageService:
             print(f"⚠️  Error generating decoy text: {e}")
             decoy_text = "[ENCRYPTED MESSAGE] Tap to decrypt"
         
+        # Calculate expiration time if disappearing message
+        expires_at = None
+        auto_delete = False
+        if disappear_after_hours is not None and disappear_after_hours > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=disappear_after_hours)
+            auto_delete = True
+        
         # Create message - simplified
         message = Message(
             sender_id=sender_id,
@@ -257,7 +265,9 @@ class MessageService:
             content_type="encrypted",
             delivered=False,
             read=False,
-            is_offline=True  # Mark as offline initially
+            is_offline=True,  # Mark as offline initially
+            expires_at=expires_at,
+            auto_delete=auto_delete
         )
         
         # Try to set decoy_content, but handle case where column might not exist yet
@@ -315,6 +325,29 @@ class MessageService:
             db.commit()
             return True
         return False
+    
+    @staticmethod
+    def delete_expired_messages(db: Session) -> int:
+        """Delete expired messages and return count of deleted messages"""
+        current_time = datetime.now(timezone.utc)
+        expired_messages = db.query(Message).filter(
+            and_(
+                Message.auto_delete == True,
+                Message.expires_at <= current_time
+            )
+        ).all()
+        
+        deleted_count = len(expired_messages)
+        
+        # Delete expired messages
+        for message in expired_messages:
+            db.delete(message)
+        
+        if deleted_count > 0:
+            db.commit()
+            logger.info(f"🗑️  Deleted {deleted_count} expired messages")
+        
+        return deleted_count
 
 class SessionService:
     """Service class for session management"""
@@ -761,13 +794,22 @@ async def send_message(message_data: MessageSend,
     try:
         user_id = int(getattr(current_user, 'id', 0)) if hasattr(getattr(current_user, 'id', 0), '__int__') else int(getattr(current_user, 'id', 0))
         message = MessageService.send_message(
-            db, user_id, message_data.username, message_data.message
+            db, user_id, message_data.username, message_data.message, message_data.disappear_after_hours
         )
         
-        return {
+        response = {
             "username": message_data.username,
             "message": "sent"
         }
+        
+        # Add expiration info if it's a disappearing message
+        auto_delete = getattr(message, 'auto_delete', False)
+        expires_at = getattr(message, 'expires_at', None)
+        if auto_delete and expires_at:
+            response["expires_at"] = expires_at.isoformat() if hasattr(expires_at, 'isoformat') else str(expires_at)
+            response["auto_delete"] = str(auto_delete).lower()
+        
+        return response
         
     except HTTPException:
         raise
@@ -966,6 +1008,22 @@ async def confirm_mastertoken(token_data: MasterToken,
     except Exception as e:
         logger.error(f"Confirm mastertoken error: {e}")
         raise HTTPException(status_code=500, detail="Failed to confirm master token")
+
+@app.post("/messages/cleanup")
+async def cleanup_expired_messages(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Manually trigger cleanup of expired messages"""
+    try:
+        deleted_count = MessageService.delete_expired_messages(db)
+        return {
+            "message": f"Cleanup completed. {deleted_count} expired messages deleted.",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to cleanup expired messages")
 
 @app.delete("/users/{username}")
 async def delete_user_account(
