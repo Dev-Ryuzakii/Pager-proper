@@ -129,7 +129,7 @@ Get offline messages for the user.
 Mark a message as read.
 
 **Response:**
-```json
+``json
 {
   "message": "Message marked as read"
 }
@@ -300,3 +300,91 @@ A background worker runs periodically to clean up expired messages. The cleanup 
 ### Manual Cleanup
 
 You can also manually trigger cleanup by calling the `/messages/cleanup` endpoint.
+
+## Media Handling
+
+The API supports secure handling of encrypted media files (photos and videos) and document files from user devices.
+
+### Media Upload
+
+#### POST /media/upload
+Upload an encrypted media or document file.
+
+**Request Body:**
+```json
+{
+  "username": "string",
+  "media_type": "string", // "photo", "video", or "document"
+  "encrypted_content": "string", // Base64 encoded encrypted file content
+  "filename": "string", // Original filename
+  "file_size": "integer", // File size in bytes
+  "disappear_after_hours": "integer (optional)" // Hours after which file should disappear
+}
+```
+
+**Response:**
+```json
+{
+  "media_id": "string",
+  "filename": "string",
+  "media_type": "string",
+  "message": "Media uploaded successfully"
+}
+```
+
+### Media Retrieval
+
+#### GET /media/inbox
+Get the user's media and document inbox.
+
+**Response:**
+``json
+{
+  "media_files": [
+    {
+      "id": "integer",
+      "media_id": "string",
+      "filename": "string",
+      "media_type": "string",
+      "content_type": "string",
+      "file_size": "integer",
+      "sender": "string",
+      "recipient": "string",
+      "timestamp": "string (ISO 8601 format)",
+      "expires_at": "string (ISO 8601 format or null)",
+      "auto_delete": "boolean",
+      "downloaded": "boolean"
+    }
+  ],
+  "count": "integer"
+}
+```
+
+#### GET /media/{media_id}
+Download an encrypted media or document file.
+
+**Response:**
+```json
+{
+  "media_id": "string",
+  "filename": "string",
+  "media_type": "string",
+  "content_type": "string",
+  "file_size": "integer",
+  "encrypted_content": "string", // Base64 encoded encrypted content
+  "encryption_metadata": "object or null"
+}
+```
+
+### Disappearing Media and Documents
+
+Media and document files support the same disappearing functionality as text messages:
+
+1. When uploading, you can optionally specify the `disappear_after_hours` parameter
+2. If provided, the file will be marked for automatic deletion
+3. A background cleanup process runs periodically to delete expired files
+4. Expired files are permanently deleted from the server
+
+### Manual Media Cleanup
+
+You can manually trigger cleanup of expired media by calling the `/media/cleanup` endpoint.

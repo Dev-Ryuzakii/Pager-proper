@@ -38,7 +38,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media
 from fake_text_generator import FakeTextGenerator
 
 # Configure logging
@@ -90,6 +90,29 @@ class UserResponse(BaseModel):
     registered: datetime
     last_login: Optional[datetime]
     is_active: bool
+
+# Add new Pydantic models for media handling
+class MediaUpload(BaseModel):
+    username: str = Field(..., description="Recipient username")
+    media_type: str = Field(..., description="Type of media: photo, video, or document")
+    encrypted_content: str = Field(..., description="Base64 encoded encrypted media content")
+    filename: str = Field(..., description="Original filename")
+    file_size: int = Field(..., description="File size in bytes")
+    disappear_after_hours: Optional[int] = Field(None, description="Hours after which media should disappear (default: None)")
+
+class MediaResponse(BaseModel):
+    id: int
+    media_id: str
+    filename: str
+    media_type: str
+    content_type: str
+    file_size: int
+    sender: str
+    recipient: str
+    timestamp: datetime
+    expires_at: Optional[datetime]
+    auto_delete: bool
+    downloaded: bool
 
 def validate_master_token(db: Session, user_id: int, mastertoken: str) -> bool:
     """Validate the master token for a user"""
@@ -604,6 +627,156 @@ class DecryptService:
             )
             raise HTTPException(status_code=500, detail="Decryption failed")
 
+# Add MediaService class
+class MediaService:
+    """Service class for media operations"""
+    
+    @staticmethod
+    def upload_media(db: Session, sender_id: int, recipient_username: str, media_data: dict) -> Media:
+        """Upload encrypted media file (photo, video, or document)"""
+        # Get recipient
+        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
+        if not recipient:
+            raise HTTPException(status_code=404, detail="Recipient not found")
+        
+        # Generate unique media ID
+        import uuid
+        media_id = str(uuid.uuid4())
+        
+        # Save encrypted media to file system
+        import os
+        upload_dir = "media_uploads"
+        if not os.path.exists(upload_dir):
+            os.makedirs(upload_dir)
+        
+        # Save encrypted content to file
+        encrypted_file_path = os.path.join(upload_dir, f"{media_id}.enc")
+        try:
+            # Decode base64 content and save to file
+            import base64
+            encrypted_content = base64.b64decode(media_data["encrypted_content"])
+            with open(encrypted_file_path, "wb") as f:
+                f.write(encrypted_content)
+        except Exception as e:
+            logger.error(f"Error saving encrypted media: {e}")
+            raise HTTPException(status_code=500, detail="Failed to save encrypted media")
+        
+        # Calculate expiration time if disappearing media
+        expires_at = None
+        auto_delete = False
+        if media_data.get("disappear_after_hours") is not None and media_data["disappear_after_hours"] > 0:
+            from datetime import datetime, timedelta, timezone
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=media_data["disappear_after_hours"])
+            auto_delete = True
+        
+        # Create message for the media
+        message = Message(
+            sender_id=sender_id,
+            recipient_id=recipient.id,
+            encrypted_content=media_data["encrypted_content"],
+            content_type=f"media/{media_data['media_type']}",
+            delivered=False,
+            read=False,
+            is_offline=True,
+            expires_at=expires_at,
+            auto_delete=auto_delete
+        )
+        
+        db.add(message)
+        db.commit()
+        db.refresh(message)
+        
+        # Create media record
+        media = Media(
+            media_id=media_id,
+            filename=media_data["filename"],
+            file_size=media_data["file_size"],
+            media_type=media_data["media_type"],
+            content_type=media_data.get("content_type", "application/octet-stream"),
+            encryption_metadata=media_data.get("encryption_metadata"),
+            encrypted_file_path=encrypted_file_path,
+            message_id=message.id,
+            sender_id=sender_id,
+            recipient_id=recipient.id,
+            expires_at=expires_at,
+            auto_delete=auto_delete
+        )
+        
+        db.add(media)
+        db.commit()
+        db.refresh(media)
+        
+        logger.info(f"📤 Media uploaded: {sender_id} → {recipient.id} ({media_id})")
+        return media
+    
+    @staticmethod
+    def get_user_media(db: Session, user_id: int, limit: int = 50) -> List[Media]:
+        """Get media files (photos, videos, documents) for a user"""
+        return db.query(Media).filter(
+            Media.recipient_id == user_id
+        ).order_by(Media.uploaded_at.desc()).limit(limit).all()
+    
+    @staticmethod
+    def get_media_by_id(db: Session, media_id: int, user_id: int) -> Optional[Media]:
+        """Get specific media file by ID for a user"""
+        return db.query(Media).filter(
+            and_(
+                Media.id == media_id,
+                or_(
+                    Media.sender_id == user_id,
+                    Media.recipient_id == user_id
+                )
+            )
+        ).first()
+    
+    @staticmethod
+    def mark_media_downloaded(db: Session, media_id: int) -> bool:
+        """Mark media as downloaded"""
+        media = db.query(Media).filter(Media.id == media_id).first()
+        if media:
+            from datetime import datetime, timezone
+            setattr(media, 'downloaded_at', datetime.now(timezone.utc))
+            db.commit()
+            return True
+        return False
+    
+    @staticmethod
+    def delete_expired_media(db: Session) -> int:
+        """Delete expired media files and return count of deleted files"""
+        from datetime import datetime, timezone
+        current_time = datetime.now(timezone.utc)
+        expired_media = db.query(Media).filter(
+            and_(
+                Media.auto_delete == True,
+                Media.expires_at <= current_time
+            )
+        ).all()
+        
+        deleted_count = len(expired_media)
+        
+        # Delete expired media files from file system and database
+        for media in expired_media:
+            try:
+                # Delete encrypted file from file system
+                if os.path.exists(media.encrypted_file_path):
+                    os.remove(media.encrypted_file_path)
+                
+                # Delete associated message
+                message = db.query(Message).filter(Message.id == media.message_id).first()
+                if message:
+                    db.delete(message)
+                
+                # Delete media record
+                db.delete(media)
+            except Exception as e:
+                logger.error(f"Error deleting expired media {media.media_id}: {e}")
+        
+        if deleted_count > 0:
+            db.commit()
+            logger.info(f"🗑️  Deleted {deleted_count} expired media files")
+        
+        return deleted_count
+
 # FastAPI app with lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1014,16 +1187,22 @@ async def cleanup_expired_messages(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
-    """Manually trigger cleanup of expired messages"""
+    """Manually trigger cleanup of expired messages and media"""
     try:
-        deleted_count = MessageService.delete_expired_messages(db)
+        # Clean up expired messages
+        deleted_messages = MessageService.delete_expired_messages(db)
+        
+        # Clean up expired media
+        deleted_media = MediaService.delete_expired_media(db)
+        
         return {
-            "message": f"Cleanup completed. {deleted_count} expired messages deleted.",
-            "deleted_count": deleted_count
+            "message": f"Cleanup completed. {deleted_messages} expired messages and {deleted_media} expired media files deleted.",
+            "deleted_messages": deleted_messages,
+            "deleted_media": deleted_media
         }
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to cleanup expired messages")
+        raise HTTPException(status_code=500, detail="Failed to cleanup expired messages and media")
 
 @app.delete("/users/{username}")
 async def delete_user_account(
@@ -1145,6 +1324,139 @@ async def decrypt_message(
             status_code=500,
             detail=f"Failed to decrypt message: {str(e)}"
         )
+
+# Add media endpoints
+@app.post("/media/upload")
+async def upload_media(
+    media_data: MediaUpload,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Upload encrypted media file from gallery"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        media = MediaService.upload_media(db, user_id, media_data.username, media_data.dict())
+        
+        return {
+            "media_id": media.media_id,
+            "filename": media.filename,
+            "media_type": media.media_type,
+            "message": "Media uploaded successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload media error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload media")
+
+@app.get("/media/inbox")
+async def get_media_inbox(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Get user's media inbox"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        media_files = MediaService.get_user_media(db, user_id)
+        
+        result = []
+        for media in media_files:
+            sender = db.query(User).filter(User.id == media.sender_id).first()
+            recipient = db.query(User).filter(User.id == media.recipient_id).first()
+            result.append({
+                "id": int(getattr(media, 'id', 0)),
+                "media_id": str(getattr(media, 'media_id', '')),
+                "filename": str(getattr(media, 'filename', '')),
+                "media_type": str(getattr(media, 'media_type', '')),
+                "content_type": str(getattr(media, 'content_type', '')),
+                "file_size": int(getattr(media, 'file_size', 0)),
+                "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
+                "recipient": str(getattr(recipient, 'username', '')) if recipient else "unknown",
+                "timestamp": getattr(media, 'uploaded_at', datetime.now(timezone.utc)).isoformat(),
+                "expires_at": getattr(media, 'expires_at', None).isoformat() if getattr(media, 'expires_at', None) else None,
+                "auto_delete": bool(getattr(media, 'auto_delete', False)),
+                "downloaded": getattr(media, 'downloaded_at', None) is not None
+            })
+        
+        return {
+            "media_files": result,
+            "count": len(result)
+        }
+        
+    except Exception as e:
+        logger.error(f"Media inbox error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve media inbox")
+
+@app.get("/media/{media_id}")
+async def get_media_file(
+    media_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Get encrypted media file for download"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        media = MediaService.get_media_by_id(db, media_id, user_id)
+        
+        if not media:
+            raise HTTPException(status_code=404, detail="Media file not found")
+        
+        # Check if user is authorized to access this media
+        if user_id != media.sender_id and user_id != media.recipient_id:
+            raise HTTPException(status_code=403, detail="Not authorized to access this media")
+        
+        # Read encrypted file content
+        import os
+        if not os.path.exists(media.encrypted_file_path):
+            raise HTTPException(status_code=404, detail="Media file not found on server")
+        
+        try:
+            with open(media.encrypted_file_path, "rb") as f:
+                encrypted_content = f.read()
+            
+            # Encode as base64 for transmission
+            import base64
+            encoded_content = base64.b64encode(encrypted_content).decode('utf-8')
+            
+            # Mark as downloaded
+            MediaService.mark_media_downloaded(db, media_id)
+            
+            return {
+                "media_id": media.media_id,
+                "filename": media.filename,
+                "media_type": media.media_type,
+                "content_type": media.content_type,
+                "file_size": media.file_size,
+                "encrypted_content": encoded_content,
+                "encryption_metadata": media.encryption_metadata
+            }
+            
+        except Exception as e:
+            logger.error(f"Error reading media file: {e}")
+            raise HTTPException(status_code=500, detail="Failed to read media file")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get media error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve media")
+
+@app.post("/media/cleanup")
+async def cleanup_expired_media(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Manually trigger cleanup of expired media files"""
+    try:
+        deleted_count = MediaService.delete_expired_media(db)
+        return {
+            "message": f"Cleanup completed. {deleted_count} expired media files deleted.",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        logger.error(f"Media cleanup error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to cleanup expired media files")
 
 if __name__ == "__main__":
     # Use Render's PORT environment variable, default to 8001 for local development
