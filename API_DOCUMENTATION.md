@@ -72,7 +72,7 @@ Send a message to another user.
 ```
 
 **Response:**
-```json
+``json
 {
   "username": "string",
   "message": "sent",
@@ -388,3 +388,116 @@ Media and document files support the same disappearing functionality as text mes
 ### Manual Media Cleanup
 
 You can manually trigger cleanup of expired media by calling the `/media/cleanup` endpoint.
+
+## Admin Endpoints
+
+The API includes special endpoints for admin users to manage the system.
+
+### Admin Login
+
+#### POST /admin/login
+Login as an admin user with username and password.
+
+**Request Body:**
+```json
+{
+  "username": "string",
+  "password": "string"
+}
+```
+
+**Response:**
+```json
+{
+  "username": "string",
+  "token": "string",
+  "must_change_password": "boolean"
+}
+```
+
+### Change Admin Password
+
+#### POST /admin/change_password
+Change admin password (required on first login).
+
+**Request Body:**
+```json
+{
+  "current_password": "string",
+  "new_password": "string"
+}
+```
+
+**Response:**
+```json
+{
+  "message": "Password changed successfully"
+}
+```
+
+### Create User (Admin Only)
+
+#### POST /admin/users
+Create a new user account (admin only).
+
+**Request Body:**
+```json
+{
+  "username": "string",
+  "token": "string",
+  "public_key": "string (optional)"
+}
+```
+
+**Response:**
+```json
+{
+  "username": "string",
+  "message": "User created successfully"
+}
+```
+
+### Delete User (Admin Only)
+
+#### DELETE /admin/users/{username}
+Delete a user account permanently (admin only).
+
+**Response:**
+```json
+{
+  "message": "User account '{username}' deleted successfully",
+  "deleted": "boolean"
+}
+```
+
+### List All Users (Admin Only)
+
+#### GET /admin/users
+Get a list of all users in the system (admin only).
+
+**Response:**
+```json
+{
+  "users": [
+    {
+      "username": "string",
+      "registered": "string (ISO 8601 format)",
+      "last_login": "string (ISO 8601 format or null)",
+      "is_active": "boolean",
+      "is_admin": "boolean",
+      "user_type": "string"
+    }
+  ],
+  "count": "integer"
+}
+```
+
+### Admin Authentication
+
+All admin endpoints (except login) require authentication with a valid admin account. Non-admin users will receive a 403 Forbidden error when attempting to access these endpoints.
+
+### First-Time Admin Login
+
+1. Admin logs in with default credentials (username: `admin`, password: `adminuser@123`)
+2. If `must_change_password` is true in the response, admin must change password immediately
+3. After password change, admin can access all user management features

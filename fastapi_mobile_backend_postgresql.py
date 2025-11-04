@@ -58,6 +58,21 @@ class UserRegistration(BaseModel):
     token: str = Field(..., description="User authentication token")
     public_key: Optional[str] = Field(None, description="User's RSA public key in PEM format (optional)")
 
+# Add new Pydantic models for admin functionality
+class AdminLogin(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, description="Admin password")
+
+class AdminChangePassword(BaseModel):
+    current_password: str = Field(..., description="Current password")
+    new_password: str = Field(..., min_length=8, description="New password")
+
+class AdminCreateUser(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    token: str = Field(..., description="User authentication token")
+    public_key: Optional[str] = Field(None, description="User's RSA public key in PEM format (optional)")
+
+
 class UserLogin(UserAuth):
     pass  # Same as auth - just username and token
 
@@ -777,6 +792,175 @@ class MediaService:
         
         return deleted_count
 
+class AdminService:
+    """Service class for admin operations"""
+    
+    @staticmethod
+    def is_admin(db: Session, user_id: int) -> bool:
+        """Check if user is an admin"""
+        user = db.query(User).filter(User.id == user_id, User.is_admin == True).first()
+        return user is not None
+    
+    @staticmethod
+    def authenticate_admin(db: Session, username: str, password: str, ip_address: Optional[str] = None) -> Optional[User]:
+        """Authenticate admin user with password"""
+        user = db.query(User).filter(
+            User.username == username, 
+            User.is_admin == True,
+            User.is_active == True
+        ).first()
+        
+        if user and user.password_hash:
+            if verify_password(password, user.password_hash):
+                # Use setattr for SQLAlchemy models
+                setattr(user, 'last_login', datetime.now(timezone.utc))
+                db.commit()
+                
+                # Log login
+                AuditService.log_event(
+                    db, getattr(user, 'id', None), "admin_login", 
+                    f"Admin {username} logged in", 
+                    ip_address=ip_address
+                )
+                return user
+        
+        return None
+    
+    @staticmethod
+    def change_admin_password(db: Session, user_id: int, current_password: str, new_password: str) -> bool:
+        """Change admin password"""
+        user = db.query(User).filter(User.id == user_id, User.is_admin == True).first()
+        if not user or not user.password_hash:
+            return False
+        
+        # Verify current password
+        if not verify_password(current_password, user.password_hash):
+            return False
+        
+        # Hash and set new password
+        user.password_hash = hash_password(new_password)
+        user.must_change_password = False  # Clear the flag after password change
+        db.commit()
+        
+        # Log password change
+        AuditService.log_event(
+            db, user_id, "admin_password_changed", 
+            f"Admin password changed for user {user.username}"
+        )
+        
+        return True
+    
+    @staticmethod
+    def create_user(db: Session, admin_user_id: int, user_data: AdminCreateUser, ip_address: Optional[str] = None) -> User:
+        """Create a new user (admin only)"""
+        # Check if requesting user is admin
+        if not AdminService.is_admin(db, admin_user_id):
+            raise HTTPException(status_code=403, detail="Only admin users can create new accounts")
+        
+        # Check if user already exists
+        existing_user = db.query(User).filter(User.username == user_data.username).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Username already registered")
+        
+        # Use provided token
+        token = user_data.token
+        
+        # Create user
+        user = User(
+            username=user_data.username,
+            token=token,
+            public_key=user_data.public_key,
+            registration_ip=ip_address,
+            is_active=True,
+            is_verified=True,
+            user_type='mobile',
+            is_admin=False  # New users are not admins by default
+        )
+        
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        
+        # Log registration
+        user_id = getattr(user, 'id', None)
+        AuditService.log_event(
+            db, admin_user_id, "user_registration_by_admin", 
+            f"User {user_data.username} registered by admin user {admin_user_id}", 
+            ip_address=ip_address
+        )
+        
+        logger.info(f"✅ User registered by admin: {user_data.username}")
+        return user
+    
+    @staticmethod
+    def delete_user(db: Session, admin_user_id: int, username: str) -> bool:
+        """Delete a user account (admin only)"""
+        # Check if requesting user is admin
+        if not AdminService.is_admin(db, admin_user_id):
+            raise HTTPException(status_code=403, detail="Only admin users can delete accounts")
+        
+        # Get the user to delete
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            return False
+        
+        # Prevent admin from deleting themselves
+        if user.id == admin_user_id:
+            raise HTTPException(status_code=400, detail="Admin cannot delete their own account")
+        
+        # Get user ID for logging
+        user_id = getattr(user, 'id', None)
+        
+        # Log the deletion
+        AuditService.log_event(
+            db, admin_user_id, "account_deleted_by_admin", 
+            f"User account {username} deleted by admin user {admin_user_id}"
+        )
+        
+        # Delete associated data first due to foreign key constraints
+        # Delete user sessions
+        db.query(UserSession).filter(UserSession.user_id == user_id).delete()
+        
+        # Delete user keys
+        db.query(UserKey).filter(UserKey.user_id == user_id).delete()
+        
+        # Delete user master tokens
+        db.query(DBMasterToken).filter(DBMasterToken.user_id == user_id).delete()
+        
+        # Delete messages sent by user
+        db.query(Message).filter(Message.sender_id == user_id).delete()
+        
+        # Delete messages received by user
+        db.query(Message).filter(Message.recipient_id == user_id).delete()
+        
+        # Delete media files associated with user
+        media_files = db.query(Media).filter(
+            or_(Media.sender_id == user_id, Media.recipient_id == user_id)
+        ).all()
+        
+        for media in media_files:
+            # Delete encrypted file from filesystem
+            try:
+                if os.path.exists(media.encrypted_file_path):
+                    os.remove(media.encrypted_file_path)
+            except Exception as e:
+                logger.error(f"Error deleting media file {media.encrypted_file_path}: {e}")
+            
+            # Delete associated message if it exists
+            message = db.query(Message).filter(Message.id == media.message_id).first()
+            if message:
+                db.delete(message)
+            
+            # Delete media record
+            db.delete(media)
+        
+        # Finally delete the user
+        db.delete(user)
+        db.commit()
+        
+        logger.info(f"✅ User account and all associated data deleted by admin: {username}")
+        return True
+
 # FastAPI app with lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1458,13 +1642,163 @@ async def cleanup_expired_media(
         logger.error(f"Media cleanup error: {e}")
         raise HTTPException(status_code=500, detail="Failed to cleanup expired media files")
 
-if __name__ == "__main__":
-    # Use Render's PORT environment variable, default to 8001 for local development
-    port = int(os.getenv("PORT", 8001))
-    uvicorn.run(
-        "fastapi_mobile_backend_postgresql:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,  # Disable reload in production
-        log_level="info"
-    )
+# Add admin authentication dependency
+async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
+                        db: Session = Depends(get_database_session)) -> User:
+    """Get current authenticated admin user"""
+    try:
+        token = credentials.credentials
+        
+        # Validate session
+        session = SessionService.validate_session(db, token)
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired session",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Get user
+        user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.is_admin == True).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Admin user not found",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        return user
+        
+    except Exception as e:
+        logger.error(f"Admin authentication error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate admin credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+# Add admin endpoints
+@app.post("/admin/login")
+async def admin_login(login_data: AdminLogin, db: Session = Depends(get_database_session)):
+    """Admin login with username and password"""
+    try:
+        user = AdminService.authenticate_admin(db, login_data.username, login_data.password, ip_address="admin_api")
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        
+        # Create session
+        user_id = int(getattr(user, 'id', 0))
+        session = SessionService.create_session(db, user_id, "admin", "admin_api")
+        
+        return {
+            "username": str(getattr(user, 'username', '')),
+            "token": str(getattr(session, 'session_token', '')),
+            "must_change_password": bool(getattr(user, 'must_change_password', False))
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin login error: {e}")
+        raise HTTPException(status_code=500, detail="Login failed")
+
+@app.post("/admin/change_password")
+async def admin_change_password(password_data: AdminChangePassword,
+                               current_user: User = Depends(get_admin_user),
+                               db: Session = Depends(get_database_session)):
+    """Change admin password"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        success = AdminService.change_admin_password(
+            db, user_id, password_data.current_password, password_data.new_password
+        )
+        
+        if success:
+            return {"message": "Password changed successfully"}
+        else:
+            raise HTTPException(status_code=400, detail="Failed to change password")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Change password error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to change password")
+
+@app.post("/admin/users")
+async def admin_create_user(user_data: AdminCreateUser,
+                           current_user: User = Depends(get_admin_user),
+                           db: Session = Depends(get_database_session)):
+    """Create a new user account (admin only)"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        new_user = AdminService.create_user(db, user_id, user_data, ip_address="admin_api")
+        
+        return {
+            "username": str(getattr(new_user, 'username', '')),
+            "message": "User created successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin create user error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create user")
+
+@app.delete("/admin/users/{username}")
+async def admin_delete_user(username: str,
+                           current_user: User = Depends(get_admin_user),
+                           db: Session = Depends(get_database_session)):
+    """Delete a user account permanently (admin only)"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        success = AdminService.delete_user(db, user_id, username)
+        
+        if success:
+            return {
+                "message": f"User account '{username}' deleted successfully",
+                "deleted": True
+            }
+        else:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin delete user error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete user account")
+
+@app.get("/admin/users")
+async def admin_get_all_users(current_user: User = Depends(get_admin_user),
+                             db: Session = Depends(get_database_session)):
+    """Get list of all users (admin only)"""
+    try:
+        # Check if requesting user is admin
+        user_id = int(getattr(current_user, 'id', 0))
+        if not AdminService.is_admin(db, user_id):
+            raise HTTPException(status_code=403, detail="Only admin users can access this endpoint")
+        
+        users = UserService.get_all_users(db)
+        
+        result = []
+        for user in users:
+            last_login = getattr(user, 'last_login', None)
+            registered = getattr(user, 'registered', datetime.now(timezone.utc))
+            result.append({
+                "username": str(getattr(user, 'username', '')),
+                "registered": registered.isoformat() if registered else datetime.now(timezone.utc).isoformat(),
+                "last_login": last_login.isoformat() if last_login else None,
+                "is_active": bool(getattr(user, 'is_active', False)),
+                "is_admin": bool(getattr(user, 'is_admin', False)),
+                "user_type": str(getattr(user, 'user_type', ''))
+            })
+        
+        return {
+            "users": result,
+            "count": len(result)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin get users error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve users")

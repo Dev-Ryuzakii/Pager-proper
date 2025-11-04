@@ -21,6 +21,7 @@ class User(Base):
     email = Column(String(255), unique=True, index=True, nullable=True)  # Optional for TLS users
     public_key = Column(Text, nullable=True)  # Make this optional - RSA public key in PEM format
     password_hash = Column(String(255), nullable=True)  # Optional password hash
+    must_change_password = Column(Boolean, default=False)  # Flag to force password change on first login
     
     # Authentication tokens
     token = Column(String(255), nullable=True)  # TLS safetoken or API token
@@ -40,6 +41,7 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     is_verified = Column(Boolean, default=False)
     user_type = Column(String(20), default="tls")  # "tls", "mobile", "both"
+    is_admin = Column(Boolean, default=False)  # Admin account flag
     
     # Relationships
     sent_messages = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")
@@ -49,7 +51,7 @@ class User(Base):
     master_tokens = relationship("MasterToken", back_populates="user")  # Add this line
     
     def __repr__(self):
-        return f"<User(username='{self.username}', type='{self.user_type}', email='{self.email}')>"
+        return f"<User(username='{self.username}', type='{self.user_type}', email='{self.email}', admin={self.is_admin})>"
 
 class Message(Base):
     """Message table for storing encrypted messages between users"""
