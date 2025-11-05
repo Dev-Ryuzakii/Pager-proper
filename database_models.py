@@ -21,6 +21,7 @@ class User(Base):
     email = Column(String(255), unique=True, index=True, nullable=True)  # Optional for TLS users
     public_key = Column(Text, nullable=True)  # Make this optional - RSA public key in PEM format
     password_hash = Column(String(255), nullable=True)  # Optional password hash
+    must_change_password = Column(Boolean, default=False)  # Flag to force password change on first login
     
     # Authentication tokens
     token = Column(String(255), nullable=True)  # TLS safetoken or API token
@@ -40,6 +41,7 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     is_verified = Column(Boolean, default=False)
     user_type = Column(String(20), default="tls")  # "tls", "mobile", "both"
+    is_admin = Column(Boolean, default=False)  # Admin account flag
     
     # Relationships
     sent_messages = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")
@@ -49,7 +51,7 @@ class User(Base):
     master_tokens = relationship("MasterToken", back_populates="user")  # Add this line
     
     def __repr__(self):
-        return f"<User(username='{self.username}', type='{self.user_type}', email='{self.email}')>"
+        return f"<User(username='{self.username}', type='{self.user_type}', email='{self.email}', admin={self.is_admin})>"
 
 class Message(Base):
     """Message table for storing encrypted messages between users"""
@@ -88,6 +90,7 @@ class Message(Base):
     # Relationships
     sender = relationship("User", foreign_keys=[sender_id], back_populates="sent_messages")
     recipient = relationship("User", foreign_keys=[recipient_id], back_populates="received_messages")
+    media_files = relationship("Media", back_populates="message")  # Add this line
     
     def __repr__(self):
         return f"<Message(sender={self.sender_id}, recipient={self.recipient_id}, timestamp={self.timestamp})>"
@@ -208,6 +211,47 @@ class MasterToken(Base):
     
     def __repr__(self):
         return f"<MasterToken(user_id={self.user_id}, created_at={self.created_at})>"
+
+class Media(Base):
+    """Media files storage for encrypted photos, videos and documents"""
+    __tablename__ = "media"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    media_id = Column(String(255), unique=True, nullable=False)  # UUID for the media
+    filename = Column(String(255), nullable=False)  # Original filename
+    file_size = Column(Integer, nullable=False)  # Size in bytes
+    media_type = Column(String(50), nullable=False)  # photo, video, document
+    content_type = Column(String(100), nullable=False)  # MIME type
+    
+    # Encryption metadata
+    encryption_metadata = Column(JSON, nullable=True)  # Encryption details
+    encrypted_file_path = Column(String(512), nullable=False)  # Path to encrypted file
+    
+    # Message relationship
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False)
+    message = relationship("Message", back_populates="media_files")
+    
+    # Ownership
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    # Disappearing media
+    expires_at = Column(DateTime, nullable=True)  # When the media should be deleted
+    auto_delete = Column(Boolean, default=False)  # Whether the media should auto-delete
+    
+    # Timestamps
+    uploaded_at = Column(DateTime, default=func.now())
+    downloaded_at = Column(DateTime, nullable=True)
+    
+    # Relationships
+    sender = relationship("User", foreign_keys=[sender_id])
+    recipient = relationship("User", foreign_keys=[recipient_id])
+    
+    def __repr__(self):
+        return f"<Media(media_id='{self.media_id}', filename='{self.filename}', type='{self.media_type}')>"
+
+# Add relationship to Message model
+Message.media_files = relationship("Media", back_populates="message")
 
 # Database connection configuration
 DATABASE_URL = os.getenv(
