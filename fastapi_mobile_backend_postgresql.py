@@ -28,6 +28,9 @@ from Crypto.Util.Padding import unpad
 from Crypto.Protocol.KDF import PBKDF2
 import json
 
+# Import bcrypt for password hashing
+import bcrypt
+
 # Load environment variables
 if os.path.exists('.env'):
     with open('.env', 'r') as f:
@@ -48,6 +51,17 @@ logger = logging.getLogger(__name__)
 # Security
 security = HTTPBearer()
 
+# Password hashing functions
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt"""
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed.decode('utf-8')
+
+def verify_password(password: str, hashed: str) -> bool:
+    """Verify a password against its hash using bcrypt"""
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
 # Pydantic Models
 class UserAuth(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
@@ -61,6 +75,7 @@ class UserRegistration(BaseModel):
 # Add new Pydantic models for admin functionality
 class AdminLogin(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
+
     password: str = Field(..., min_length=8, description="Admin password")
 
 class AdminChangePassword(BaseModel):
@@ -911,13 +926,10 @@ class AdminService:
         # Get user ID for logging
         user_id = getattr(user, 'id', None)
         
-        # Log the deletion
-        AuditService.log_event(
-            db, admin_user_id, "account_deleted_by_admin", 
-            f"User account {username} deleted by admin user {admin_user_id}"
-        )
-        
         # Delete associated data first due to foreign key constraints
+        # Delete audit logs associated with the user
+        db.query(AuditLog).filter(AuditLog.user_id == user_id).delete()
+        
         # Delete user sessions
         db.query(UserSession).filter(UserSession.user_id == user_id).delete()
         
@@ -927,13 +939,7 @@ class AdminService:
         # Delete user master tokens
         db.query(DBMasterToken).filter(DBMasterToken.user_id == user_id).delete()
         
-        # Delete messages sent by user
-        db.query(Message).filter(Message.sender_id == user_id).delete()
-        
-        # Delete messages received by user
-        db.query(Message).filter(Message.recipient_id == user_id).delete()
-        
-        # Delete media files associated with user
+        # Delete media files associated with user FIRST (to avoid foreign key constraint violations)
         media_files = db.query(Media).filter(
             or_(Media.sender_id == user_id, Media.recipient_id == user_id)
         ).all()
@@ -946,13 +952,23 @@ class AdminService:
             except Exception as e:
                 logger.error(f"Error deleting media file {media.encrypted_file_path}: {e}")
             
-            # Delete associated message if it exists
-            message = db.query(Message).filter(Message.id == media.message_id).first()
-            if message:
-                db.delete(message)
-            
             # Delete media record
             db.delete(media)
+        
+        # Commit the media deletions to avoid foreign key constraint violations
+        db.commit()
+        
+        # Delete messages sent by user
+        db.query(Message).filter(Message.sender_id == user_id).delete()
+        
+        # Delete messages received by user
+        db.query(Message).filter(Message.recipient_id == user_id).delete()
+        
+        # Log the deletion (after all associated data is deleted)
+        AuditService.log_event(
+            db, admin_user_id, "account_deleted_by_admin", 
+            f"User account {username} deleted by admin user {admin_user_id}"
+        )
         
         # Finally delete the user
         db.delete(user)
@@ -1558,7 +1574,7 @@ async def get_media_inbox(
                 "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
                 "recipient": str(getattr(recipient, 'username', '')) if recipient else "unknown",
                 "timestamp": getattr(media, 'uploaded_at', datetime.now(timezone.utc)).isoformat(),
-                "expires_at": getattr(media, 'expires_at', None).isoformat() if getattr(media, 'expires_at', None) else None,
+                "expires_at": getattr(media, 'expires_at', None).isoformat() if getattr(media, 'expires_at', None) is not None else None,
                 "auto_delete": bool(getattr(media, 'auto_delete', False)),
                 "downloaded": getattr(media, 'downloaded_at', None) is not None
             })
@@ -1802,3 +1818,15 @@ async def admin_get_all_users(current_user: User = Depends(get_admin_user),
     except Exception as e:
         logger.error(f"Admin get users error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve users")
+
+        
+if __name__ == "__main__":
+    # Use Render's PORT environment variable, default to 8001 for local development
+    port = int(os.getenv("PORT", 8001))
+    uvicorn.run(
+        "fastapi_mobile_backend_postgresql:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,  # Disable reload in production
+        log_level="info"
+    )
