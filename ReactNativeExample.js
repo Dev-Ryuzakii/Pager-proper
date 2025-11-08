@@ -24,6 +24,12 @@ const SecureMessagingApp = () => {
   const [inbox, setInbox] = useState([]);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [sessionToken, setSessionToken] = useState('');
+  // Add new state variables for decoy features
+  const [imageContent, setImageContent] = useState('');
+  const [documentContent, setDocumentContent] = useState('');
+  const [documentFilename, setDocumentFilename] = useState('document.pdf');
+  const [documentMimeType, setDocumentMimeType] = useState('application/pdf');
+  const [selectedMessageId, setSelectedMessageId] = useState(null);
 
   // Base URL - update for your deployment
   const API_BASE_URL = 'http://localhost:8001';
@@ -250,6 +256,165 @@ const SecureMessagingApp = () => {
     }
   };
 
+  // Send decoy image
+  const sendDecoyImage = async () => {
+    try {
+      // Filter out undefined fields
+      const imageData = {
+        username: recipient,
+        image_content: imageContent || '',
+        filename: 'hidden_image.png',
+        file_size: imageContent ? imageContent.length : 0,
+      };
+      
+      // Remove any undefined values
+      Object.keys(imageData).forEach(key => {
+        if (imageData[key] === undefined || imageData[key] === 'undefined') {
+          delete imageData[key];
+        }
+      });
+
+      const response = await fetch(`${API_BASE_URL}/messages/send_decoy_image`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify(imageData),
+      });
+
+      const data = await response.json();
+      
+      if (response.ok) {
+        Alert.alert('Success', 'Hidden image sent successfully');
+        setImageContent('');
+      } else {
+        Alert.alert('Error', data.detail || 'Failed to send hidden image');
+      }
+    } catch (error) {
+      Alert.alert('Error', 'Network error during hidden image sending');
+      console.error('Send decoy image error:', error);
+    }
+  };
+
+  // Send decoy document
+  const sendDecoyDocument = async () => {
+    try {
+      // Filter out undefined fields
+      const docData = {
+        username: recipient,
+        document_content: documentContent || '',
+        filename: documentFilename || 'document.pdf',
+        file_size: documentContent ? documentContent.length : 0,
+        mime_type: documentMimeType || 'application/pdf',
+      };
+      
+      // Remove any undefined values
+      Object.keys(docData).forEach(key => {
+        if (docData[key] === undefined || docData[key] === 'undefined') {
+          delete docData[key];
+        }
+      });
+
+      const response = await fetch(`${API_BASE_URL}/messages/send_decoy_document`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify(docData),
+      });
+
+      const data = await response.json();
+      
+      if (response.ok) {
+        Alert.alert('Success', 'Hidden document sent successfully');
+        setDocumentContent('');
+      } else {
+        Alert.alert('Error', data.detail || 'Failed to send hidden document');
+      }
+    } catch (error) {
+      Alert.alert('Error', 'Network error during hidden document sending');
+      console.error('Send decoy document error:', error);
+    }
+  };
+
+  // Extract decoy image
+  const extractDecoyImage = async (messageId) => {
+    try {
+      // Validate master token first
+      if (!masterToken || masterToken.length < 8) {
+        Alert.alert('Error', 'Please enter a valid master token first');
+        return;
+      }
+
+      const response = await fetch(`${API_BASE_URL}/messages/extract_decoy_image`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          message_id: messageId,
+          mastertoken: masterToken,
+        }),
+      });
+
+      const data = await response.json();
+      
+      if (response.ok) {
+        Alert.alert('Hidden Image Extracted', `Image extracted successfully!\nFilename: ${data.filename}\nSize: ${data.file_size} bytes`);
+      } else {
+        Alert.alert('Error', data.detail || 'Failed to extract hidden image');
+      }
+    } catch (error) {
+      Alert.alert('Error', 'Network error during image extraction');
+      console.error('Extract decoy image error:', error);
+    }
+  };
+
+  // Extract decoy document
+  const extractDecoyDocument = async (messageId) => {
+    try {
+      // Validate master token first
+      if (!masterToken || masterToken.length < 8) {
+        Alert.alert('Error', 'Please enter a valid master token first');
+        return;
+      }
+
+      const response = await fetch(`${API_BASE_URL}/messages/extract_decoy_document`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          message_id: messageId,
+          mastertoken: masterToken,
+        }),
+      });
+
+      const data = await response.json();
+      
+      if (response.ok) {
+        const appList = data.suggested_apps ? data.suggested_apps.join(', ') : 'No specific apps suggested';
+        Alert.alert(
+          'Hidden Document Extracted', 
+          `Document extracted successfully!
+Filename: ${data.filename}
+Size: ${data.file_size} bytes
+MIME Type: ${data.mime_type}
+Suggested apps: ${appList}`
+        );
+      } else {
+        Alert.alert('Error', data.detail || 'Failed to extract hidden document');
+      }
+    } catch (error) {
+      Alert.alert('Error', 'Network error during document extraction');
+      console.error('Extract decoy document error:', error);
+    }
+  };
+
   // Check if user is already logged in
   useEffect(() => {
     const checkLoginStatus = async () => {
@@ -323,6 +488,46 @@ const SecureMessagingApp = () => {
       </View>
       
       <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Send Hidden Image</Text>
+        <TextInput
+          style={[styles.input, styles.textArea]}
+          value={imageContent}
+          onChangeText={setImageContent}
+          placeholder="Enter base64 image content"
+          multiline
+        />
+        <TouchableOpacity style={styles.button} onPress={sendDecoyImage}>
+          <Text style={styles.buttonText}>Send Hidden Image</Text>
+        </TouchableOpacity>
+      </View>
+      
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Send Hidden Document</Text>
+        <TextInput
+          style={styles.input}
+          value={documentFilename}
+          onChangeText={setDocumentFilename}
+          placeholder="Document filename (e.g., report.pdf)"
+        />
+        <TextInput
+          style={styles.input}
+          value={documentMimeType}
+          onChangeText={setDocumentMimeType}
+          placeholder="MIME type (e.g., application/pdf)"
+        />
+        <TextInput
+          style={[styles.input, styles.textArea]}
+          value={documentContent}
+          onChangeText={setDocumentContent}
+          placeholder="Enter base64 document content"
+          multiline
+        />
+        <TouchableOpacity style={styles.button} onPress={sendDecoyDocument}>
+          <Text style={styles.buttonText}>Send Hidden Document</Text>
+        </TouchableOpacity>
+      </View>
+      
+      <View style={styles.section}>
         <Text style={styles.sectionTitle}>Master Token</Text>
         <TextInput
           style={styles.input}
@@ -359,6 +564,23 @@ const SecureMessagingApp = () => {
                 onPress={() => decryptMessage(msg.id)}
               >
                 <Text style={styles.decryptButtonText}>Decrypt Message</Text>
+              </TouchableOpacity>
+            )}
+            {/* Check if this is a decoy image or document message */}
+            {msg.content && msg.content.includes('[IMAGE_DATA:') && (
+              <TouchableOpacity 
+                style={styles.decryptButton} 
+                onPress={() => extractDecoyImage(msg.id)}
+              >
+                <Text style={styles.decryptButtonText}>Extract Hidden Image</Text>
+              </TouchableOpacity>
+            )}
+            {msg.content && msg.content.includes('[DOCUMENT_DATA:') && (
+              <TouchableOpacity 
+                style={styles.decryptButton} 
+                onPress={() => extractDecoyDocument(msg.id)}
+              >
+                <Text style={styles.decryptButtonText}>Extract Hidden Document</Text>
               </TouchableOpacity>
             )}
           </View>

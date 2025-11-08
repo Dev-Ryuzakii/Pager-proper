@@ -174,6 +174,70 @@ const MediaExample = () => {
     }
   };
 
+  // Function to send media as decoy (no encryption)
+  const sendDecoyMedia = async (recipientUsername, disappearAfterHours = null) => {
+    if (!selectedMedia) {
+      Alert.alert('Error', 'Please select media first');
+      return;
+    }
+
+    setIsUploading(true);
+    
+    try {
+      // Read file as base64
+      const base64Data = await RNFS.readFile(selectedMedia.uri, 'base64');
+      
+      // Get auth token from secure storage
+      const authToken = 'user_auth_token'; // This should come from secure storage
+      
+      // Determine media type
+      const isImage = selectedMedia.type?.includes('image');
+      const mediaType = isImage ? 'photo' : 'video';
+      
+      // Filter out undefined fields
+      const mediaData = {
+        username: recipientUsername,
+        media_type: mediaType,
+        content: base64Data || '',
+        filename: selectedMedia.fileName || 'media_file',
+        file_size: selectedMedia.fileSize || 0,
+        content_type: selectedMedia.type || 'application/octet-stream',
+        disappear_after_hours: disappearAfterHours,
+      };
+      
+      // Remove any undefined values
+      Object.keys(mediaData).forEach(key => {
+        if (mediaData[key] === undefined || mediaData[key] === 'undefined') {
+          delete mediaData[key];
+        }
+      });
+
+      // Send as simple (unencrypted) media
+      const response = await fetch('http://your-server-url/media/simple_upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authToken}`,
+        },
+        body: JSON.stringify(mediaData),
+      });
+
+      const result = await response.json();
+      
+      if (response.ok) {
+        Alert.alert('Success', 'Media sent as hidden decoy successfully');
+        setSelectedMedia(null);
+      } else {
+        Alert.alert('Error', result.detail || 'Failed to send hidden media');
+      }
+    } catch (error) {
+      console.error('Send decoy error:', error);
+      Alert.alert('Error', 'Failed to send hidden media');
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Secure Media Sharing</Text>
@@ -204,29 +268,27 @@ const MediaExample = () => {
             disabled={isUploading}
           >
             <Text style={styles.buttonText}>
-              {isUploading ? 'Uploading...' : 'Send Media'}
+              {isUploading ? 'Uploading...' : 'Upload Encrypted Media'}
             </Text>
           </TouchableOpacity>
           
+          {/* New Decoy Features */}
           <TouchableOpacity 
-            style={[styles.button, styles.disappearButton]} 
-            onPress={() => uploadMedia('recipient_username', 24)}
+            style={[styles.button, styles.decoyButton]} 
+            onPress={() => sendDecoyMedia('recipient_username')}
             disabled={isUploading}
           >
             <Text style={styles.buttonText}>
-              {isUploading ? 'Uploading...' : 'Send Media (Disappears in 24h)'}
+              {isUploading ? 'Sending...' : 'Send Hidden Media (No Encryption)'}
             </Text>
           </TouchableOpacity>
         </>
       )}
       
-      <View style={styles.infoSection}>
-        <Text style={styles.infoTitle}>How it works:</Text>
-        <Text>1. Select media from your device gallery</Text>
-        <Text>2. Media is encrypted locally on your device</Text>
-        <Text>3. Encrypted media is sent to the secure server</Text>
-        <Text>4. Recipient uses their master token to decrypt</Text>
-      </View>
+      <Text style={styles.infoText}>
+        Note: Encrypted media requires end-to-end encryption setup. 
+        Hidden media is sent plainly but disguised with decoy text.
+      </Text>
     </View>
   );
 };
@@ -255,8 +317,8 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: 'bold',
   },
-  disappearButton: {
-    backgroundColor: '#FF3B30',
+  decoyButton: {
+    backgroundColor: '#FFCC00',
   },
   mediaPreview: {
     marginVertical: 20,
@@ -270,16 +332,11 @@ const styles = StyleSheet.create({
     height: 200,
     marginVertical: 10,
   },
-  infoSection: {
+  infoText: {
     marginTop: 30,
     padding: 15,
     backgroundColor: 'white',
     borderRadius: 10,
-  },
-  infoTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    marginBottom: 10,
   },
 });
 

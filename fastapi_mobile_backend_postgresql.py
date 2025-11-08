@@ -130,6 +130,30 @@ class MediaUpload(BaseModel):
     file_size: int = Field(..., description="File size in bytes")
     disappear_after_hours: Optional[int] = Field(None, description="Hours after which media should disappear (default: None)")
 
+class SimpleMediaUpload(BaseModel):
+    username: str = Field(..., description="Recipient username")
+    media_type: str = Field(default="photo", description="Type of media: photo, video, or document")
+    content: str = Field(default="", description="Base64 encoded media content")
+    filename: str = Field(default="media", description="Original filename")
+    file_size: int = Field(default=0, description="File size in bytes")
+    disappear_after_hours: Optional[int] = Field(None, description="Hours after which media should disappear (default: None)")
+    content_type: Optional[str] = Field("application/octet-stream", description="MIME type of the media")
+
+class DecoyImageMessage(BaseModel):
+    username: str = Field(..., description="Recipient username")
+    image_content: str = Field(..., description="Base64 encoded image content")
+    filename: str = Field(default="image.jpg", description="Original filename")
+    file_size: int = Field(default=0, description="File size in bytes")
+    disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
+
+class DecoyDocumentMessage(BaseModel):
+    username: str = Field(..., description="Recipient username")
+    document_content: str = Field(..., description="Base64 encoded document content")
+    filename: str = Field(..., description="Original filename with extension (e.g., document.pdf, report.docx)")
+    file_size: int = Field(default=0, description="File size in bytes")
+    mime_type: str = Field(default="application/octet-stream", description="MIME type of the document")
+    disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
+
 class MediaResponse(BaseModel):
     id: int
     media_id: str
@@ -534,6 +558,75 @@ class DecryptService:
             raise HTTPException(status_code=500, detail="AES-GCM decryption failed")
     
     @staticmethod
+    def extract_decoy_image(message_content: str) -> Optional[Dict]:
+        """Extract hidden image from decoy message content"""
+        try:
+            import re
+            import base64
+            import json
+            
+            # Find the image data pattern
+            match = re.search(r'\[IMAGE_DATA:([^\]]+)\]', message_content)
+            if not match:
+                return None
+            
+            encoded_image_data = match.group(1)
+            
+            # Decode the image data
+            decoded_json = base64.b64decode(encoded_image_data).decode()
+            image_payload = json.loads(decoded_json)
+            
+            # Verify this is an image payload
+            if image_payload.get("type") != "decoy_image":
+                return None
+            
+            return {
+                "image_data": image_payload.get("image_data", ""),
+                "filename": image_payload.get("filename", "image.jpg"),
+                "file_size": image_payload.get("file_size", 0),
+                "timestamp": image_payload.get("timestamp", 0)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error extracting decoy image: {e}")
+            return None
+    
+    @staticmethod
+    def extract_decoy_document(message_content: str) -> Optional[Dict]:
+        """Extract hidden document from decoy message content"""
+        try:
+            import re
+            import base64
+            import json
+            
+            # Find the document data pattern
+            match = re.search(r'\[DOCUMENT_DATA:([^\]]+)\]', message_content)
+            if not match:
+                return None
+            
+            encoded_document_data = match.group(1)
+            
+            # Decode the document data
+            decoded_json = base64.b64decode(encoded_document_data).decode()
+            document_payload = json.loads(decoded_json)
+            
+            # Verify this is a document payload
+            if document_payload.get("type") != "decoy_document":
+                return None
+            
+            return {
+                "document_data": document_payload.get("document_data", ""),
+                "filename": document_payload.get("filename", "document"),
+                "file_size": document_payload.get("file_size", 0),
+                "mime_type": document_payload.get("mime_type", "application/octet-stream"),
+                "timestamp": document_payload.get("timestamp", 0)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error extracting decoy document: {e}")
+            return None
+    
+    @staticmethod
     def decrypt_message(db: Session, user_id: int, message_id: int, mastertoken: str) -> Optional[str]:
         """Decrypt a message using the master token"""
         # Get the message
@@ -737,6 +830,83 @@ class MediaService:
         db.refresh(media)
         
         logger.info(f"📤 Media uploaded: {sender_id} → {recipient.id} ({media_id})")
+        return media
+    
+    @staticmethod
+    def upload_simple_media(db: Session, sender_id: int, recipient_username: str, media_data: SimpleMediaUpload) -> Media:
+        """Upload simple (unencrypted) media file (photo, video, or document)"""
+        # Get recipient
+        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
+        if not recipient:
+            raise HTTPException(status_code=404, detail="Recipient not found")
+        
+        # Generate unique media ID
+        import uuid
+        media_id = str(uuid.uuid4())
+        
+        # Save media to file system
+        import os
+        upload_dir = "media_uploads"
+        if not os.path.exists(upload_dir):
+            os.makedirs(upload_dir)
+        
+        # Save content to file
+        file_path = os.path.join(upload_dir, f"{media_id}")
+        try:
+            # Decode base64 content and save to file
+            import base64
+            content = base64.b64decode(media_data.content or "")
+            with open(file_path, "wb") as f:
+                f.write(content)
+        except Exception as e:
+            logger.error(f"Error saving media: {e}")
+            raise HTTPException(status_code=500, detail="Failed to save media")
+        
+        # Calculate expiration time if disappearing media
+        expires_at = None
+        auto_delete = False
+        if media_data.disappear_after_hours is not None and media_data.disappear_after_hours > 0:
+            from datetime import datetime, timedelta, timezone
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=media_data.disappear_after_hours)
+            auto_delete = True
+        
+        # Create message for the media
+        message = Message(
+            sender_id=sender_id,
+            recipient_id=recipient.id,
+            encrypted_content=media_data.content or "",  # Store the base64 content directly
+            content_type=f"media/{media_data.media_type or 'photo'}",
+            delivered=False,
+            read=False,
+            is_offline=True,
+            expires_at=expires_at,
+            auto_delete=auto_delete
+        )
+        
+        db.add(message)
+        db.commit()
+        db.refresh(message)
+        
+        # Create media record
+        media = Media(
+            media_id=media_id,
+            filename=media_data.filename or "media",
+            file_size=media_data.file_size or 0,
+            media_type=media_data.media_type or "photo",
+            content_type=media_data.content_type or "application/octet-stream",
+            encrypted_file_path=file_path,  # Store the file path
+            message_id=message.id,
+            sender_id=sender_id,
+            recipient_id=recipient.id,
+            expires_at=expires_at,
+            auto_delete=auto_delete
+        )
+        
+        db.add(media)
+        db.commit()
+        db.refresh(media)
+        
+        logger.info(f"📤 Simple media uploaded: {sender_id} → {recipient.id} ({media_id})")
         return media
     
     @staticmethod
@@ -1190,6 +1360,108 @@ async def send_message(message_data: MessageSend,
         logger.error(f"Send message error: {e}")
         raise HTTPException(status_code=500, detail="Failed to send message")
 
+@app.post("/messages/send_decoy_image")
+async def send_decoy_image(
+    message_data: DecoyImageMessage,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Send an image hidden under decoy text - no encryption, just hidden"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        
+        # Create a decoy message that hides the image
+        # The image will be embedded in the message content in a way that requires the master token to extract
+        import base64
+        import json
+        
+        # Create a payload that contains the image data
+        image_payload = {
+            "type": "decoy_image",
+            "image_data": message_data.image_content,
+            "filename": message_data.filename,
+            "file_size": message_data.file_size,
+            "timestamp": int(time.time())
+        }
+        
+        # Convert to JSON and base64 encode
+        image_json = json.dumps(image_payload)
+        encoded_image_data = base64.b64encode(image_json.encode()).decode()
+        
+        # Embed the encoded image data within decoy text
+        # We'll create a message that looks like normal text but contains the hidden image data
+        decoy_message = f"{FakeTextGenerator.generate_paragraph(2)} [IMAGE_DATA:{encoded_image_data}] {FakeTextGenerator.generate_paragraph(1)}"
+        
+        # Send as a regular message
+        message = MessageService.send_message(
+            db, user_id, message_data.username, decoy_message, message_data.disappear_after_hours
+        )
+        
+        return {
+            "message_id": getattr(message, 'id', 0),
+            "recipient": message_data.username,
+            "status": "sent",
+            "message": "Image sent hidden under decoy text"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Send decoy image error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send decoy image")
+
+@app.post("/messages/send_decoy_document")
+async def send_decoy_document(
+    message_data: DecoyDocumentMessage,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Send a document hidden under decoy text - no encryption, just hidden"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        
+        # Create a decoy message that hides the document
+        # The document will be embedded in the message content in a way that requires the master token to extract
+        import base64
+        import json
+        
+        # Create a payload that contains the document data
+        document_payload = {
+            "type": "decoy_document",
+            "document_data": message_data.document_content,
+            "filename": message_data.filename,
+            "file_size": message_data.file_size,
+            "mime_type": message_data.mime_type,
+            "timestamp": int(time.time())
+        }
+        
+        # Convert to JSON and base64 encode
+        document_json = json.dumps(document_payload)
+        encoded_document_data = base64.b64encode(document_json.encode()).decode()
+        
+        # Embed the encoded document data within decoy text
+        # We'll create a message that looks like normal text but contains the hidden document data
+        decoy_message = f"{FakeTextGenerator.generate_paragraph(2)} [DOCUMENT_DATA:{encoded_document_data}] {FakeTextGenerator.generate_paragraph(1)}"
+        
+        # Send as a regular message
+        message = MessageService.send_message(
+            db, user_id, message_data.username, decoy_message, message_data.disappear_after_hours
+        )
+        
+        return {
+            "message_id": getattr(message, 'id', 0),
+            "recipient": message_data.username,
+            "status": "sent",
+            "message": "Document sent hidden under decoy text"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Send decoy document error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send decoy document")
+
+
 @app.get("/messages/inbox")
 async def get_inbox(current_user: User = Depends(get_current_user),
                    db: Session = Depends(get_database_session)):
@@ -1525,6 +1797,150 @@ async def decrypt_message(
             detail=f"Failed to decrypt message: {str(e)}"
         )
 
+@app.post("/messages/extract_decoy_image")
+async def extract_decoy_image(
+    decrypt_data: DecryptRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Extract hidden image from decoy message using master token"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        
+        # Validate master token
+        if not DecryptService.validate_master_token(db, user_id, decrypt_data.mastertoken):
+            raise HTTPException(
+                status_code=401, 
+                detail="Invalid master token. Master token is required to extract hidden images."
+            )
+        
+        # Get the message
+        message = db.query(Message).filter(
+            and_(
+                Message.id == decrypt_data.message_id,
+                or_(
+                    Message.sender_id == user_id,
+                    Message.recipient_id == user_id
+                )
+            )
+        ).first()
+        
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        # Check if this is a decoy image message and extract the image
+        message_content = str(getattr(message, 'encrypted_content', ''))
+        image_data = DecryptService.extract_decoy_image(message_content)
+        
+        if not image_data:
+            raise HTTPException(status_code=400, detail="This message does not contain a hidden image or extraction failed")
+        
+        # Log successful extraction
+        AuditService.log_event(
+            db,
+            user_id,
+            "image_extracted",
+            f"Hidden image extracted from message {decrypt_data.message_id}",
+            severity="info"
+        )
+        
+        return {
+            "message_id": decrypt_data.message_id,
+            "filename": image_data["filename"],
+            "file_size": image_data["file_size"],
+            "image_data": image_data["image_data"],  # Base64 encoded image
+            "extract_time": time.time(),
+            "security": "Decoy text protection"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Extract decoy image error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to extract hidden image")
+
+@app.post("/messages/extract_decoy_document")
+async def extract_decoy_document(
+    decrypt_data: DecryptRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Extract hidden document from decoy message using master token and provide app integration"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        
+        # Validate master token
+        if not DecryptService.validate_master_token(db, user_id, decrypt_data.mastertoken):
+            raise HTTPException(
+                status_code=401, 
+                detail="Invalid master token. Master token is required to extract hidden documents."
+            )
+        
+        # Get the message
+        message = db.query(Message).filter(
+            and_(
+                Message.id == decrypt_data.message_id,
+                or_(
+                    Message.sender_id == user_id,
+                    Message.recipient_id == user_id
+                )
+            )
+        ).first()
+        
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        # Check if this is a decoy document message and extract the document
+        message_content = str(getattr(message, 'encrypted_content', ''))
+        document_data = DecryptService.extract_decoy_document(message_content)
+        
+        if not document_data:
+            raise HTTPException(status_code=400, detail="This message does not contain a hidden document or extraction failed")
+        
+        # Log successful extraction
+        AuditService.log_event(
+            db,
+            user_id,
+            "document_extracted",
+            f"Hidden document extracted from message {decrypt_data.message_id}",
+            severity="info"
+        )
+        
+        # Determine which apps can open this document type
+        mime_type = document_data.get("mime_type", "application/octet-stream")
+        filename = document_data.get("filename", "document")
+        
+        # Map MIME types to common document reading apps
+        app_suggestions = []
+        if mime_type.startswith("application/pdf"):
+            app_suggestions = ["Adobe Acrobat", "Microsoft Edge", "Google PDF Viewer", "WPS Office", "Microsoft 365"]
+        elif mime_type.startswith("application/vnd.openxmlformats-officedocument.wordprocessingml.document") or mime_type.startswith("application/msword"):
+            app_suggestions = ["Microsoft Word", "WPS Office", "Google Docs", "Apple Pages"]
+        elif mime_type.startswith("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") or mime_type.startswith("application/vnd.ms-excel"):
+            app_suggestions = ["Microsoft Excel", "WPS Office", "Google Sheets", "Apple Numbers"]
+        elif mime_type.startswith("application/vnd.openxmlformats-officedocument.presentationml.presentation") or mime_type.startswith("application/vnd.ms-powerpoint"):
+            app_suggestions = ["Microsoft PowerPoint", "WPS Office", "Google Slides", "Apple Keynote"]
+        else:
+            app_suggestions = ["File Viewer", "WPS Office", "Microsoft 365", "Google Docs"]
+        
+        return {
+            "message_id": decrypt_data.message_id,
+            "filename": filename,
+            "file_size": document_data["file_size"],
+            "document_data": document_data["document_data"],  # Base64 encoded document
+            "mime_type": mime_type,
+            "extract_time": time.time(),
+            "security": "Decoy text protection",
+            "suggested_apps": app_suggestions,  # List of apps that can open this document
+            "message": f"Document extracted successfully. Suggested apps: {', '.join(app_suggestions)}"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Extract decoy document error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to extract hidden document")
+
 # Add media endpoints
 @app.post("/media/upload")
 async def upload_media(
@@ -1550,6 +1966,38 @@ async def upload_media(
         logger.error(f"Upload media error: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload media")
 
+@app.post("/media/simple_upload")
+async def upload_simple_media(
+    media_data: SimpleMediaUpload,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Upload simple (unencrypted) media file from gallery"""
+    try:
+        # Log the incoming data for debugging
+        logger.info(f"Received simple media upload request: {media_data.dict()}")
+        
+        # Validate that username is provided
+        if not media_data.username or media_data.username == "undefined":
+            logger.error("Username is required for media upload")
+            raise HTTPException(status_code=400, detail="Username is required")
+        
+        user_id = int(getattr(current_user, 'id', 0))
+        media = MediaService.upload_simple_media(db, user_id, media_data.username, media_data)
+        
+        return {
+            "media_id": media.media_id,
+            "filename": media.filename,
+            "media_type": media.media_type,
+            "message": "Simple media uploaded successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload simple media error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload simple media")
+
 @app.get("/media/inbox")
 async def get_media_inbox(
     current_user: User = Depends(get_current_user),
@@ -1574,7 +2022,7 @@ async def get_media_inbox(
                 "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
                 "recipient": str(getattr(recipient, 'username', '')) if recipient else "unknown",
                 "timestamp": getattr(media, 'uploaded_at', datetime.now(timezone.utc)).isoformat(),
-                "expires_at": getattr(media, 'expires_at', None).isoformat() if getattr(media, 'expires_at', None) is not None else None,
+                "expires_at": getattr(media, 'expires_at', None) and getattr(media, 'expires_at', None).isoformat() or None,
                 "auto_delete": bool(getattr(media, 'auto_delete', False)),
                 "downloaded": getattr(media, 'downloaded_at', None) is not None
             })
