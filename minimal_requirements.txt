@@ -1,0 +1,10 @@
+# Minimal requirements for FastAPI mobile backend with PostgreSQL
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+SQLAlchemy==2.0.44
+psycopg2-binary==2.9.11
+pycryptodome==3.23.0
+python-dotenv==1.1.1

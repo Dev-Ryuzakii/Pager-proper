@@ -8,6 +8,11 @@ import os
 import sys
 import logging
 import time
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 from database_config import db_config
 from database_models import Base, engine
 
@@ -32,7 +37,7 @@ def main():
     
     # Wait a bit for database to be ready
     print("⏳ Waiting for database to be ready...")
-    time.sleep(10)
+    time.sleep(5)
     
     try:
         # Create all database tables

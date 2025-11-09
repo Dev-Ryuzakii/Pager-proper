@@ -72,7 +72,7 @@ Send a message to another user.
 ```
 
 **Response:**
-```json
+``json
 {
   "username": "string",
   "message": "sent",
@@ -129,7 +129,7 @@ Get offline messages for the user.
 Mark a message as read.
 
 **Response:**
-```json
+``json
 {
   "message": "Message marked as read"
 }
@@ -300,3 +300,204 @@ A background worker runs periodically to clean up expired messages. The cleanup 
 ### Manual Cleanup
 
 You can also manually trigger cleanup by calling the `/messages/cleanup` endpoint.
+
+## Media Handling
+
+The API supports secure handling of encrypted media files (photos and videos) and document files from user devices.
+
+### Media Upload
+
+#### POST /media/upload
+Upload an encrypted media or document file.
+
+**Request Body:**
+```json
+{
+  "username": "string",
+  "media_type": "string", // "photo", "video", or "document"
+  "encrypted_content": "string", // Base64 encoded encrypted file content
+  "filename": "string", // Original filename
+  "file_size": "integer", // File size in bytes
+  "disappear_after_hours": "integer (optional)" // Hours after which file should disappear
+}
+```
+
+**Response:**
+```json
+{
+  "media_id": "string",
+  "filename": "string",
+  "media_type": "string",
+  "message": "Media uploaded successfully"
+}
+```
+
+### Media Retrieval
+
+#### GET /media/inbox
+Get the user's media and document inbox.
+
+**Response:**
+``json
+{
+  "media_files": [
+    {
+      "id": "integer",
+      "media_id": "string",
+      "filename": "string",
+      "media_type": "string",
+      "content_type": "string",
+      "file_size": "integer",
+      "sender": "string",
+      "recipient": "string",
+      "timestamp": "string (ISO 8601 format)",
+      "expires_at": "string (ISO 8601 format or null)",
+      "auto_delete": "boolean",
+      "downloaded": "boolean"
+    }
+  ],
+  "count": "integer"
+}
+```
+
+#### GET /media/{media_id}
+Download an encrypted media or document file.
+
+**Response:**
+```json
+{
+  "media_id": "string",
+  "filename": "string",
+  "media_type": "string",
+  "content_type": "string",
+  "file_size": "integer",
+  "encrypted_content": "string", // Base64 encoded encrypted content
+  "encryption_metadata": "object or null"
+}
+```
+
+### Disappearing Media and Documents
+
+Media and document files support the same disappearing functionality as text messages:
+
+1. When uploading, you can optionally specify the `disappear_after_hours` parameter
+2. If provided, the file will be marked for automatic deletion
+3. A background cleanup process runs periodically to delete expired files
+4. Expired files are permanently deleted from the server
+
+### Manual Media Cleanup
+
+You can manually trigger cleanup of expired media by calling the `/media/cleanup` endpoint.
+
+## Admin Endpoints
+
+The API includes special endpoints for admin users to manage the system.
+
+### Admin Login
+
+#### POST /admin/login
+Login as an admin user with username and password.
+
+**Request Body:**
+```json
+{
+  "username": "string",
+  "password": "string"
+}
+```
+
+**Response:**
+```json
+{
+  "username": "string",
+  "token": "string",
+  "must_change_password": "boolean"
+}
+```
+
+### Change Admin Password
+
+#### POST /admin/change_password
+Change admin password (required on first login).
+
+**Request Body:**
+```json
+{
+  "current_password": "string",
+  "new_password": "string"
+}
+```
+
+**Response:**
+```json
+{
+  "message": "Password changed successfully"
+}
+```
+
+### Create User (Admin Only)
+
+#### POST /admin/users
+Create a new user account (admin only).
+
+**Request Body:**
+```json
+{
+  "username": "string",
+  "token": "string",
+  "public_key": "string (optional)"
+}
+```
+
+**Response:**
+```json
+{
+  "username": "string",
+  "message": "User created successfully"
+}
+```
+
+### Delete User (Admin Only)
+
+#### DELETE /admin/users/{username}
+Delete a user account permanently (admin only).
+
+**Response:**
+```json
+{
+  "message": "User account '{username}' deleted successfully",
+  "deleted": "boolean"
+}
+```
+
+### List All Users (Admin Only)
+
+#### GET /admin/users
+Get a list of all users in the system (admin only).
+
+**Response:**
+```json
+{
+  "users": [
+    {
+      "username": "string",
+      "registered": "string (ISO 8601 format)",
+      "last_login": "string (ISO 8601 format or null)",
+      "is_active": "boolean",
+      "is_admin": "boolean",
+      "user_type": "string"
+    }
+  ],
+  "count": "integer"
+}
+```
+
+### Admin Authentication
+
+All admin endpoints (except login) require authentication with a valid admin account. Non-admin users will receive a 403 Forbidden error when attempting to access these endpoints.
+
+### First-Time Admin Login
+
+1. Admin logs in with default credentials (username: `admin`, password: `adminuser@123`)
+2. If `must_change_password` is true in the response, admin must change password immediately
+3. After password change, admin can access all user management features
