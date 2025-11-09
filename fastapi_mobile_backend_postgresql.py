@@ -9,14 +9,16 @@ import time
 import base64
 import hashlib
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, File, Form, UploadFile, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
 import uvicorn
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
@@ -2266,6 +2268,180 @@ async def admin_get_all_users(current_user: User = Depends(get_admin_user),
     except Exception as e:
         logger.error(f"Admin get users error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve users")
+
+# Directory to temporarily store uploaded files
+UPLOAD_DIR = "media_uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.post("/media/upload_raw")
+async def upload_raw_media(
+    username: str = Form(...),
+    file: UploadFile = File(...),
+    disappear_after_hours: Optional[int] = Form(None),
+    current_user: User = Depends(get_current_user),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_database_session)
+):
+    """
+    Endpoint for direct raw media upload without base64 encoding
+    """
+    try:
+        # Get recipient user
+        recipient = db.query(User).filter(User.username == username, User.is_active == True).first()
+        if not recipient:
+            raise HTTPException(status_code=404, detail="Recipient not found")
+        
+        # Generate unique filename to avoid conflicts
+        file_extension = os.path.splitext(file.filename)[1] if file.filename else ".bin"
+        unique_filename = f"{uuid.uuid4()}{file_extension}"
+        file_path = os.path.join(UPLOAD_DIR, unique_filename)
+        
+        # Save the uploaded file
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        # Get sender ID
+        sender_id = int(getattr(current_user, 'id', 0))
+        
+        # Calculate expiration time if disappearing media
+        expires_at = None
+        auto_delete = False
+        if disappear_after_hours is not None and disappear_after_hours > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=disappear_after_hours)
+            auto_delete = True
+        
+        # Create message for the media
+        message = Message(
+            sender_id=sender_id,
+            recipient_id=recipient.id,
+            encrypted_content=unique_filename,  # Use the actual media ID
+            content_type=f"media/raw",
+            delivered=True,
+            read=False,
+            is_offline=False,  # Set to False so it appears in regular inbox
+            expires_at=expires_at,
+            auto_delete=auto_delete
+        )
+        
+        db.add(message)
+        db.commit()
+        db.refresh(message)
+        
+        # Create media record
+        media = Media(
+            media_id=unique_filename,
+            filename=file.filename or "media",
+            file_size=len(content),
+            media_type="raw",
+            content_type=file.content_type or "application/octet-stream",
+            encrypted_file_path=file_path,
+            message_id=message.id,
+            sender_id=sender_id,
+            recipient_id=recipient.id,
+            expires_at=expires_at,
+            auto_delete=auto_delete
+        )
+        
+        db.add(media)
+        db.commit()
+        db.refresh(media)
+        
+        logger.info(f"📤 Raw media uploaded: {sender_id} → {recipient.id} ({unique_filename})")
+        
+        # Create success response with file info
+        response = {
+            "media_id": unique_filename,
+            "filename": file.filename,
+            "file_size": len(content),
+            "content_type": file.content_type,
+            "message": "File uploaded successfully",
+            "uploaded_for": username,
+            "disappear_after_hours": disappear_after_hours
+        }
+        
+        return response
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
+
+@app.get("/media/download/{media_id}")
+async def download_raw_media(
+    media_id: str, 
+    current_user: User = Depends(get_current_user),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_database_session)
+):
+    """
+    Endpoint to download raw media by ID
+    """
+    try:
+        # Verify that the user has access to this media
+        media = db.query(Media).filter(Media.media_id == media_id).first()
+        if not media:
+            raise HTTPException(status_code=404, detail="Media not found")
+        
+        # Check if user is sender or recipient
+        user_id = int(getattr(current_user, 'id', 0))
+        if media.sender_id != user_id and media.recipient_id != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        file_path = os.path.join(UPLOAD_DIR, media_id)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Read the file content
+        with open(file_path, "rb") as file:
+            content = file.read()
+        
+        # Mark media as downloaded
+        media.downloaded_at = datetime.now(timezone.utc)
+        db.commit()
+        
+        return Response(
+            content=content,
+            media_type=media.content_type,
+            headers={
+                "Content-Disposition": f"attachment; filename={media.filename}",
+                "Content-Length": str(len(content))
+            }
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to download file: {str(e)}")
+
+@app.get("/media/{media_id}")
+async def get_raw_uploaded_media(media_id: str):
+    """
+    Endpoint to retrieve uploaded media by ID
+    """
+    # Sanitize media_id to prevent path traversal issues
+    import re
+    if not re.match(r'^[a-zA-Z0-9._-]+$', media_id):
+        raise HTTPException(status_code=400, detail="Invalid media ID format")
+    
+    file_path = os.path.join(UPLOAD_DIR, media_id)
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Return file info (in a real app, you'd serve the actual file)
+    return {
+        "media_id": media_id,
+        "message": "File available for download"
+    }
+
+# Health check endpoint
+@app.get("/status")
+async def raw_upload_health_check():
+    return {
+        "status": "running",
+        "version": "1.0.0"
+    }
 
         
 if __name__ == "__main__":
