@@ -1237,19 +1237,18 @@ async def register_user(user_data: UserRegistration, db: Session = Depends(get_d
 
 @app.post("/auth/login")
 async def login_user(login_data: UserLogin, db: Session = Depends(get_database_session)):
-    """Login user with phone number and token - simplified JSON: {phone_number, token}"""
+    """Login user with username and token - simplified JSON: {username, token}"""
     try:
-        user = UserService.authenticate_user(db, login_data.phone_number, login_data.token, ip_address="mobile_app")
+        user = AdminService.authenticate_user(db, login_data.username, login_data.token, ip_address="mobile_app")
         if not user:
-            raise HTTPException(status_code=401, detail="Invalid phone number or token")
+            raise HTTPException(status_code=401, detail="Invalid username or token")
         
         # Create session
         user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
         session = SessionService.create_session(db, user_id, "mobile", "mobile_app")
         
         return {
-            "phone_number": str(getattr(user, 'phone_number', '')),
-            "username": str(getattr(user, 'username', '')),  # For backward compatibility
+            "username": str(getattr(user, 'username', '')),
             "token": str(getattr(session, 'session_token', ''))
         }
         
@@ -1539,24 +1538,6 @@ async def register_user(user_data: UserRegistration,
         raise HTTPException(status_code=400, detail="Failed to register user")
 
 
-@app.post("/login")
-async def login_user(phone_number: str,
-                    token: str,
-                    db: Session = Depends(get_database_session)):
-    """Login user"""
-    try:
-        user = UserService.login_user(db, phone_number, token)
-        if user:
-            return {
-                "username": user.username,
-                "phone_number": user.phone_number,
-                "registered": user.registered.isoformat(),
-                "last_login": user.last_login.isoformat() if user.last_login else None
-            }
-
-    except Exception as e:
-        logger.error(f"Login error: {e}")
-        raise HTTPException(status_code=401, detail="Failed to login user")
 
 
 @app.post("/messages/mark_read")
@@ -2323,29 +2304,6 @@ async def admin_login(login_data: AdminLogin, db: Session = Depends(get_database
         logger.error(f"Admin login error: {e}")
         raise HTTPException(status_code=500, detail="Login failed")
 
-@app.post("/auth/login")
-async def login_user(login_data: UserLogin, db: Session = Depends(get_database_session)):
-    """Login user with username and token - simplified JSON: {username, token}"""
-    try:
-        user = UserService.authenticate_user(db, login_data.username, login_data.token, ip_address="mobile_app")
-        if not user:
-            raise HTTPException(status_code=401, detail="Invalid username or token")
-        
-        # Create session
-        user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
-        session = SessionService.create_session(db, user_id, "mobile", "mobile_app")
-        
-        return {
-            "username": str(getattr(user, 'username', '')),
-            "phone_number": str(getattr(user, 'phone_number', '')),  # For backward compatibility
-            "token": str(getattr(session, 'session_token', ''))
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Login error: {e}")
-        raise HTTPException(status_code=500, detail="Login failed")
 
 @app.post("/admin/change_password")
 async def admin_change_password(password_data: AdminChangePassword,
