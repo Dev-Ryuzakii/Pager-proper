@@ -66,14 +66,14 @@ def verify_password(password: str, hashed: str) -> bool:
 
 # Pydantic Models
 class UserAuth(BaseModel):
-    phone_number: str = Field(..., min_length=10, max_length=20, description="User's phone number")
+    username: str = Field(..., min_length=3, max_length=50, description="User's username")
     token: str = Field(..., description="User authentication token")
 
 class UserRegistration(BaseModel):
     """Deprecated - Users can only be created by admin"""
-    phone_number: str = Field(..., min_length=10, max_length=20)
+    username: str = Field(..., min_length=3, max_length=50)
+    phone_number: str = Field(..., min_length=10, max_length=20, description="User's phone number")
     token: str = Field(..., description="User authentication token")
-    public_key: Optional[str] = Field(None, description="User's RSA public key in PEM format (optional)")
 
 # Add new Pydantic models for admin functionality
 class AdminLogin(BaseModel):
@@ -85,10 +85,9 @@ class AdminChangePassword(BaseModel):
     new_password: str = Field(..., min_length=8, description="New password")
 
 class AdminCreateUser(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
     phone_number: str = Field(..., min_length=10, max_length=20, description="User's phone number")
     token: str = Field(..., description="User authentication token")
-    public_key: Optional[str] = Field(None, description="User's RSA public key in PEM format (optional)")
-
 
 class UserLogin(UserAuth):
     pass  # Same as auth - just username and token
@@ -927,6 +926,29 @@ class AdminService:
         return user is not None
     
     @staticmethod
+    def authenticate_user(db: Session, username: str, token: str, ip_address: Optional[str] = None) -> Optional[User]:
+        """Authenticate user with username and token, update last login"""
+        user = db.query(User).filter(
+            User.username == username, 
+            User.token == token,
+            User.is_active == True
+        ).first()
+        
+        if user:
+            # Use setattr for SQLAlchemy models
+            setattr(user, 'last_login', datetime.now(timezone.utc))
+            db.commit()
+            
+            # Log login
+            AuditService.log_event(
+                db, getattr(user, 'id', None), "user_login", 
+                f"User {username} logged in", 
+                ip_address=ip_address
+            )
+        
+        return user
+
+    @staticmethod
     def authenticate_admin(db: Session, username: str, password: str, ip_address: Optional[str] = None) -> Optional[User]:
         """Authenticate admin user with password"""
         user = db.query(User).filter(
@@ -987,18 +1009,15 @@ class AdminService:
         if existing_user:
             raise HTTPException(status_code=400, detail="Phone number already registered")
         
-        # Use provided token
+        # Use provided token and username
         token = user_data.token
-        
-        # Generate username from phone number (e.g., user_1234567890)
-        username = f"user_{user_data.phone_number.replace('+', '').replace('-', '').replace(' ', '')}"
+        username = user_data.username
         
         # Create user
         user = User(
             phone_number=user_data.phone_number,
             username=username,
             token=token,
-            public_key=user_data.public_key,
             registration_ip=ip_address,
             is_active=True,
             is_verified=True,
@@ -1489,6 +1508,78 @@ async def mark_message_read(message_id: int,
         logger.error(f"Mark read error: {e}")
         raise HTTPException(status_code=500, detail="Failed to mark message as read")
 
+class AdminUserRegistrationDetails(BaseModel):
+    """Model for admin user registration details response"""
+    username: str = Field(..., description="Username for the user account")
+    phone_number: str = Field(..., description="Phone number for the user account")
+    token: str = Field(..., description="Authentication token for the user")
+    message: str = Field(..., description="Instructional message for sharing with user")
+
+@app.post("/register")
+async def register_user(user_data: UserRegistration,
+                       db: Session = Depends(get_database_session)):
+    """Register new user"""
+    try:
+        user = UserService.register_user(db, user_data.username,
+                                       user_data.phone_number,
+                                       user_data.password,
+                                       user_data.public_key,
+                                       user_data.token)
+
+        if user:
+            return {
+                "username": user.username,
+                "phone_number": user.phone_number,
+                "registered": user.registered.isoformat(),
+                "last_login": user.last_login.isoformat() if user.last_login else None
+            }
+
+    except Exception as e:
+        logger.error(f"Registration error: {e}")
+        raise HTTPException(status_code=400, detail="Failed to register user")
+
+
+@app.post("/login")
+async def login_user(phone_number: str,
+                    token: str,
+                    db: Session = Depends(get_database_session)):
+    """Login user"""
+    try:
+        user = UserService.login_user(db, phone_number, token)
+        if user:
+            return {
+                "username": user.username,
+                "phone_number": user.phone_number,
+                "registered": user.registered.isoformat(),
+                "last_login": user.last_login.isoformat() if user.last_login else None
+            }
+
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        raise HTTPException(status_code=401, detail="Failed to login user")
+
+
+@app.post("/messages/mark_read")
+async def mark_message_as_read(message_id: int,
+                               current_user: User = Depends(get_current_user),
+                               db: Session = Depends(get_database_session)):
+    """Mark a message as read"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        UserService.mark_message_read(db, message_id, user_id)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Mark read error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to mark message as read")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Mark read error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to mark message as read")
+
 @app.get("/users")
 async def get_users(current_user: User = Depends(get_current_user),
                    db: Session = Depends(get_database_session)):
@@ -1538,6 +1629,139 @@ async def get_user_public_key(username: str,
     except Exception as e:
         logger.error(f"Get public key error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve public key")
+
+def normalize_phone_number(phone: str) -> str:
+    """Normalize phone number by removing spaces, hyphens, parentheses, and handling country code variations"""
+    if not phone:
+        return ""
+    
+    # Remove all formatting characters
+    cleaned = phone.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+    
+    # Handle country code variations
+    if cleaned.startswith('+'):
+        cleaned = cleaned[1:]
+    
+    return cleaned
+
+# Add admin authentication dependency
+async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
+                        db: Session = Depends(get_database_session)) -> User:
+    """Get current authenticated admin user"""
+    try:
+        token = credentials.credentials
+        
+        # Validate session
+        session = SessionService.validate_session(db, token)
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired session",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Get user
+        user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.is_admin == True).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Admin user not found",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        return user
+        
+    except Exception as e:
+        logger.error(f"Admin authentication error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate admin credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+@app.get("/admin/users/{username}/registration_details", response_model=AdminUserRegistrationDetails)
+async def admin_get_user_registration_details(username: str,
+                                          current_user: User = Depends(get_admin_user),
+                                          db: Session = Depends(get_database_session)):
+    """Get registration details for a specific user by username (admin only)
+    
+    This endpoint allows admins to retrieve the registration details for a specific user
+    which can be shared with the user for them to log in to the system.
+    
+    - **username**: The username of the user to retrieve details for
+    - **current_user**: The authenticated admin user making the request
+    - **db**: Database session dependency
+    
+    Returns:
+    - **username**: Username for the user account
+    - **phone_number**: Phone number for the user account  
+    - **token**: Authentication token for the user
+    - **message**: Instructional message for sharing with user
+    
+    Raises:
+    - **403**: If the requesting user is not an admin
+    - **404**: If no user is found with the specified username
+    - **500**: If there's an internal server error
+    """
+    try:
+        # Check if requesting user is admin
+        user_id = int(getattr(current_user, 'id', 0))
+        if not AdminService.is_admin(db, user_id):
+            raise HTTPException(status_code=403, detail="Only admin users can access this endpoint")
+        
+        logger.info(f"=== DEBUG: Starting user search by username ===")
+        logger.info(f"Input username parameter: '{username}'")
+        logger.info(f"Input parameter type: {type(username)}")
+        logger.info(f"Input parameter length: {len(username)}")
+        logger.info(f"Input parameter repr: {repr(username)}")
+        
+        # Log all users in database for debugging
+        all_users = db.query(User).all()
+        logger.info(f"Total users in database: {len(all_users)}")
+        for u in all_users:
+            stored_username = getattr(u, 'username', '')
+            logger.info(f"DB User ID {u.id}: username='{stored_username}' (type: {type(stored_username)}, len: {len(stored_username)})")
+        
+        # Try exact match
+        logger.info(f"Attempting exact match for username: '{username}'")
+        user = db.query(User).filter(User.username == username).first()
+        if user:
+            logger.info(f"SUCCESS: Found user with exact match - ID: {user.id}")
+        else:
+            logger.info("Exact match failed")
+            
+            # Try with string conversion
+            logger.info(f"Attempting string conversion match for username: '{str(username)}'")
+            user = db.query(User).filter(User.username == str(username)).first()
+            if user:
+                logger.info(f"SUCCESS: Found user with string conversion match - ID: {user.id}")
+            else:
+                logger.info("String conversion match failed")
+        
+        if not user:
+            logger.error(f"User not found for username: '{username}'")
+            # Log similar usernames for debugging
+            similar_users = db.query(User).filter(User.username.like(f"%{username}%")).all()
+            if similar_users:
+                logger.info(f"Similar usernames found:")
+                for u in similar_users:
+                    logger.info(f"  Similar: '{u.username}'")
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Return registration details that can be shared with the user
+        logger.info(f"Returning registration details for user ID: {user.id}")
+        return {
+            "username": str(getattr(user, 'username', '')),
+            "phone_number": str(getattr(user, 'phone_number', '')),
+            "token": str(getattr(user, 'token', '')),
+            "message": "Share these details with the user for registration"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin get user registration details error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve user registration details")
 
 @app.post("/mastertoken/create")
 async def create_mastertoken(token_data: MasterToken, 
@@ -2099,6 +2323,30 @@ async def admin_login(login_data: AdminLogin, db: Session = Depends(get_database
         logger.error(f"Admin login error: {e}")
         raise HTTPException(status_code=500, detail="Login failed")
 
+@app.post("/auth/login")
+async def login_user(login_data: UserLogin, db: Session = Depends(get_database_session)):
+    """Login user with username and token - simplified JSON: {username, token}"""
+    try:
+        user = UserService.authenticate_user(db, login_data.username, login_data.token, ip_address="mobile_app")
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid username or token")
+        
+        # Create session
+        user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
+        session = SessionService.create_session(db, user_id, "mobile", "mobile_app")
+        
+        return {
+            "username": str(getattr(user, 'username', '')),
+            "phone_number": str(getattr(user, 'phone_number', '')),  # For backward compatibility
+            "token": str(getattr(session, 'session_token', ''))
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        raise HTTPException(status_code=500, detail="Login failed")
+
 @app.post("/admin/change_password")
 async def admin_change_password(password_data: AdminChangePassword,
                                current_user: User = Depends(get_admin_user),
@@ -2132,6 +2380,7 @@ async def admin_create_user(user_data: AdminCreateUser,
         
         return {
             "username": str(getattr(new_user, 'username', '')),
+            "phone_number": str(getattr(new_user, 'phone_number', '')),
             "message": "User created successfully"
         }
         
@@ -2189,11 +2438,6 @@ async def admin_get_all_users(current_user: User = Depends(get_admin_user),
                 "is_admin": bool(getattr(user, 'is_admin', False)),
                 "user_type": str(getattr(user, 'user_type', ''))
             })
-        
-        return {
-            "users": result,
-            "count": len(result)
-        }
         
         return {
             "users": result,

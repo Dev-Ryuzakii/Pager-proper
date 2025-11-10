@@ -4,7 +4,7 @@ This document describes the JavaScript functions for interacting with the admin 
 
 ## Base Configuration
 
-```javascript
+```
 const BASE_URL = 'http://localhost:8001';
 ```
 
@@ -148,18 +148,18 @@ export const adminCreateUser = async (userData, token) => {
 ```
 
 **Parameters:**
-- `userData` (object): User data with `username` (min 3 characters), `token`, and optional `public_key`
+- `userData` (object): User data with `username` (min 3 characters), `phone_number` (min 10 characters), and `token`
 - `token` (string): Admin authentication token
 
 **Returns:**
-- Success message with created username
+- Success message with created username and phone number
 
 ### adminDeleteUser
 Delete a user account permanently.
 
 ```javascript
-export const adminDeleteUser = async (username, token) => {
-  const response = await fetch(`${BASE_URL}/admin/users/${username}`, {
+export const adminDeleteUser = async (phoneNumber, token) => {
+  const response = await fetch(`${BASE_URL}/admin/users/${phoneNumber}`, {
     method: 'DELETE',
     headers: {
       'Authorization': `Bearer ${token}`,
@@ -176,8 +176,79 @@ export const adminDeleteUser = async (username, token) => {
 ```
 
 **Parameters:**
-- `username` (string): Username of the account to delete
+- `phoneNumber` (string): Phone number of the account to delete
 - `token` (string): Admin authentication token
 
 **Returns:**
 - Success message or error
+
+### adminGetUserRegistrationDetails
+Get registration details for a specific user by username.
+
+```javascript
+export const adminGetUserRegistrationDetails = async (username, token) => {
+  const response = await fetch(`${BASE_URL}/admin/users/${username}/registration_details`, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+    },
+  });
+  
+  return handleResponse(response);
+};
+```
+
+**Parameters:**
+- `username` (string): Username of the user to get registration details for
+- `token` (string): Admin authentication token
+
+**Returns:**
+- Object with `username`, `phone_number`, `token`, and `message` properties that can be shared with the user for registration
+
+### User Login
+Login as a regular user.
+
+```javascript
+export const userLogin = async (username, token) => {
+  const response = await fetch(`${BASE_URL}/auth/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ username, token }),
+  });
+  
+  return handleResponse(response);
+};
+```
+
+**Parameters:**
+- `username` (string): Username of the user account
+- `token` (string): Authentication token for the user
+
+**Returns:**
+- Object with `username`, `phone_number`, and session `token` properties
+
+## Testing with cURL
+
+### Admin Login
+```bash
+curl -X POST http://localhost:8001/admin/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "your_admin_password"}'
+```
+
+### User Login
+```bash
+curl -X POST http://localhost:8001/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "user_09074528611", "token": "@1257_Shadow"}'
+```
+
+### Admin Create User
+```bash
+curl -X POST http://localhost:8001/admin/users \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ADMIN_SESSION_TOKEN" \
+  -d '{"username": "newuser", "phone_number": "1234567890", "token": "user_token"}'
+```
