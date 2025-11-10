@@ -66,18 +66,18 @@ def verify_password(password: str, hashed: str) -> bool:
 
 # Pydantic Models
 class UserAuth(BaseModel):
-    username: str = Field(..., min_length=3, max_length=50)
+    phone_number: str = Field(..., min_length=10, max_length=20, description="User's phone number")
     token: str = Field(..., description="User authentication token")
 
 class UserRegistration(BaseModel):
-    username: str = Field(..., min_length=3, max_length=50)
+    """Deprecated - Users can only be created by admin"""
+    phone_number: str = Field(..., min_length=10, max_length=20)
     token: str = Field(..., description="User authentication token")
     public_key: Optional[str] = Field(None, description="User's RSA public key in PEM format (optional)")
 
 # Add new Pydantic models for admin functionality
 class AdminLogin(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
-
     password: str = Field(..., min_length=8, description="Admin password")
 
 class AdminChangePassword(BaseModel):
@@ -85,7 +85,7 @@ class AdminChangePassword(BaseModel):
     new_password: str = Field(..., min_length=8, description="New password")
 
 class AdminCreateUser(BaseModel):
-    username: str = Field(..., min_length=3, max_length=50)
+    phone_number: str = Field(..., min_length=10, max_length=20, description="User's phone number")
     token: str = Field(..., description="User authentication token")
     public_key: Optional[str] = Field(None, description="User's RSA public key in PEM format (optional)")
 
@@ -94,7 +94,7 @@ class UserLogin(UserAuth):
     pass  # Same as auth - just username and token
 
 class MessageSend(BaseModel):
-    username: str = Field(..., description="Recipient username")
+    phone_number: str = Field(..., description="Recipient phone number")
     message: str = Field(..., min_length=1, description="Message content")
     disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
 
@@ -125,7 +125,7 @@ class UserResponse(BaseModel):
 
 # Add new Pydantic models for media handling
 class MediaUpload(BaseModel):
-    username: str = Field(..., description="Recipient username")
+    phone_number: str = Field(..., description="Recipient phone number")
     media_type: str = Field(..., description="Type of media: photo, video, or document")
     encrypted_content: str = Field(..., description="Base64 encoded encrypted media content")
     filename: str = Field(..., description="Original filename")
@@ -133,7 +133,7 @@ class MediaUpload(BaseModel):
     disappear_after_hours: Optional[int] = Field(None, description="Hours after which media should disappear (default: None)")
 
 class SimpleMediaUpload(BaseModel):
-    username: str = Field(..., description="Recipient username")
+    phone_number: str = Field(..., description="Recipient phone number")
     media_type: str = Field(default="photo", description="Type of media: photo, video, or document")
     content: str = Field(default="", description="Base64 encoded media content")
     filename: str = Field(default="media", description="Original filename")
@@ -142,14 +142,14 @@ class SimpleMediaUpload(BaseModel):
     content_type: Optional[str] = Field("application/octet-stream", description="MIME type of the media")
 
 class DecoyImageMessage(BaseModel):
-    username: str = Field(..., description="Recipient username")
+    phone_number: str = Field(..., description="Recipient phone number")
     image_content: str = Field(..., description="Base64 encoded image content")
     filename: str = Field(default="image.jpg", description="Original filename")
     file_size: int = Field(default=0, description="File size in bytes")
     disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
 
 class DecoyDocumentMessage(BaseModel):
-    username: str = Field(..., description="Recipient username")
+    phone_number: str = Field(..., description="Recipient phone number")
     document_content: str = Field(..., description="Base64 encoded document content")
     filename: str = Field(..., description="Original filename with extension (e.g., document.pdf, report.docx)")
     file_size: int = Field(default=0, description="File size in bytes")
@@ -197,46 +197,17 @@ class UserService:
     
     @staticmethod
     def create_user(db: Session, user_data: UserRegistration, ip_address: Optional[str] = None) -> User:
-        """Create a new user"""
-        # Check if user already exists
-        existing_user = db.query(User).filter(User.username == user_data.username).first()
-        if existing_user:
-            raise HTTPException(status_code=400, detail="Username already registered")
-        
-        # Use provided token (simple like TLS system)
-        token = user_data.token
-        
-        # Create user - simple fields only: username, token, and optional public_key
-        user = User(
-            username=user_data.username,
-            token=token,
-            public_key=user_data.public_key,  # This is now optional
-            registration_ip=ip_address,
-            is_active=True,
-            is_verified=True,
-            user_type='mobile'  # To distinguish from TLS users
+        """Create a new user - DEPRECATED: Only admin can create users now"""
+        raise HTTPException(
+            status_code=403, 
+            detail="User registration is disabled. Only administrators can create user accounts."
         )
-        
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        
-        # Log registration - use getattr to safely access the id
-        user_id = getattr(user, 'id', None)
-        AuditService.log_event(
-            db, user_id, "user_registration", 
-            f"User {user_data.username} registered", 
-            ip_address=ip_address
-        )
-        
-        logger.info(f"✅ User registered: {user_data.username}")
-        return user
     
     @staticmethod
-    def authenticate_user(db: Session, username: str, token: str, ip_address: Optional[str] = None) -> Optional[User]:
-        """Authenticate user with token and update last login"""
+    def authenticate_user(db: Session, phone_number: str, token: str, ip_address: Optional[str] = None) -> Optional[User]:
+        """Authenticate user with phone number and token, update last login"""
         user = db.query(User).filter(
-            User.username == username, 
+            User.phone_number == phone_number, 
             User.token == token,
             User.is_active == True
         ).first()
@@ -249,15 +220,20 @@ class UserService:
             # Log login
             AuditService.log_event(
                 db, getattr(user, 'id', None), "user_login", 
-                f"User {username} logged in", 
+                f"User {phone_number} logged in", 
                 ip_address=ip_address
             )
         
         return user
     
     @staticmethod
+    def get_user_by_phone(db: Session, phone_number: str) -> Optional[User]:
+        """Get user by phone number"""
+        return db.query(User).filter(User.phone_number == phone_number, User.is_active == True).first()
+    
+    @staticmethod
     def get_user_by_username(db: Session, username: str) -> Optional[User]:
-        """Get user by username"""
+        """Get user by username - deprecated, kept for backward compatibility"""
         return db.query(User).filter(User.username == username, User.is_active == True).first()
     
     @staticmethod
@@ -266,59 +242,21 @@ class UserService:
         return db.query(User).filter(User.is_active == True).all()
     
     @staticmethod
-    def delete_user(db: Session, username: str) -> bool:
-        """Delete a user account and all associated data"""
-        try:
-            # Get the user
-            user = db.query(User).filter(User.username == username).first()
-            if not user:
-                return False
-            
-            # Get user ID for logging
-            user_id = getattr(user, 'id', None)
-            
-            # Log the deletion
-            AuditService.log_event(
-                db, user_id, "account_deleted", 
-                f"User account {username} deleted by system"
-            )
-            
-            # Delete associated data first due to foreign key constraints
-            # Delete user sessions
-            db.query(UserSession).filter(UserSession.user_id == user_id).delete()
-            
-            # Delete user keys
-            db.query(UserKey).filter(UserKey.user_id == user_id).delete()
-            
-            # Delete user master tokens
-            db.query(DBMasterToken).filter(DBMasterToken.user_id == user_id).delete()
-            
-            # Delete messages sent by user
-            db.query(Message).filter(Message.sender_id == user_id).delete()
-            
-            # Delete messages received by user
-            db.query(Message).filter(Message.recipient_id == user_id).delete()
-            
-            # Finally delete the user
-            db.delete(user)
-            db.commit()
-            
-            logger.info(f"✅ User account and all associated data deleted: {username}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error deleting user {username}: {e}")
-            db.rollback()
-            return False
+    def delete_user(db: Session, phone_number: str) -> bool:
+        """Delete a user account and all associated data - DEPRECATED: Use AdminService.delete_user"""
+        raise HTTPException(
+            status_code=403,
+            detail="Only administrators can delete user accounts."
+        )
 
 class MessageService:
     """Service class for message operations"""
     
     @staticmethod
-    def send_message(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = None) -> Message:
+    def send_message(db: Session, sender_id: int, recipient_phone: str, message_content: str, disappear_after_hours: Optional[int] = None) -> Message:
         """Send a message - simplified"""
-        # Get recipient
-        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
+        # Get recipient by phone number
+        recipient = db.query(User).filter(User.phone_number == recipient_phone, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
@@ -757,10 +695,10 @@ class MediaService:
     """Service class for media operations"""
     
     @staticmethod
-    def upload_media(db: Session, sender_id: int, recipient_username: str, media_data: dict) -> Media:
+    def upload_media(db: Session, sender_id: int, recipient_phone: str, media_data: dict) -> Media:
         """Upload encrypted media file (photo, video, or document)"""
-        # Get recipient
-        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
+        # Get recipient by phone number
+        recipient = db.query(User).filter(User.phone_number == recipient_phone, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
@@ -835,10 +773,10 @@ class MediaService:
         return media
     
     @staticmethod
-    def upload_simple_media(db: Session, sender_id: int, recipient_username: str, media_data: SimpleMediaUpload) -> Media:
+    def upload_simple_media(db: Session, sender_id: int, recipient_phone: str, media_data: SimpleMediaUpload) -> Media:
         """Upload simple (unencrypted) media file (photo, video, or document)"""
-        # Get recipient
-        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
+        # Get recipient by phone number
+        recipient = db.query(User).filter(User.phone_number == recipient_phone, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
@@ -1044,17 +982,21 @@ class AdminService:
         if not AdminService.is_admin(db, admin_user_id):
             raise HTTPException(status_code=403, detail="Only admin users can create new accounts")
         
-        # Check if user already exists
-        existing_user = db.query(User).filter(User.username == user_data.username).first()
+        # Check if user already exists by phone number
+        existing_user = db.query(User).filter(User.phone_number == user_data.phone_number).first()
         if existing_user:
-            raise HTTPException(status_code=400, detail="Username already registered")
+            raise HTTPException(status_code=400, detail="Phone number already registered")
         
         # Use provided token
         token = user_data.token
         
+        # Generate username from phone number (e.g., user_1234567890)
+        username = f"user_{user_data.phone_number.replace('+', '').replace('-', '').replace(' ', '')}"
+        
         # Create user
         user = User(
-            username=user_data.username,
+            phone_number=user_data.phone_number,
+            username=username,
             token=token,
             public_key=user_data.public_key,
             registration_ip=ip_address,
@@ -1072,22 +1014,22 @@ class AdminService:
         user_id = getattr(user, 'id', None)
         AuditService.log_event(
             db, admin_user_id, "user_registration_by_admin", 
-            f"User {user_data.username} registered by admin user {admin_user_id}", 
+            f"User {user_data.phone_number} registered by admin user {admin_user_id}", 
             ip_address=ip_address
         )
         
-        logger.info(f"✅ User registered by admin: {user_data.username}")
+        logger.info(f"✅ User registered by admin: {user_data.phone_number}")
         return user
     
     @staticmethod
-    def delete_user(db: Session, admin_user_id: int, username: str) -> bool:
+    def delete_user(db: Session, admin_user_id: int, phone_number: str) -> bool:
         """Delete a user account (admin only)"""
         # Check if requesting user is admin
         if not AdminService.is_admin(db, admin_user_id):
             raise HTTPException(status_code=403, detail="Only admin users can delete accounts")
         
-        # Get the user to delete
-        user = db.query(User).filter(User.username == username).first()
+        # Get the user to delete by phone number
+        user = db.query(User).filter(User.phone_number == phone_number).first()
         if not user:
             return False
         
@@ -1119,10 +1061,11 @@ class AdminService:
         for media in media_files:
             # Delete encrypted file from filesystem
             try:
-                if os.path.exists(media.encrypted_file_path):
-                    os.remove(media.encrypted_file_path)
+                file_path = getattr(media, 'encrypted_file_path', '')
+                if file_path and os.path.exists(file_path):
+                    os.remove(file_path)
             except Exception as e:
-                logger.error(f"Error deleting media file {media.encrypted_file_path}: {e}")
+                logger.error(f"Error deleting media file: {e}")
             
             # Delete media record
             db.delete(media)
@@ -1139,14 +1082,14 @@ class AdminService:
         # Log the deletion (after all associated data is deleted)
         AuditService.log_event(
             db, admin_user_id, "account_deleted_by_admin", 
-            f"User account {username} deleted by admin user {admin_user_id}"
+            f"User account {phone_number} deleted by admin user {admin_user_id}"
         )
         
         # Finally delete the user
         db.delete(user)
         db.commit()
         
-        logger.info(f"✅ User account and all associated data deleted by admin: {username}")
+        logger.info(f"✅ User account and all associated data deleted by admin: {phone_number}")
         return True
 
 # FastAPI app with lifespan
@@ -1267,39 +1210,27 @@ async def get_status(db: Session = Depends(get_database_session)):
 
 @app.post("/auth/register")
 async def register_user(user_data: UserRegistration, db: Session = Depends(get_database_session)):
-    """Register a new user - simplified JSON: {username, token}"""
-    try:
-        user = UserService.create_user(db, user_data, ip_address="mobile_app")
-        
-        # Create session
-        user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
-        session = SessionService.create_session(db, user_id, "mobile", "mobile_app")
-        
-        return {
-            "username": str(getattr(user, 'username', '')),
-            "token": str(getattr(session, 'session_token', ''))
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Registration error: {e}")
-        raise HTTPException(status_code=500, detail="Registration failed")
+    """User registration disabled - Only admin can create accounts"""
+    raise HTTPException(
+        status_code=403,
+        detail="User registration is disabled. Please contact an administrator to create an account."
+    )
 
 @app.post("/auth/login")
 async def login_user(login_data: UserLogin, db: Session = Depends(get_database_session)):
-    """Login user - simplified JSON: {username, token}"""
+    """Login user with phone number and token - simplified JSON: {phone_number, token}"""
     try:
-        user = UserService.authenticate_user(db, login_data.username, login_data.token, ip_address="mobile_app")
+        user = UserService.authenticate_user(db, login_data.phone_number, login_data.token, ip_address="mobile_app")
         if not user:
-            raise HTTPException(status_code=401, detail="Invalid username or token")
+            raise HTTPException(status_code=401, detail="Invalid phone number or token")
         
         # Create session
         user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
         session = SessionService.create_session(db, user_id, "mobile", "mobile_app")
         
         return {
-            "username": str(getattr(user, 'username', '')),
+            "phone_number": str(getattr(user, 'phone_number', '')),
+            "username": str(getattr(user, 'username', '')),  # For backward compatibility
             "token": str(getattr(session, 'session_token', ''))
         }
         
@@ -1335,15 +1266,15 @@ async def logout_user(current_user: User = Depends(get_current_user),
 async def send_message(message_data: MessageSend, 
                       current_user: User = Depends(get_current_user),
                       db: Session = Depends(get_database_session)):
-    """Send a message - simplified JSON: {username, message}"""
+    """Send a message - simplified JSON: {phone_number, message}"""
     try:
         user_id = int(getattr(current_user, 'id', 0)) if hasattr(getattr(current_user, 'id', 0), '__int__') else int(getattr(current_user, 'id', 0))
         message = MessageService.send_message(
-            db, user_id, message_data.username, message_data.message, message_data.disappear_after_hours
+            db, user_id, message_data.phone_number, message_data.message, message_data.disappear_after_hours
         )
         
         response = {
-            "username": message_data.username,
+            "phone_number": message_data.phone_number,
             "message": "sent"
         }
         
@@ -1396,12 +1327,12 @@ async def send_decoy_image(
         
         # Send as a regular message
         message = MessageService.send_message(
-            db, user_id, message_data.username, decoy_message, message_data.disappear_after_hours
+            db, user_id, message_data.phone_number, decoy_message, message_data.disappear_after_hours
         )
         
         return {
             "message_id": getattr(message, 'id', 0),
-            "recipient": message_data.username,
+            "recipient": message_data.phone_number,
             "status": "sent",
             "message": "Image sent hidden under decoy text"
         }
@@ -1447,12 +1378,12 @@ async def send_decoy_document(
         
         # Send as a regular message
         message = MessageService.send_message(
-            db, user_id, message_data.username, decoy_message, message_data.disappear_after_hours
+            db, user_id, message_data.phone_number, decoy_message, message_data.disappear_after_hours
         )
         
         return {
             "message_id": getattr(message, 'id', 0),
-            "recipient": message_data.username,
+            "recipient": message_data.phone_number,
             "status": "sent",
             "message": "Document sent hidden under decoy text"
         }
@@ -1953,7 +1884,7 @@ async def upload_media(
     """Upload encrypted media file from gallery"""
     try:
         user_id = int(getattr(current_user, 'id', 0))
-        media = MediaService.upload_media(db, user_id, media_data.username, media_data.dict())
+        media = MediaService.upload_media(db, user_id, media_data.phone_number, media_data.dict())
         
         return {
             "media_id": media.media_id,
@@ -1979,13 +1910,13 @@ async def upload_simple_media(
         # Log the incoming data for debugging
         logger.info(f"Received simple media upload request: {media_data.dict()}")
         
-        # Validate that username is provided
-        if not media_data.username or media_data.username == "undefined":
-            logger.error("Username is required for media upload")
-            raise HTTPException(status_code=400, detail="Username is required")
+        # Validate that phone_number is provided
+        if not media_data.phone_number or media_data.phone_number == "undefined":
+            logger.error("Phone number is required for media upload")
+            raise HTTPException(status_code=400, detail="Phone number is required")
         
         user_id = int(getattr(current_user, 'id', 0))
-        media = MediaService.upload_simple_media(db, user_id, media_data.username, media_data)
+        media = MediaService.upload_simple_media(db, user_id, media_data.phone_number, media_data)
         
         return {
             "media_id": media.media_id,
@@ -2210,18 +2141,18 @@ async def admin_create_user(user_data: AdminCreateUser,
         logger.error(f"Admin create user error: {e}")
         raise HTTPException(status_code=500, detail="Failed to create user")
 
-@app.delete("/admin/users/{username}")
-async def admin_delete_user(username: str,
+@app.delete("/admin/users/{phone_number}")
+async def admin_delete_user(phone_number: str,
                            current_user: User = Depends(get_admin_user),
                            db: Session = Depends(get_database_session)):
-    """Delete a user account permanently (admin only)"""
+    """Delete a user account permanently by phone number (admin only)"""
     try:
         user_id = int(getattr(current_user, 'id', 0))
-        success = AdminService.delete_user(db, user_id, username)
+        success = AdminService.delete_user(db, user_id, phone_number)
         
         if success:
             return {
-                "message": f"User account '{username}' deleted successfully",
+                "message": f"User account with phone number '{phone_number}' deleted successfully",
                 "deleted": True
             }
         else:
@@ -2250,6 +2181,7 @@ async def admin_get_all_users(current_user: User = Depends(get_admin_user),
             last_login = getattr(user, 'last_login', None)
             registered = getattr(user, 'registered', datetime.now(timezone.utc))
             result.append({
+                "phone_number": str(getattr(user, 'phone_number', '')),
                 "username": str(getattr(user, 'username', '')),
                 "registered": registered.isoformat() if registered else datetime.now(timezone.utc).isoformat(),
                 "last_login": last_login.isoformat() if last_login else None,
@@ -2257,6 +2189,11 @@ async def admin_get_all_users(current_user: User = Depends(get_admin_user),
                 "is_admin": bool(getattr(user, 'is_admin', False)),
                 "user_type": str(getattr(user, 'user_type', ''))
             })
+        
+        return {
+            "users": result,
+            "count": len(result)
+        }
         
         return {
             "users": result,
@@ -2275,7 +2212,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.post("/media/upload_raw")
 async def upload_raw_media(
-    username: str = Form(...),
+    phone_number: str = Form(...),
     file: UploadFile = File(...),
     disappear_after_hours: Optional[int] = Form(None),
     current_user: User = Depends(get_current_user),
@@ -2286,8 +2223,8 @@ async def upload_raw_media(
     Endpoint for direct raw media upload without base64 encoding
     """
     try:
-        # Get recipient user
-        recipient = db.query(User).filter(User.username == username, User.is_active == True).first()
+        # Get recipient user by phone number
+        recipient = db.query(User).filter(User.phone_number == phone_number, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
@@ -2356,7 +2293,7 @@ async def upload_raw_media(
             "file_size": len(content),
             "content_type": file.content_type,
             "message": "File uploaded successfully",
-            "uploaded_for": username,
+            "uploaded_for": phone_number,
             "disappear_after_hours": disappear_after_hours
         }
         
