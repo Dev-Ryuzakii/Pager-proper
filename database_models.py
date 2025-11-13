@@ -17,8 +17,8 @@ class User(Base):
     __tablename__ = "users"
     
     id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), unique=True, index=True, nullable=False)
-    email = Column(String(255), unique=True, index=True, nullable=True)  # Optional for TLS users
+    username = Column(String(50), unique=True, index=True, nullable=False)  # Kept for backward compatibility
+    phone_number = Column(String(20), unique=True, index=True, nullable=False)  # Primary identifier
     public_key = Column(Text, nullable=True)  # Make this optional - RSA public key in PEM format
     password_hash = Column(String(255), nullable=True)  # Optional password hash
     must_change_password = Column(Boolean, default=False)  # Flag to force password change on first login
@@ -51,7 +51,7 @@ class User(Base):
     master_tokens = relationship("MasterToken", back_populates="user")  # Add this line
     
     def __repr__(self):
-        return f"<User(username='{self.username}', type='{self.user_type}', email='{self.email}', admin={self.is_admin})>"
+        return f"<User(phone='{self.phone_number}', username='{self.username}', type='{self.user_type}', admin={self.is_admin})>"
 
 class Message(Base):
     """Message table for storing encrypted messages between users"""

@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""
+Test script for decoy document messaging functionality
+"""
+
+import requests
+import base64
+import json
+import time
+
+# Configuration
+BASE_URL = "http://localhost:8001"
+TEST_USER_TOKEN = "test_token"
+TEST_RECIPIENT = "test_recipient"
+TEST_MASTER_TOKEN = "test_master_token"
+
+def create_test_user(username, token):
+    """Create a test user"""
+    url = f"{BASE_URL}/auth/register"
+    data = {
+        "username": username,
+        "token": token
+    }
+    response = requests.post(url, json=data)
+    return response
+
+def login_test_user(username, token):
+    """Login test user"""
+    url = f"{BASE_URL}/auth/login"
+    data = {
+        "username": username,
+        "token": token
+    }
+    response = requests.post(url, json=data)
+    return response
+
+def send_decoy_document(token, document_data):
+    """Send decoy document"""
+    url = f"{BASE_URL}/messages/send_decoy_document"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    response = requests.post(url, headers=headers, json=document_data)
+    return response
+
+def extract_hidden_document(token, extract_data):
+    """Extract hidden document using master token"""
+    url = f"{BASE_URL}/messages/extract_decoy_document"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    response = requests.post(url, headers=headers, json=extract_data)
+    return response
+
+def main():
+    print("Testing decoy document messaging functionality...")
+    
+    # Create a test user
+    print("Creating test user...")
+    response = create_test_user("test_user", TEST_USER_TOKEN)
+    print(f"Create user response: {response.status_code} - {response.text}")
+    
+    # Login test user
+    print("Logging in test user...")
+    response = login_test_user("test_user", TEST_USER_TOKEN)
+    print(f"Login response: {response.status_code} - {response.text}")
+    
+    if response.status_code == 200:
+        login_data = response.json()
+        user_token = login_data.get("token")
+        print(f"User token: {user_token}")
+        
+        # Create test document data (simple PDF header as example)
+        test_document_base64 = "JVBERi0xLjQKJcOkw7zDtsOfCjIgMCBvYmoKPDwvTGVuZ3RoIDMgMCBSL0ZpbHRlci9GbGF0ZURlY29kZT4+CnN0cmVhbQp4nF3MwQ3AIAwEwT5F6cBnGxtIv6X03wZJHJl52l2tKqqqquq31TV67Q=="
+        
+        document_data = {
+            "username": TEST_RECIPIENT,
+            "document_content": test_document_base64,
+            "filename": "test_document.pdf",
+            "file_size": len(test_document_base64),
+            "mime_type": "application/pdf",
+            "disappear_after_hours": None
+        }
+        
+        print("Sending decoy document...")
+        response = send_decoy_document(user_token, document_data)
+        print(f"Send document response: {response.status_code} - {response.text}")
+        
+        if response.status_code == 200:
+            send_result = response.json()
+            message_id = send_result.get("message_id")
+            print(f"✅ Decoy document sent successfully! Message ID: {message_id}")
+            
+            # Wait a moment for the message to be processed
+            time.sleep(1)
+            
+            # Test extraction (this would normally be done by the recipient)
+            extract_data = {
+                "mastertoken": TEST_MASTER_TOKEN,
+                "message_id": message_id
+            }
+            
+            print("Extracting hidden document...")
+            response = extract_hidden_document(user_token, extract_data)
+            print(f"Extract document response: {response.status_code} - {response.text}")
+            
+            if response.status_code == 200:
+                extract_result = response.json()
+                print("✅ Hidden document extracted successfully!")
+                print(f"Filename: {extract_result.get('filename')}")
+                print(f"File size: {extract_result.get('file_size')}")
+                print(f"MIME type: {extract_result.get('mime_type')}")
+                print(f"Image data length: {len(extract_result.get('document_data', ''))}")
+                print(f"Suggested apps: {extract_result.get('suggested_apps', [])}")
+            else:
+                print("❌ Failed to extract hidden document!")
+                print(f"Response: {response.text}")
+        else:
+            print("❌ Failed to send decoy document!")
+            print(f"Response: {response.text}")
+    else:
+        print("❌ Failed to login test user")
+
+if __name__ == "__main__":
+    main()
