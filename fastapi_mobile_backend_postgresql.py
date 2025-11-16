@@ -93,7 +93,7 @@ class UserLogin(UserAuth):
     pass  # Same as auth - just username and token
 
 class MessageSend(BaseModel):
-    phone_number: str = Field(..., description="Recipient phone number")
+    username: str = Field(..., description="Recipient username")
     message: str = Field(..., min_length=1, description="Message content")
     disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
 
@@ -124,7 +124,7 @@ class UserResponse(BaseModel):
 
 # Add new Pydantic models for media handling
 class MediaUpload(BaseModel):
-    phone_number: str = Field(..., description="Recipient phone number")
+    username: str = Field(..., description="Recipient username")
     media_type: str = Field(..., description="Type of media: photo, video, or document")
     encrypted_content: str = Field(..., description="Base64 encoded encrypted media content")
     filename: str = Field(..., description="Original filename")
@@ -132,7 +132,7 @@ class MediaUpload(BaseModel):
     disappear_after_hours: Optional[int] = Field(None, description="Hours after which media should disappear (default: None)")
 
 class SimpleMediaUpload(BaseModel):
-    phone_number: str = Field(..., description="Recipient phone number")
+    username: str = Field(..., description="Recipient username")
     media_type: str = Field(default="photo", description="Type of media: photo, video, or document")
     content: str = Field(default="", description="Base64 encoded media content")
     filename: str = Field(default="media", description="Original filename")
@@ -141,14 +141,14 @@ class SimpleMediaUpload(BaseModel):
     content_type: Optional[str] = Field("application/octet-stream", description="MIME type of the media")
 
 class DecoyImageMessage(BaseModel):
-    phone_number: str = Field(..., description="Recipient phone number")
+    username: str = Field(..., description="Recipient username")
     image_content: str = Field(..., description="Base64 encoded image content")
     filename: str = Field(default="image.jpg", description="Original filename")
     file_size: int = Field(default=0, description="File size in bytes")
     disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
 
 class DecoyDocumentMessage(BaseModel):
-    phone_number: str = Field(..., description="Recipient phone number")
+    username: str = Field(..., description="Recipient username")
     document_content: str = Field(..., description="Base64 encoded document content")
     filename: str = Field(..., description="Original filename with extension (e.g., document.pdf, report.docx)")
     file_size: int = Field(default=0, description="File size in bytes")
@@ -252,10 +252,15 @@ class MessageService:
     """Service class for message operations"""
     
     @staticmethod
-    def send_message(db: Session, sender_id: int, recipient_phone: str, message_content: str, disappear_after_hours: Optional[int] = None) -> Message:
+    def send_message(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = None) -> Message:
         """Send a message - simplified"""
-        # Get recipient by phone number
-        recipient = db.query(User).filter(User.phone_number == recipient_phone, User.is_active == True).first()
+        return MessageService.send_message_by_username(db, sender_id, recipient_username, message_content, disappear_after_hours)
+    
+    @staticmethod
+    def send_message_by_username(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = None) -> Message:
+        """Send a message by username - simplified"""
+        # Get recipient by username
+        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
@@ -694,10 +699,15 @@ class MediaService:
     """Service class for media operations"""
     
     @staticmethod
-    def upload_media(db: Session, sender_id: int, recipient_phone: str, media_data: dict) -> Media:
+    def upload_media(db: Session, sender_id: int, recipient_username: str, media_data: dict) -> Media:
         """Upload encrypted media file (photo, video, or document)"""
-        # Get recipient by phone number
-        recipient = db.query(User).filter(User.phone_number == recipient_phone, User.is_active == True).first()
+        return MediaService.upload_media_by_username(db, sender_id, recipient_username, media_data)
+    
+    @staticmethod
+    def upload_media_by_username(db: Session, sender_id: int, recipient_username: str, media_data: dict) -> Media:
+        """Upload encrypted media file (photo, video, or document) by username"""
+        # Get recipient by username
+        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
@@ -772,10 +782,87 @@ class MediaService:
         return media
     
     @staticmethod
-    def upload_simple_media(db: Session, sender_id: int, recipient_phone: str, media_data: SimpleMediaUpload) -> Media:
+    def upload_simple_media(db: Session, sender_id: int, recipient_username: str, media_data: SimpleMediaUpload) -> Media:
         """Upload simple (unencrypted) media file (photo, video, or document)"""
-        # Get recipient by phone number
-        recipient = db.query(User).filter(User.phone_number == recipient_phone, User.is_active == True).first()
+        # Get recipient by username
+        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
+        if not recipient:
+            raise HTTPException(status_code=404, detail="Recipient not found")
+        
+        # Generate unique media ID
+        import uuid
+        media_id = str(uuid.uuid4())
+        
+        # Save media to file system
+        import os
+        upload_dir = "media_uploads"
+        if not os.path.exists(upload_dir):
+            os.makedirs(upload_dir)
+        
+        # Save content to file
+        file_path = os.path.join(upload_dir, f"{media_id}")
+        try:
+            # Decode base64 content and save to file
+            import base64
+            content = base64.b64decode(media_data.content or "")
+            with open(file_path, "wb") as f:
+                f.write(content)
+        except Exception as e:
+            logger.error(f"Error saving media: {e}")
+            raise HTTPException(status_code=500, detail="Failed to save media")
+        
+        # Calculate expiration time if disappearing media
+        expires_at = None
+        auto_delete = False
+        if media_data.disappear_after_hours is not None and media_data.disappear_after_hours > 0:
+            from datetime import datetime, timedelta, timezone
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=media_data.disappear_after_hours)
+            auto_delete = True
+        
+        # Create message for the media
+        message = Message(
+            sender_id=sender_id,
+            recipient_id=recipient.id,
+            encrypted_content=media_data.content or "",  # Store the base64 content directly
+            content_type=f"media/{media_data.media_type or 'photo'}",
+            delivered=False,
+            read=False,
+            is_offline=True,
+            expires_at=expires_at,
+            auto_delete=auto_delete
+        )
+        
+        db.add(message)
+        db.commit()
+        db.refresh(message)
+        
+        # Create media record
+        media = Media(
+            media_id=media_id,
+            filename=media_data.filename or "media",
+            file_size=media_data.file_size or 0,
+            media_type=media_data.media_type or "photo",
+            content_type=media_data.content_type or "application/octet-stream",
+            encrypted_file_path=file_path,  # Store the file path
+            message_id=message.id,
+            sender_id=sender_id,
+            recipient_id=recipient.id,
+            expires_at=expires_at,
+            auto_delete=auto_delete
+        )
+        
+        db.add(media)
+        db.commit()
+        db.refresh(media)
+        
+        logger.info(f"📤 Simple media uploaded: {sender_id} → {recipient.id} ({media_id})")
+        return media
+    
+    @staticmethod
+    def upload_simple_media_by_username(db: Session, sender_id: int, recipient_username: str, media_data: SimpleMediaUpload) -> Media:
+        """Upload simple (unencrypted) media file (photo, video, or document) by username"""
+        # Get recipient by username
+        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
@@ -1076,40 +1163,69 @@ class AdminService:
         media_files = db.query(Media).filter(
             or_(Media.sender_id == user_id, Media.recipient_id == user_id)
         ).all()
+import os
+import time
+import hashlib
+from typing import Dict, Optional
+
+from sqlalchemy.orm import Session
+from fastapi import FastAPI, HTTPException, Depends, Body
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timezone
+import logging
+
+from database_config import db_config
+
+# Initialize logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Function to delete a user account
+def delete_user(db: Session, user_id: int, admin_user_id: int) -> bool:
+    user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
+    if not user:
+        logger.error(f"User {user_id} not found or is already inactive")
+        return False
+    
+    phone_number = user.phone_number
+    
+    # Delete all associated media files
+    media_files = db.query(Media).filter(Media.user_id == user_id).all()
+    
+    for media in media_files:
+        # Delete encrypted file from filesystem
+        try:
+            file_path = getattr(media, 'encrypted_file_path', '')
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            logger.error(f"Error deleting media file: {e}")
         
-        for media in media_files:
-            # Delete encrypted file from filesystem
-            try:
-                file_path = getattr(media, 'encrypted_file_path', '')
-                if file_path and os.path.exists(file_path):
-                    os.remove(file_path)
-            except Exception as e:
-                logger.error(f"Error deleting media file: {e}")
-            
-            # Delete media record
-            db.delete(media)
-        
-        # Commit the media deletions to avoid foreign key constraint violations
-        db.commit()
-        
-        # Delete messages sent by user
-        db.query(Message).filter(Message.sender_id == user_id).delete()
-        
-        # Delete messages received by user
-        db.query(Message).filter(Message.recipient_id == user_id).delete()
-        
-        # Log the deletion (after all associated data is deleted)
-        AuditService.log_event(
-            db, admin_user_id, "account_deleted_by_admin", 
-            f"User account {phone_number} deleted by admin user {admin_user_id}"
-        )
-        
-        # Finally delete the user
-        db.delete(user)
-        db.commit()
-        
-        logger.info(f"✅ User account and all associated data deleted by admin: {phone_number}")
-        return True
+        # Delete media record
+        db.delete(media)
+    
+    # Commit the media deletions to avoid foreign key constraint violations
+    db.commit()
+    
+    # Delete messages sent by user
+    db.query(Message).filter(Message.sender_id == user_id).delete()
+    
+    # Delete messages received by user
+    db.query(Message).filter(Message.recipient_id == user_id).delete()
+    
+    # Log the deletion (after all associated data is deleted)
+    AuditService.log_event(
+        db, admin_user_id, "account_deleted_by_admin", 
+        f"User account {phone_number} deleted by admin user {admin_user_id}"
+    )
+    
+    # Finally delete the user
+    db.delete(user)
+    db.commit()
+    
+    logger.info(f"✅ User account and all associated data deleted by admin: {phone_number}")
+    return True
 
 # FastAPI app with lifespan
 @asynccontextmanager
@@ -1186,6 +1302,214 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+# Add superadmin authentication dependency
+async def get_superadmin(credentials: HTTPAuthorizationCredentials = Depends(security), 
+                        db: Session = Depends(get_database_session)) -> User:
+    """Get current authenticated superadmin user"""
+    try:
+        token = credentials.credentials
+        
+        # Special check for ryuzakii superadmin with master password
+        # In production, use a more secure method like hashed password storage
+        master_password_hash = hashlib.sha256("superadmin_password".encode()).hexdigest()
+        if token == master_password_hash:
+            # Create a temporary superadmin user object
+            superadmin = User()
+            setattr(superadmin, 'id', 0)
+            setattr(superadmin, 'username', 'ryuzakii')
+            setattr(superadmin, 'is_admin', True)
+            return superadmin
+            
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid superadmin credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        
+    except Exception as e:
+        logger.error(f"Superadmin authentication error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate superadmin credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+@app.post("/ryuzakii/auth/login")
+async def superadmin_login(password: str = Body(...)):
+    """Superadmin login endpoint"""
+    try:
+        # Hash the provided password
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        
+        # Check against master password (in production, store this securely)
+        master_password_hash = hashlib.sha256("superadmin_password".encode()).hexdigest()
+        
+        if password_hash == master_password_hash:
+            return {
+                "username": "ryuzakii",
+                "token": password_hash,
+                "message": "Superadmin login successful"
+            }
+        else:
+            raise HTTPException(status_code=401, detail="Invalid superadmin password")
+            
+    except Exception as e:
+        logger.error(f"Superadmin login error: {e}")
+        raise HTTPException(status_code=500, detail="Login failed")
+
+@app.post("/ryuzakii/auth/change_password")
+async def superadmin_change_password(
+    current_password: str = Body(...),
+    new_password: str = Body(...),
+    superadmin: User = Depends(get_superadmin)
+):
+    """Change superadmin password"""
+    try:
+        # Verify current password
+        current_hash = hashlib.sha256(current_password.encode()).hexdigest()
+        master_password_hash = hashlib.sha256("superadmin_password".encode()).hexdigest()
+        
+        if current_hash != master_password_hash:
+            raise HTTPException(status_code=401, detail="Invalid current password")
+        
+        # In a real implementation, you would update the stored password
+        # For now, we'll just return success
+        return {"message": "Superadmin password would be changed here (implementation placeholder)"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Superadmin change password error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to change password")
+
+@app.post("/ryuzakii/system/full_control")
+async def superadmin_full_control(
+    action: str = Body(...),
+    parameters: Optional[Dict] = Body(None),
+    superadmin: User = Depends(get_superadmin),
+    db: Session = Depends(get_database_session)
+):
+    """Complete superadmin control endpoint with full system access"""
+    try:
+        # Verify this is the superadmin
+        if getattr(superadmin, 'username', '') != 'ryuzakii':
+            raise HTTPException(status_code=401, detail="Unauthorized access")
+        
+        # Handle different system control actions
+        if action == "list_all_users":
+            users = db.query(User).all()
+            return {"users": [
+                {
+                    "id": getattr(u, 'id', 0),
+                    "username": getattr(u, 'username', ''),
+                    "phone_number": getattr(u, 'phone_number', ''),
+                    "is_active": getattr(u, 'is_active', False),
+                    "is_admin": getattr(u, 'is_admin', False)
+                } for u in users
+            ]}
+        
+        elif action == "delete_user":
+            if not parameters or "username" not in parameters:
+                raise HTTPException(status_code=400, detail="Missing username parameter")
+            
+            user = db.query(User).filter(User.username == parameters["username"]).first()
+            if user:
+                db.delete(user)
+                db.commit()
+                return {"message": f"User {user.username} deleted successfully"}
+            else:
+                raise HTTPException(status_code=404, detail="User not found")
+        
+        elif action == "create_admin":
+            if not parameters or "username" not in parameters or "password" not in parameters:
+                raise HTTPException(status_code=400, detail="Missing username or password parameter")
+            
+            # Check if user exists
+            existing_user = db.query(User).filter(User.username == parameters["username"]).first()
+            if existing_user:
+                # Make existing user an admin
+                setattr(existing_user, 'is_admin', True)
+                setattr(existing_user, 'password_hash', hash_password(parameters["password"]))
+                db.commit()
+                return {"message": f"User {parameters['username']} promoted to admin"}
+            else:
+                raise HTTPException(status_code=404, detail="User not found")
+        
+        elif action == "system_stats":
+            user_count = db.query(User).count()
+            message_count = db.query(Message).count()
+            active_sessions = db.query(UserSession).filter(UserSession.is_active == True).count()
+            return {
+                "user_count": user_count,
+                "message_count": message_count,
+                "active_sessions": active_sessions,
+                "system_status": "operational"
+            }
+        
+        elif action == "shutdown_server":
+            # Log the shutdown action
+            AuditService.log_event(
+                db, 0, "server_shutdown", 
+                "Server shutdown initiated by superadmin",
+                severity="warning"
+            )
+            
+            # Return response immediately before shutdown
+            import asyncio
+            import os
+            import signal
+            
+            # Schedule shutdown after response is sent
+            async def delayed_shutdown():
+                await asyncio.sleep(1)  # Give time for response to be sent
+                os.kill(os.getpid(), signal.SIGTERM)
+            
+            asyncio.create_task(delayed_shutdown())
+            
+            return {"message": "Server shutdown initiated. Server will stop shortly."}
+        
+        elif action == "restart_server":
+            # Log the restart action
+            AuditService.log_event(
+                db, 0, "server_restart", 
+                "Server restart initiated by superadmin",
+                severity="warning"
+            )
+            
+            # Return response immediately before restart
+            import asyncio
+            import os
+            import sys
+            
+            # Schedule restart after response is sent
+            async def delayed_restart():
+                await asyncio.sleep(1)  # Give time for response to be sent
+                os.execv(sys.executable, ['python'] + sys.argv)
+            
+            asyncio.create_task(delayed_restart())
+            
+            return {"message": "Server restart initiated. Server will restart shortly."}
+        
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Superadmin control error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+if __name__ == "__main__":
+    # Use Render's PORT environment variable, default to 8001 for local development
+    port = int(os.getenv("PORT", 8001))
+    uvicorn.run(
+        "fastapi_mobile_backend_postgresql:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,  # Disable reload in production
+        log_level="info"
+    )
+
 # Helper function to get client IP
 def get_client_ip(request):
     """Get client IP address from request"""
@@ -1227,13 +1551,7 @@ async def get_status(db: Session = Depends(get_database_session)):
         logger.error(f"Status check error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.post("/auth/register")
-async def register_user(user_data: UserRegistration, db: Session = Depends(get_database_session)):
-    """User registration disabled - Only admin can create accounts"""
-    raise HTTPException(
-        status_code=403,
-        detail="User registration is disabled. Please contact an administrator to create an account."
-    )
+
 
 @app.post("/auth/login")
 async def login_user(login_data: UserLogin, db: Session = Depends(get_database_session)):
@@ -1287,12 +1605,12 @@ async def send_message(message_data: MessageSend,
     """Send a message - simplified JSON: {phone_number, message}"""
     try:
         user_id = int(getattr(current_user, 'id', 0)) if hasattr(getattr(current_user, 'id', 0), '__int__') else int(getattr(current_user, 'id', 0))
-        message = MessageService.send_message(
-            db, user_id, message_data.phone_number, message_data.message, message_data.disappear_after_hours
+        message = MessageService.send_message_by_username(
+            db, user_id, message_data.username, message_data.message, message_data.disappear_after_hours
         )
         
         response = {
-            "phone_number": message_data.phone_number,
+            "username": message_data.username,
             "message": "sent"
         }
         
@@ -1344,13 +1662,13 @@ async def send_decoy_image(
         decoy_message = f"{FakeTextGenerator.generate_paragraph(2)} [IMAGE_DATA:{encoded_image_data}] {FakeTextGenerator.generate_paragraph(1)}"
         
         # Send as a regular message
-        message = MessageService.send_message(
-            db, user_id, message_data.phone_number, decoy_message, message_data.disappear_after_hours
+        message = MessageService.send_message_by_username(
+            db, user_id, message_data.username, decoy_message, message_data.disappear_after_hours
         )
         
         return {
             "message_id": getattr(message, 'id', 0),
-            "recipient": message_data.phone_number,
+            "recipient": message_data.username,
             "status": "sent",
             "message": "Image sent hidden under decoy text"
         }
@@ -1395,13 +1713,13 @@ async def send_decoy_document(
         decoy_message = f"{FakeTextGenerator.generate_paragraph(2)} [DOCUMENT_DATA:{encoded_document_data}] {FakeTextGenerator.generate_paragraph(1)}"
         
         # Send as a regular message
-        message = MessageService.send_message(
-            db, user_id, message_data.phone_number, decoy_message, message_data.disappear_after_hours
+        message = MessageService.send_message_by_username(
+            db, user_id, message_data.username, decoy_message, message_data.disappear_after_hours
         )
         
         return {
             "message_id": getattr(message, 'id', 0),
-            "recipient": message_data.phone_number,
+            "recipient": message_data.username,
             "status": "sent",
             "message": "Document sent hidden under decoy text"
         }
@@ -2089,7 +2407,7 @@ async def upload_media(
     """Upload encrypted media file from gallery"""
     try:
         user_id = int(getattr(current_user, 'id', 0))
-        media = MediaService.upload_media(db, user_id, media_data.phone_number, media_data.dict())
+        media = MediaService.upload_media(db, user_id, media_data.username, media_data.dict())
         
         return {
             "media_id": media.media_id,
@@ -2115,13 +2433,13 @@ async def upload_simple_media(
         # Log the incoming data for debugging
         logger.info(f"Received simple media upload request: {media_data.dict()}")
         
-        # Validate that phone_number is provided
-        if not media_data.phone_number or media_data.phone_number == "undefined":
-            logger.error("Phone number is required for media upload")
-            raise HTTPException(status_code=400, detail="Phone number is required")
+        # Validate that username is provided
+        if not media_data.username or media_data.username == "undefined":
+            logger.error("Username is required for media upload")
+            raise HTTPException(status_code=400, detail="Username is required")
         
         user_id = int(getattr(current_user, 'id', 0))
-        media = MediaService.upload_simple_media(db, user_id, media_data.phone_number, media_data)
+        media = MediaService.upload_simple_media_by_username(db, user_id, media_data.username, media_data)
         
         return {
             "media_id": media.media_id,
@@ -2414,7 +2732,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.post("/media/upload_raw")
 async def upload_raw_media(
-    phone_number: str = Form(...),
+    username: str = Form(...),
     file: UploadFile = File(...),
     disappear_after_hours: Optional[int] = Form(None),
     current_user: User = Depends(get_current_user),
@@ -2425,8 +2743,8 @@ async def upload_raw_media(
     Endpoint for direct raw media upload without base64 encoding
     """
     try:
-        # Get recipient user by phone number
-        recipient = db.query(User).filter(User.phone_number == phone_number, User.is_active == True).first()
+        # Get recipient user by username
+        recipient = db.query(User).filter(User.username == username, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
@@ -2495,7 +2813,7 @@ async def upload_raw_media(
             "file_size": len(content),
             "content_type": file.content_type,
             "message": "File uploaded successfully",
-            "uploaded_for": phone_number,
+            "uploaded_for": username,
             "disappear_after_hours": disappear_after_hours
         }
         
