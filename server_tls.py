@@ -224,6 +224,19 @@ def handle_key_registration(tls_socket, data):
             tls_socket.send(json.dumps(response).encode())
             log_message(f"REGISTRATION FAILED: {username} already exists from {client_ip}")
             return False
+
+        # Prevent token reuse across accounts (token must be unique per user)
+        for existing_username, existing_data in user_public_keys.items():
+            if existing_username != username and existing_data.get("token") == token:
+                response_data = {"status": "error", "message": "Token already in use by another user"}
+                timestamp = time.time()
+                hmac_value = generate_message_hmac(response_data, timestamp)
+                response = {**response_data, "timestamp": timestamp, "hmac": hmac_value}
+                tls_socket.send(json.dumps(response).encode())
+                log_message(
+                    f"REGISTRATION FAILED: token reuse attempt for '{username}' (already used by '{existing_username}') from {client_ip}"
+                )
+                return False
         
         # Store user data with security metadata
         user_public_keys[username] = {

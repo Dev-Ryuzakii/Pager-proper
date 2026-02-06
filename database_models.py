@@ -24,7 +24,7 @@ class User(Base):
     must_change_password = Column(Boolean, default=False)  # Flag to force password change on first login
     
     # Authentication tokens
-    token = Column(String(255), nullable=True)  # TLS safetoken or API token
+    token = Column(String(255), unique=True, index=True, nullable=True)  # TLS safetoken or API token
     session_token = Column(String(255), nullable=True)
     
     # Registration and login tracking

@@ -8,6 +8,7 @@ import json
 import time
 import base64
 import hashlib
+import hmac
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -45,6 +46,7 @@ if os.path.exists('.env'):
 from database_config import get_database_session, db_config
 from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media
 from fake_text_generator import FakeTextGenerator
+from watermark_media import apply_watermark
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -171,24 +173,8 @@ class MediaResponse(BaseModel):
 
 def validate_master_token(db: Session, user_id: int, mastertoken: str) -> bool:
     """Validate the master token for a user"""
-    # For the TLS system's token handling:
-    # 1. For sending: Check if token is cached (last 24 hours)
-    # 2. For decryption: Always require fresh token entry
-    
-    # Get user to verify master token
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        return False
-        
-    # Simple token verification (you should implement proper token validation)
-    # This is a placeholder - implement your actual master token validation
-    master_salt = f"{user.username}_master_salt"  # In production, get from secure storage
-    
-    # Create token hash (match your TLS system's token derivation)
-    token_hash = hashlib.sha256(f"{mastertoken}:{master_salt}".encode()).hexdigest()
-    
-    # For actual implementation, verify against securely stored token hash
-    return True  # Replace with actual token verification
+    # Backward-compatible wrapper: use the real DB-backed validation
+    return DecryptService.validate_master_token(db, user_id, mastertoken)
 
 # Database Services
 class UserService:
@@ -452,16 +438,39 @@ class DecryptService:
     @staticmethod
     def validate_master_token(db: Session, user_id: int, mastertoken: str) -> bool:
         """Validate the master token for a user"""
-        # Check if the master token has been confirmed for this user
-        audit_record = db.query(AuditLog).filter(
-            and_(
-                AuditLog.user_id == user_id,
-                AuditLog.event_type == "mastertoken_confirmed",
-                AuditLog.timestamp >= datetime.now(timezone.utc) - timedelta(hours=24)  # Valid for 24 hours
-            )
-        ).first()
-        
-        return audit_record is not None
+        try:
+            if not mastertoken:
+                return False
+
+            # Get latest active master token record for this user
+            record = db.query(DBMasterToken).filter(
+                DBMasterToken.user_id == user_id,
+                DBMasterToken.is_active == True
+            ).order_by(DBMasterToken.created_at.desc()).first()
+
+            if not record:
+                return False
+
+            # Expiration check (if set)
+            expires_at = getattr(record, "expires_at", None)
+            if expires_at is not None:
+                # Some DBs store naive datetimes; compare safely
+                now = datetime.now(timezone.utc)
+                if getattr(expires_at, "tzinfo", None) is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if expires_at <= now:
+                    return False
+
+            salt = str(getattr(record, "salt", ""))
+            expected_hash = str(getattr(record, "token_hash", ""))
+            if not salt or not expected_hash:
+                return False
+
+            provided_hash = hashlib.sha256((mastertoken + salt).encode()).hexdigest()
+            return hmac.compare_digest(provided_hash, expected_hash)
+        except Exception as e:
+            logger.error(f"Master token validation error: {e}")
+            return False
     
     @staticmethod
     def derive_master_key(mastertoken: str, salt: bytes) -> bytes:
@@ -799,12 +808,23 @@ class MediaService:
         if not os.path.exists(upload_dir):
             os.makedirs(upload_dir)
         
-        # Save content to file
-        file_path = os.path.join(upload_dir, f"{media_id}")
+        # Decode and apply leak-detection watermark (up to 5 per file)
         try:
-            # Decode base64 content and save to file
             import base64
             content = base64.b64decode(media_data.content or "")
+            content = apply_watermark(
+                content,
+                media_data.content_type or "application/octet-stream",
+                media_data.filename or "media",
+                recipient.id,
+                media_id,
+            )
+        except Exception as e:
+            logger.error(f"Error decoding media: {e}")
+            raise HTTPException(status_code=500, detail="Failed to decode media")
+        
+        file_path = os.path.join(upload_dir, f"{media_id}")
+        try:
             with open(file_path, "wb") as f:
                 f.write(content)
         except Exception as e:
@@ -836,11 +856,11 @@ class MediaService:
         db.commit()
         db.refresh(message)
         
-        # Create media record
+        # Create media record (file_size may change after watermarking)
         media = Media(
             media_id=media_id,
             filename=media_data.filename or "media",
-            file_size=media_data.file_size or 0,
+            file_size=len(content),
             media_type=media_data.media_type or "photo",
             content_type=media_data.content_type or "application/octet-stream",
             encrypted_file_path=file_path,  # Store the file path
@@ -870,18 +890,28 @@ class MediaService:
         import uuid
         media_id = str(uuid.uuid4())
         
-        # Save media to file system
+        # Decode and apply leak-detection watermark (up to 5 per file)
+        try:
+            import base64
+            content = base64.b64decode(media_data.content or "")
+            content = apply_watermark(
+                content,
+                media_data.content_type or "application/octet-stream",
+                media_data.filename or "media",
+                recipient.id,
+                media_id,
+            )
+        except Exception as e:
+            logger.error(f"Error decoding media: {e}")
+            raise HTTPException(status_code=500, detail="Failed to decode media")
+        
         import os
         upload_dir = "media_uploads"
         if not os.path.exists(upload_dir):
             os.makedirs(upload_dir)
         
-        # Save content to file
         file_path = os.path.join(upload_dir, f"{media_id}")
         try:
-            # Decode base64 content and save to file
-            import base64
-            content = base64.b64decode(media_data.content or "")
             with open(file_path, "wb") as f:
                 f.write(content)
         except Exception as e:
@@ -913,11 +943,11 @@ class MediaService:
         db.commit()
         db.refresh(message)
         
-        # Create media record
+        # Create media record (file_size may change after watermarking)
         media = Media(
             media_id=media_id,
             filename=media_data.filename or "media",
-            file_size=media_data.file_size or 0,
+            file_size=len(content),
             media_type=media_data.media_type or "photo",
             content_type=media_data.content_type or "application/octet-stream",
             encrypted_file_path=file_path,  # Store the file path
@@ -964,6 +994,18 @@ class MediaService:
             setattr(media, 'downloaded_at', datetime.now(timezone.utc))
             db.commit()
             return True
+        return False
+    
+    @staticmethod
+    def delete_media_file_from_disk(file_path: str) -> bool:
+        """Delete media file from disk after viewing (one-time view, user cannot go back)."""
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"🗑️ Media file deleted from server (one-time view): {file_path}")
+                return True
+        except Exception as e:
+            logger.warning(f"Failed to delete media file {file_path}: {e}")
         return False
     
     @staticmethod
@@ -1099,6 +1141,11 @@ class AdminService:
         # Use provided token and username
         token = user_data.token
         username = user_data.username
+
+        # Enforce token uniqueness (prevents one token working across multiple accounts)
+        existing_token_user = db.query(User).filter(User.token == token).first()
+        if existing_token_user:
+            raise HTTPException(status_code=400, detail="Token already in use by another user")
         
         # Create user
         user = User(
@@ -2068,11 +2115,33 @@ async def create_mastertoken(token_data: MasterToken,
                            db: Session = Depends(get_database_session)):
     """Create master token - simplified JSON: {mastertoken}"""
     try:
-        # Store master token for user (you might want to hash this)
-        # For now, just acknowledge creation
-        
         user_id = int(getattr(current_user, 'id', 0))
         username = str(getattr(current_user, 'username', ''))
+        mastertoken = str(getattr(token_data, "mastertoken", "")).strip()
+
+        if not mastertoken:
+            raise HTTPException(status_code=400, detail="mastertoken is required")
+
+        # Deactivate existing master tokens
+        db.query(DBMasterToken).filter(
+            DBMasterToken.user_id == user_id,
+            DBMasterToken.is_active == True
+        ).update({"is_active": False})
+
+        # Store new master token securely (salt + hash)
+        salt = base64.b64encode(os.urandom(32)).decode()
+        token_hash = hashlib.sha256((mastertoken + salt).encode()).hexdigest()
+
+        record = DBMasterToken(
+            user_id=user_id,
+            token_hash=token_hash,
+            salt=salt,
+            is_active=True,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=30)
+        )
+        db.add(record)
+        db.commit()
+        
         AuditService.log_event(
             db, user_id, "mastertoken_created", 
             f"Master token created for {username}"
@@ -2092,11 +2161,13 @@ async def confirm_mastertoken(token_data: MasterToken,
                             db: Session = Depends(get_database_session)):
     """Confirm master token - simplified JSON: {mastertoken}"""
     try:
-        # Validate master token (implement your validation logic)
-        # For now, just acknowledge confirmation
-        
         user_id = int(getattr(current_user, 'id', 0))
         username = str(getattr(current_user, 'username', ''))
+        mastertoken = str(getattr(token_data, "mastertoken", "")).strip()
+
+        if not DecryptService.validate_master_token(db, user_id, mastertoken):
+            raise HTTPException(status_code=401, detail="Invalid master token")
+
         AuditService.log_event(
             db, user_id, "mastertoken_confirmed", 
             f"Master token confirmed for {username}"
@@ -2513,6 +2584,9 @@ async def get_media_file(
         # Read encrypted file content
         import os
         if not os.path.exists(media.encrypted_file_path):
+            # File was deleted after viewing (one-time view)
+            if getattr(media, 'downloaded_at', None):
+                raise HTTPException(status_code=410, detail="Media was deleted after viewing. Cannot access again.")
             raise HTTPException(status_code=404, detail="Media file not found on server")
         
         try:
@@ -2525,6 +2599,9 @@ async def get_media_file(
             
             # Mark as downloaded
             MediaService.mark_media_downloaded(db, media_id)
+            
+            # Auto-delete from server after viewing (one-time view, user cannot go back)
+            MediaService.delete_media_file_from_disk(media.encrypted_file_path)
             
             return {
                 "media_id": media.media_id,
@@ -2753,9 +2830,18 @@ async def upload_raw_media(
         unique_filename = f"{uuid.uuid4()}{file_extension}"
         file_path = os.path.join(UPLOAD_DIR, unique_filename)
         
-        # Save the uploaded file
+        content = await file.read()
+        # Apply leak-detection watermark (up to 5 per file) for images and PDFs
+        content = apply_watermark(
+            content,
+            file.content_type or "application/octet-stream",
+            file.filename or "media",
+            recipient.id,
+            unique_filename,
+        )
+        
+        # Save the uploaded file (watermarked if applicable)
         with open(file_path, "wb") as buffer:
-            content = await file.read()
             buffer.write(content)
         
         # Get sender ID
@@ -2847,6 +2933,9 @@ async def download_raw_media(
         
         file_path = os.path.join(UPLOAD_DIR, media_id)
         if not os.path.exists(file_path):
+            # File was deleted after viewing (one-time view)
+            if media.downloaded_at:
+                raise HTTPException(status_code=410, detail="Media was deleted after viewing. Cannot access again.")
             raise HTTPException(status_code=404, detail="File not found")
         
         # Read the file content
@@ -2856,6 +2945,9 @@ async def download_raw_media(
         # Mark media as downloaded
         media.downloaded_at = datetime.now(timezone.utc)
         db.commit()
+        
+        # Auto-delete from server after viewing (one-time view, user cannot go back)
+        MediaService.delete_media_file_from_disk(file_path)
         
         return Response(
             content=content,

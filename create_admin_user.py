@@ -57,9 +57,13 @@ def create_admin_user(username: str = "admin", password: str = "adminuser@123"):
                 session.close()
                 return True
         
-        # Create new admin user
+        # Create new admin user with a unique phone number
+        # Generate admin phone number based on username to ensure uniqueness
+        admin_phone = f"+1000{abs(hash(username)) % 1000000:06d}"
+        
         admin_user = User(
             username=username,
+            phone_number=admin_phone,  # Add required phone number
             password_hash=hash_password(password),
             is_active=True,
             is_verified=True,
