@@ -6,6 +6,15 @@ Script to create an admin user account
 import os
 import sys
 import logging
+
+# Load .env before database config so DATABASE_URL / DB_* are set
+if os.path.exists(".env"):
+    with open(".env", "r") as f:
+        for line in f:
+            if "=" in line and not line.strip().startswith("#"):
+                key, value = line.strip().split("=", 1)
+                os.environ[key] = value.strip().strip("'\"")
+
 import bcrypt
 from sqlalchemy.orm import Session
 from database_config import db_config
