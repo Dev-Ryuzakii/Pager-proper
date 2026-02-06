@@ -7,13 +7,17 @@ import os
 import sys
 import logging
 
-# Load .env before database config so DATABASE_URL / DB_* are set
-if os.path.exists(".env"):
-    with open(".env", "r") as f:
-        for line in f:
-            if "=" in line and not line.strip().startswith("#"):
-                key, value = line.strip().split("=", 1)
-                os.environ[key] = value.strip().strip("'\"")
+# Load .env before database config (try cwd and script directory)
+def _load_env():
+    for path in (".env", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")):
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                for line in f:
+                    if "=" in line and not line.strip().startswith("#"):
+                        key, value = line.strip().split("=", 1)
+                        os.environ[key] = value.strip().strip("'\"")
+
+_load_env()
 
 import bcrypt
 from sqlalchemy.orm import Session
@@ -201,18 +205,39 @@ def remove_admin_status(username: str):
         print(f"❌ Failed to remove admin status: {e}")
         return False
 
+def init_database():
+    """Create database tables (users, user_sessions, etc.) if they don't exist."""
+    print("🔧 Creating database tables...")
+    try:
+        if not db_config.initialize_database():
+            print("❌ Failed to initialize database connection")
+            return False
+        from database_models import Base
+        Base.metadata.create_all(bind=db_config.engine)
+        print("✅ Database tables created successfully!")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to create tables: {e}")
+        return False
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage:")
+        print("  python create_admin_user.py init              # Create DB tables first")
         print("  python create_admin_user.py create [username] [password]")
         print("  python create_admin_user.py list")
         print("  python create_admin_user.py remove <username>")
-        print("\nNote: If no username/password provided for create, defaults to:")
+        print("\nNote: Run 'init' first if tables don't exist. If no username/password for create, defaults:")
         print("  Username: admin")
         print("  Password: adminuser@123")
         sys.exit(1)
     
     command = sys.argv[1]
+    
+    if command == "init":
+        success = init_database()
+        sys.exit(0 if success else 1)
     
     if command == "create":
         username = "admin"
