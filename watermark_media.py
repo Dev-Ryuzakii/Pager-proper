@@ -15,11 +15,6 @@ logger = logging.getLogger(__name__)
 # Max number of watermark instances per media (e.g. 5 positions or 5 pages)
 WATERMARKS_PER_MEDIA = 5
 
-# Payload format: short code to identify recipient + media (for leak lookup)
-def _payload(recipient_id: int, media_id: str) -> str:
-    short_id = (media_id.replace("-", "")[:8]) if media_id else ""
-    return f"R{recipient_id}#{short_id}"
-
 
 def _watermark_image(data: bytes, content_type: str, payload_text: str) -> Optional[bytes]:
     """Add up to WATERMARKS_PER_MEDIA text watermarks to image bytes. Returns None on failure."""
@@ -52,17 +47,26 @@ def _watermark_image(data: bytes, content_type: str, payload_text: str) -> Optio
 
     overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
-    font_size = max(8, min(w, h) // 60)
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
-    except (OSError, AttributeError):
+    # Larger, more visible font (username as watermark)
+    font_size = max(18, min(w, h) // 22)
+    font = None
+    for path in (
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ):
         try:
-            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
-        except (OSError, AttributeError):
-            font = ImageFont.load_default()
+            font = ImageFont.truetype(path, font_size)
+            break
+        except (OSError, AttributeError, TypeError):
+            continue
+    if font is None:
+        font = ImageFont.load_default()
 
+    # More visible: darker gray, higher alpha
+    fill = (80, 80, 80, 160)
     for x, y in positions:
-        draw.text((x, y), payload_text, fill=(128, 128, 128, 80), font=font)
+        draw.text((x, y), payload_text, fill=fill, font=font)
 
     try:
         out = Image.alpha_composite(img, overlay)
@@ -101,13 +105,14 @@ def _watermark_pdf(data: bytes, payload_text: str) -> Optional[bytes]:
         return None
 
     try:
-        # Create a small watermark image (text), then as single-page PDF
-        img = Image.new("RGBA", (200, 40), (255, 255, 255, 0))
+        # Create watermark image with username text (wider for longer names)
+        text_w = max(200, len(payload_text) * 10)
+        img = Image.new("RGBA", (text_w, 50), (255, 255, 255, 0))
         try:
             from PIL import ImageDraw, ImageFont
             draw = ImageDraw.Draw(img)
             font = ImageFont.load_default()
-            draw.text((5, 5), payload_text, fill=(180, 180, 180, 120), font=font)
+            draw.text((5, 5), payload_text, fill=(80, 80, 80, 180), font=font)
         except Exception:
             pass
         wm_buf = io.BytesIO()
@@ -136,16 +141,16 @@ def apply_watermark(
     data: bytes,
     content_type: str,
     filename: str,
-    recipient_id: int,
-    media_id: str,
+    recipient_username: str,
 ) -> bytes:
     """
-    Apply up to WATERMARKS_PER_MEDIA leak-detection watermarks to media bytes.
+    Apply up to WATERMARKS_PER_MEDIA watermarks to media bytes.
+    Watermark text is the recipient's username (for leak detection).
     Supported: images (JPEG, PNG, etc.) and PDF. Others returned unchanged.
     """
     if not data:
         return data
-    payload_text = _payload(recipient_id, media_id)
+    payload_text = (recipient_username or "User").strip() or "User"
     ct = (content_type or "").lower()
     fn = (filename or "").lower()
 

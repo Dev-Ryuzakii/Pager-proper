@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, File, Form, UploadFile, Response
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, File, Form, UploadFile, Response, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -816,8 +816,7 @@ class MediaService:
                 content,
                 media_data.content_type or "application/octet-stream",
                 media_data.filename or "media",
-                recipient.id,
-                media_id,
+                str(getattr(recipient, "username", "") or "User"),
             )
         except Exception as e:
             logger.error(f"Error decoding media: {e}")
@@ -898,8 +897,7 @@ class MediaService:
                 content,
                 media_data.content_type or "application/octet-stream",
                 media_data.filename or "media",
-                recipient.id,
-                media_id,
+                str(getattr(recipient, "username", "") or "User"),
             )
         except Exception as e:
             logger.error(f"Error decoding media: {e}")
@@ -1314,6 +1312,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# WebSocket chat: connection manager (user_id -> set of WebSockets)
+class ConnectionManager:
+    def __init__(self):
+        self._connections: Dict[int, set] = {}  # user_id -> set of WebSocket
+
+    async def connect(self, websocket: WebSocket, user_id: int) -> None:
+        await websocket.accept()
+        if user_id not in self._connections:
+            self._connections[user_id] = set()
+        self._connections[user_id].add(websocket)
+        logger.info(f"WebSocket connected: user_id={user_id}, total connections for user={len(self._connections[user_id])}")
+
+    def disconnect(self, websocket: WebSocket, user_id: int) -> None:
+        if user_id in self._connections:
+            self._connections[user_id].discard(websocket)
+            if not self._connections[user_id]:
+                del self._connections[user_id]
+        logger.info(f"WebSocket disconnected: user_id={user_id}")
+
+    async def send_to_user(self, user_id: int, data: dict) -> bool:
+        """Send JSON to all WebSockets for a user. Returns True if at least one was sent."""
+        if user_id not in self._connections:
+            return False
+        payload = json.dumps(data)
+        dead = set()
+        sent = False
+        for ws in list(self._connections[user_id]):
+            try:
+                await ws.send_text(payload)
+                sent = True
+            except Exception:
+                dead.add(ws)
+        for ws in dead:
+            self._connections[user_id].discard(ws)
+        if not self._connections[user_id]:
+            del self._connections[user_id]
+        return sent
+
+
+ws_manager = ConnectionManager()
+
+
 # Authentication dependency
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
                           db: Session = Depends(get_database_session)) -> User:
@@ -1348,6 +1389,56 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             detail="Could not validate credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+@app.websocket("/ws")
+async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
+    """
+    WebSocket for real-time chat. Connect with session token in query: /ws?token=<session_token>
+    Server pushes new_message when the user receives a message (e.g. from POST /messages/send).
+    """
+    user_id = None
+    db = None
+    try:
+        if not token:
+            await websocket.close(code=4001)
+            return
+        db = db_config.get_session()
+        if not db:
+            await websocket.close(code=4010)
+            return
+        session = SessionService.validate_session(db, token)
+        if not session:
+            await websocket.close(code=4001)
+            return
+        user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+        if not user:
+            await websocket.close(code=4001)
+            return
+        user_id = int(getattr(user, "id", 0))
+        await ws_manager.connect(websocket, user_id)
+        await websocket.send_text(json.dumps({"type": "connected", "user_id": user_id}))
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+                if msg.get("type") == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong", "timestamp": time.time()}))
+            except json.JSONDecodeError:
+                pass
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning(f"WebSocket error: {e}")
+    finally:
+        if user_id is not None:
+            ws_manager.disconnect(websocket, user_id)
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
+
 
 # Add superadmin authentication dependency
 async def get_superadmin(credentials: HTTPAuthorizationCredentials = Depends(security), 
@@ -1655,21 +1746,27 @@ async def send_message(message_data: MessageSend,
         message = MessageService.send_message_by_username(
             db, user_id, message_data.username, message_data.message, message_data.disappear_after_hours
         )
-        
+        recipient_id = int(getattr(message, 'recipient_id', 0))
+        sender_username = str(getattr(current_user, 'username', ''))
+        await ws_manager.send_to_user(recipient_id, {
+            "type": "new_message",
+            "data": {
+                "message_id": getattr(message, "id", None),
+                "sender_username": sender_username,
+                "recipient_username": message_data.username,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        })
         response = {
             "username": message_data.username,
             "message": "sent"
         }
-        
-        # Add expiration info if it's a disappearing message
         auto_delete = getattr(message, 'auto_delete', False)
         expires_at = getattr(message, 'expires_at', None)
         if auto_delete and expires_at:
             response["expires_at"] = expires_at.isoformat() if hasattr(expires_at, 'isoformat') else str(expires_at)
             response["auto_delete"] = str(auto_delete).lower()
-        
         return response
-        
     except HTTPException:
         raise
     except Exception as e:
@@ -2831,13 +2928,12 @@ async def upload_raw_media(
         file_path = os.path.join(UPLOAD_DIR, unique_filename)
         
         content = await file.read()
-        # Apply leak-detection watermark (up to 5 per file) for images and PDFs
+        # Apply watermark with recipient username (up to 5 per file) for images and PDFs
         content = apply_watermark(
             content,
             file.content_type or "application/octet-stream",
             file.filename or "media",
-            recipient.id,
-            unique_filename,
+            str(getattr(recipient, "username", "") or "User"),
         )
         
         # Save the uploaded file (watermarked if applicable)
