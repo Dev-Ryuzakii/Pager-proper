@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Fi
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 import uvicorn
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
@@ -47,6 +47,7 @@ from database_config import get_database_session, db_config
 from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
+from voice_scrambler import generate_voice_decoy
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -2558,6 +2559,76 @@ async def get_call_history(
     except Exception as e:
         logger.error(f"Call history error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve call history")
+
+@app.post("/users/me/voice-identity")
+async def upload_voice_identity(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Upload a voice identity sample for scrambled decoys"""
+    try:
+        user_dir = os.path.join(UPLOAD_DIR, f"user_{current_user.id}")
+        os.makedirs(user_dir, exist_ok=True)
+        
+        file_path = os.path.join(user_dir, "voice_identity.m4a")
+        content = await file.read()
+        
+        with open(file_path, "wb") as f:
+            f.write(content)
+            
+        current_user.voice_identity_path = file_path
+        db.commit()
+        
+        return {"message": "Voice identity uploaded successfully", "path": file_path}
+    except Exception as e:
+        logger.error(f"Voice identity upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload voice identity")
+
+@app.get("/users/{username}/voice-identity")
+async def get_user_voice_identity(
+    username: str,
+    db: Session = Depends(get_database_session)
+):
+    """Get the voice identity of a specific user (for decoys)"""
+    user = db.query(User).filter(User.username == username).first()
+    if not user or not user.voice_identity_path:
+        raise HTTPException(status_code=404, detail="Voice identity not found")
+        
+    if not os.path.exists(user.voice_identity_path):
+        raise HTTPException(status_code=404, detail="Voice file missing")
+        
+@app.get("/media/decoy-voice/{media_id}")
+async def get_decoy_voice(
+    media_id: str,
+    db: Session = Depends(get_database_session),
+    current_user: User = Depends(get_current_user)
+):
+    """Generate a fresh decoy using the SENDER'S voice identity"""
+    # 1. Find the message/media
+    media = db.query(Media).filter(Media.media_id == media_id).first()
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
+        
+    # 2. Get the sender
+    sender = db.query(User).filter(User.username == media.sender).first()
+    if not sender or not sender.voice_identity_path:
+        # Fallback if sender has no identity: 404 (frontend will use synthetic noise)
+        raise HTTPException(status_code=404, detail="Sender has no voice identity")
+        
+    # 3. Generate a fresh decoy
+    temp_decoy = f"temp_decoy_{uuid.uuid4().hex}.m4a"
+    success = generate_voice_decoy(sender.voice_identity_path, temp_decoy)
+    
+    if not success:
+        if os.path.exists(temp_decoy): os.remove(temp_decoy)
+        raise HTTPException(status_code=500, detail="Failed to scramble voice")
+        
+    def cleanup():
+        if os.path.exists(temp_decoy):
+            os.remove(temp_decoy)
+            
+    return FileResponse(temp_decoy, media_type="audio/m4a", background=BackgroundTasks().add_task(cleanup))
 
 @app.post("/mastertoken/create")
 async def create_mastertoken(token_data: MasterToken, 
