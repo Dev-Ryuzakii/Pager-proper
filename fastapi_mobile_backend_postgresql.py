@@ -312,7 +312,10 @@ class MessageService:
     def get_user_messages(db: Session, user_id: int, limit: int = 50) -> List[Message]:
         """Get messages for a user (inbox)"""
         return db.query(Message).filter(
-            Message.recipient_id == user_id
+            or_(
+                Message.recipient_id == user_id,
+                Message.sender_id == user_id
+            )
         ).order_by(Message.timestamp.desc()).limit(limit).all()
     
     @staticmethod
@@ -984,7 +987,10 @@ class MediaService:
     def get_user_media(db: Session, user_id: int, limit: int = 50) -> List[Media]:
         """Get media files (photos, videos, documents) for a user"""
         return db.query(Media).filter(
-            Media.recipient_id == user_id
+            or_(
+                Media.recipient_id == user_id,
+                Media.sender_id == user_id
+            )
         ).order_by(Media.uploaded_at.desc()).limit(limit).all()
     
     @staticmethod
@@ -1415,8 +1421,23 @@ async def lifespan(app: FastAPI):
             logger.warning("⚠️  App will start but database functionality may be limited")
         else:
             logger.info("✅ PostgreSQL database connected successfully")
+
+    # Start periodic online status broadcast task
+    import asyncio
+    async def periodic_status_broadcast():
+        while True:
+            try:
+                await ws_manager.broadcast_online_status()
+            except Exception as e:
+                logger.error(f"Error in periodic broadcast: {e}")
+            await asyncio.sleep(15)  # Every 15 seconds
+
+    broadcast_task = asyncio.create_task(periodic_status_broadcast())
     
     yield
+    
+    # Cancel periodic task during shutdown
+    broadcast_task.cancel()
     
     # Shutdown
     logger.info("📴 Shutting down FastAPI Mobile Backend")
@@ -1442,26 +1463,34 @@ app.add_middleware(
 class ConnectionManager:
     def __init__(self):
         self._connections: Dict[int, set] = {}  # user_id -> set of WebSocket
+        self._usernames: Dict[int, str] = {}    # user_id -> username
 
-    async def connect(self, websocket: WebSocket, user_id: int) -> None:
+    async def connect(self, websocket: WebSocket, user_id: int, username: str) -> None:
         await websocket.accept()
         if user_id not in self._connections:
             self._connections[user_id] = set()
         self._connections[user_id].add(websocket)
-        logger.info(f"WebSocket connected: user_id={user_id}, total connections for user={len(self._connections[user_id])}")
+        self._usernames[user_id] = username
+        logger.info(f"WebSocket connected: user_id={user_id}, username={username}, total connections for user={len(self._connections[user_id])}")
+        # Broadcast online status when someone connects
+        await self.broadcast_online_status()
 
-    def disconnect(self, websocket: WebSocket, user_id: int) -> None:
+    async def disconnect(self, websocket: WebSocket, user_id: int) -> None:
         if user_id in self._connections:
             self._connections[user_id].discard(websocket)
             if not self._connections[user_id]:
                 del self._connections[user_id]
+                if user_id in self._usernames:
+                    del self._usernames[user_id]
         logger.info(f"WebSocket disconnected: user_id={user_id}")
+        # Broadcast online status when someone disconnects
+        await self.broadcast_online_status()
 
     async def send_to_user(self, user_id: int, data: dict) -> bool:
         """Send JSON to all WebSockets for a user. Returns True if at least one was sent."""
         if user_id not in self._connections:
             return False
-        payload = json.dumps(data, default=str)  # Use default=str for datetime/other non-serializables
+        payload = json.dumps(data, default=str)
         dead = set()
         sent = False
         for ws in list(self._connections[user_id]):
@@ -1474,7 +1503,42 @@ class ConnectionManager:
             self._connections[user_id].discard(ws)
         if not self._connections[user_id]:
             del self._connections[user_id]
+            if user_id in self._usernames:
+                del self._usernames[user_id]
         return sent
+
+    async def broadcast_online_status(self):
+        """Broadcast the list of online usernames to all connected clients."""
+        online_usernames = list(self._usernames.values())
+        data = {"type": "user_status", "users": online_usernames}
+        payload = json.dumps(data)
+        
+        for user_id, ws_set in list(self._connections.items()):
+            dead = set()
+            for ws in list(ws_set):
+                try:
+                    await ws.send_text(payload)
+                except Exception:
+                    dead.add(ws)
+            for ws in dead:
+                ws_set.discard(ws)
+            if not ws_set:
+                del self._connections[user_id]
+                if user_id in self._usernames:
+                    del self._usernames[user_id]
+
+    async def handle_typing(self, sender_id: int, recipient_username: str, is_typing: bool, db: Session):
+        """Send typing status to the recipient."""
+        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
+        if not recipient:
+            return
+        
+        sender_username = self._usernames.get(sender_id, "Unknown")
+        await self.send_to_user(recipient.id, {
+            "type": "typing",
+            "sender": sender_username,
+            "is_typing": is_typing
+        })
 
 
 ws_manager = ConnectionManager()
@@ -1541,7 +1605,8 @@ async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
             await websocket.close(code=4001)
             return
         user_id = int(getattr(user, "id", 0))
-        await ws_manager.connect(websocket, user_id)
+        username = str(getattr(user, "username", "Unknown"))
+        await ws_manager.connect(websocket, user_id, username)
         await websocket.send_text(json.dumps({"type": "connected", "user_id": user_id}))
         while True:
             raw = await websocket.receive_text()
@@ -1549,6 +1614,11 @@ async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
                 msg = json.loads(raw)
                 if msg.get("type") == "ping":
                     await websocket.send_text(json.dumps({"type": "pong", "timestamp": time.time()}))
+                elif msg.get("type") == "typing":
+                    recipient_username = msg.get("recipient")
+                    is_typing = msg.get("is_typing", False)
+                    if recipient_username:
+                        await ws_manager.handle_typing(user_id, recipient_username, is_typing, db)
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:
@@ -1557,7 +1627,7 @@ async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
         logger.warning(f"WebSocket error: {e}")
     finally:
         if user_id is not None:
-            ws_manager.disconnect(websocket, user_id)
+            await ws_manager.disconnect(websocket, user_id)
         if db:
             try:
                 db.close()
@@ -2110,6 +2180,51 @@ async def get_inbox(current_user: User = Depends(get_current_user),
         logger.error(f"Inbox error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve inbox")
 
+
+@app.get("/messages/conversation/{partner_username}")
+async def get_conversation(
+    partner_username: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Get all messages between the current user and a specific partner (both directions)."""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        partner = db.query(User).filter(User.username == partner_username, User.is_active == True).first()
+        if not partner:
+            raise HTTPException(status_code=404, detail="Partner user not found")
+        partner_id = int(getattr(partner, 'id', 0))
+
+        msgs = db.query(Message).filter(
+            or_(
+                and_(Message.sender_id == user_id, Message.recipient_id == partner_id),
+                and_(Message.sender_id == partner_id, Message.recipient_id == user_id),
+            )
+        ).order_by(Message.timestamp.asc()).limit(200).all()
+
+        current_username = str(getattr(current_user, 'username', ''))
+        result = []
+        for msg in msgs:
+            result.append({
+                "id": int(getattr(msg, 'id', 0)),
+                "sender": current_username if msg.sender_id == user_id else partner_username,
+                "recipient": partner_username if msg.sender_id == user_id else current_username,
+                "content": str(getattr(msg, 'encrypted_content', '')),
+                "content_type": str(getattr(msg, 'content_type', '')),
+                "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
+                "delivered": bool(getattr(msg, 'delivered', False)),
+                "read": bool(getattr(msg, 'read', False)),
+            })
+
+        return {"messages": result, "count": len(result)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Conversation fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve conversation")
+
+
 @app.get("/messages/offline")
 async def get_offline_messages(current_user: User = Depends(get_current_user),
                               db: Session = Depends(get_database_session)):
@@ -2148,12 +2263,15 @@ async def get_offline_messages(current_user: User = Depends(get_current_user),
 async def mark_message_read(message_id: int,
                            current_user: User = Depends(get_current_user),
                            db: Session = Depends(get_database_session)):
-    """Mark message as read"""
+    """Mark message as read - allowed for both sender and recipient"""
     try:
         user_id = int(getattr(current_user, 'id', 0))
-        # Verify message belongs to current user
+        # Allow either sender or recipient to mark as read
         message = db.query(Message).filter(
-            and_(Message.id == message_id, Message.recipient_id == user_id)
+            and_(
+                Message.id == message_id,
+                or_(Message.recipient_id == user_id, Message.sender_id == user_id)
+            )
         ).first()
         
         if not message:
@@ -2171,6 +2289,7 @@ async def mark_message_read(message_id: int,
     except Exception as e:
         logger.error(f"Mark read error: {e}")
         raise HTTPException(status_code=500, detail="Failed to mark message as read")
+
 
 class AdminUserRegistrationDetails(BaseModel):
     """Model for admin user registration details response"""
