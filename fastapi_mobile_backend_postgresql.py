@@ -875,11 +875,11 @@ class MediaService:
         db.commit()
         db.refresh(message)
         
-        # Create media record (file_size may change after watermarking)
+        content_len = len(content) if not isinstance(content, (Exception, type(None))) else 0
         media = Media(
             media_id=media_id,
             filename=media_data.filename or "media",
-            file_size=len(content),
+            file_size=content_len,
             media_type=media_data.media_type or "photo",
             content_type=media_data.content_type or "application/octet-stream",
             encrypted_file_path=file_path,  # Store the file path
@@ -962,10 +962,11 @@ class MediaService:
         db.refresh(message)
         
         # Create media record (file_size may change after watermarking)
+        content_len = len(content) if not isinstance(content, (Exception, type(None))) else 0
         media = Media(
             media_id=media_id,
             filename=media_data.filename or "media",
-            file_size=len(content),
+            file_size=content_len,
             media_type=media_data.media_type or "photo",
             content_type=media_data.content_type or "application/octet-stream",
             encrypted_file_path=file_path,  # Store the file path
@@ -1479,9 +1480,8 @@ class ConnectionManager:
         if user_id in self._connections:
             self._connections[user_id].discard(websocket)
             if not self._connections[user_id]:
-                del self._connections[user_id]
-                if user_id in self._usernames:
-                    del self._usernames[user_id]
+                self._connections.pop(user_id, None)
+                self._usernames.pop(user_id, None)
         logger.info(f"WebSocket disconnected: user_id={user_id}")
         # Broadcast online status when someone disconnects
         await self.broadcast_online_status()
@@ -1502,9 +1502,8 @@ class ConnectionManager:
         for ws in dead:
             self._connections[user_id].discard(ws)
         if not self._connections[user_id]:
-            del self._connections[user_id]
-            if user_id in self._usernames:
-                del self._usernames[user_id]
+            self._connections.pop(user_id, None)
+            self._usernames.pop(user_id, None)
         return sent
 
     async def broadcast_online_status(self):
@@ -1523,9 +1522,8 @@ class ConnectionManager:
             for ws in dead:
                 ws_set.discard(ws)
             if not ws_set:
-                del self._connections[user_id]
-                if user_id in self._usernames:
-                    del self._usernames[user_id]
+                self._connections.pop(user_id, None)
+                self._usernames.pop(user_id, None)
 
     async def handle_typing(self, sender_id: int, recipient_username: str, is_typing: bool, db: Session):
         """Send typing status to the recipient."""
@@ -3332,8 +3330,8 @@ async def upload_raw_media(
         mediaListType = "voice" if is_voice else "raw"
         media = Media(
             media_id=unique_filename,
-            filename=file.filename or "media",
-            file_size=len(content),
+            filename=file.filename or unique_filename,
+            file_size=len(content) if not isinstance(content, (Exception, type(None))) else 0,
             media_type=mediaListType,
             content_type=content_type or file.content_type or "application/octet-stream",
             encrypted_file_path=file_path,
@@ -3354,7 +3352,7 @@ async def upload_raw_media(
         response = {
             "media_id": unique_filename,
             "filename": file.filename,
-            "file_size": len(content),
+            "file_size": len(content) if not isinstance(content, (Exception, type(None))) else 0,
             "content_type": file.content_type,
             "message": "File uploaded successfully",
             "uploaded_for": username,
@@ -3389,9 +3387,28 @@ async def download_raw_media(
         if media.sender_id != user_id and media.recipient_id != user_id:
             raise HTTPException(status_code=403, detail="Access denied")
         
-        file_path = os.path.join(UPLOAD_DIR, media_id)
+        # Get the actual file path from the database
+        file_path = getattr(media, 'encrypted_file_path', None)
+        if not file_path:
+            file_path = os.path.join(UPLOAD_DIR, media_id)
+            
+        # Detect if this is a voice note
+        is_voice = (
+            str(getattr(media, 'media_type', '')).lower() == 'voice' or
+            any(media_id.endswith(ext) for ext in ('.m4a', '.wav', '.aac', '.opus', '.mp3'))
+        )
+        
+        # Check if the file exists, if not try adding .enc if it's not already there
         if not os.path.exists(file_path):
-            # File was deleted after viewing (one-time view)
+            if not file_path.endswith('.enc'):
+                alt_path = f"{file_path}.enc"
+                if os.path.exists(alt_path):
+                    file_path = alt_path
+        
+        if not os.path.exists(file_path):
+            if is_voice:
+                raise HTTPException(status_code=404, detail="Voice note file not found")
+            # Non-voice: File was deleted after viewing (one-time view)
             if media.downloaded_at:
                 raise HTTPException(status_code=410, detail="Media was deleted after viewing. Cannot access again.")
             raise HTTPException(status_code=404, detail="File not found")
@@ -3404,18 +3421,21 @@ async def download_raw_media(
         media.downloaded_at = datetime.now(timezone.utc)
         db.commit()
         
-        # Auto-delete from server after viewing (one-time view, user cannot go back)
-        MediaService.delete_media_file_from_disk(file_path)
+        # Voice notes: keep file on disk for replay. Only delete regular media (one-time view).
+        if not is_voice:
+            MediaService.delete_media_file_from_disk(file_path)
         
+        content_len = len(content) if hasattr(content, "__len__") else 0
         return Response(
             content=content,
             media_type=media.content_type,
             headers={
                 "Content-Disposition": f"attachment; filename={media.filename}",
-                "Content-Length": str(len(content))
+                "Content-Length": str(content_len)
             }
         )
     
+
     except HTTPException:
         raise
     except Exception as e:
