@@ -2598,6 +2598,7 @@ async def get_user_voice_identity(
     if not os.path.exists(user.voice_identity_path):
         raise HTTPException(status_code=404, detail="Voice file missing")
         
+    return FileResponse(user.voice_identity_path)
 @app.get("/media/decoy-voice/{media_id}")
 async def get_decoy_voice(
     media_id: str,
@@ -2611,7 +2612,7 @@ async def get_decoy_voice(
         raise HTTPException(status_code=404, detail="Media not found")
         
     # 2. Get the sender
-    sender = db.query(User).filter(User.username == media.sender).first()
+    sender = media.sender
     if not sender or not sender.voice_identity_path:
         # Fallback if sender has no identity: 404 (frontend will use synthetic noise)
         raise HTTPException(status_code=404, detail="Sender has no voice identity")
