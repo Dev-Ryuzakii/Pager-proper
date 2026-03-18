@@ -3165,15 +3165,20 @@ async def upload_raw_media(
         file_path = os.path.join(UPLOAD_DIR, unique_filename)
         
         content = await file.read()
-        # Apply watermark with recipient username (up to 5 per file) for images and PDFs
-        content = apply_watermark(
-            content,
-            file.content_type or "application/octet-stream",
-            file.filename or "media",
-            str(getattr(recipient, "username", "") or "User"),
-        )
         
-        # Save the uploaded file (watermarked if applicable)
+        # Determine if this is a voice note or already encrypted content
+        is_voice = content_type == "media/voice"
+        
+        # Apply watermark ONLY for images and PDFs, and SKIP for voice notes/encrypted blobs
+        if not is_voice and not (content_type and "encrypted" in content_type):
+            content = apply_watermark(
+                content,
+                file.content_type or "application/octet-stream",
+                file.filename or "media",
+                str(getattr(recipient, "username", "") or "User"),
+            )
+        
+        # Save the uploaded file
         with open(file_path, "wb") as buffer:
             buffer.write(content)
         
@@ -3195,7 +3200,7 @@ async def upload_raw_media(
             content_type=content_type or f"media/raw",
             delivered=True,
             read=False,
-            is_offline=False,  # Set to False so it appears in regular inbox
+            is_offline=False,
             expires_at=expires_at,
             auto_delete=auto_delete
         )
@@ -3204,13 +3209,14 @@ async def upload_raw_media(
         db.commit()
         db.refresh(message)
         
-        # Create media record
+        # Create media record with specific media_type
+        mediaListType = "voice" if is_voice else "raw"
         media = Media(
             media_id=unique_filename,
             filename=file.filename or "media",
             file_size=len(content),
-            media_type="raw",
-            content_type=file.content_type or "application/octet-stream",
+            media_type=mediaListType,
+            content_type=content_type or file.content_type or "application/octet-stream",
             encrypted_file_path=file_path,
             message_id=message.id,
             sender_id=sender_id,
