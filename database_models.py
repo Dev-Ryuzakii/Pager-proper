@@ -37,11 +37,12 @@ class User(Base):
     push_token = Column(String(512), nullable=True)
     device_info = Column(JSON, nullable=True)  # Store device metadata as JSON
     
-    # Account status and type
+    # Status and profile
     is_active = Column(Boolean, default=True)
     is_verified = Column(Boolean, default=False)
     user_type = Column(String(20), default="tls")  # "tls", "mobile", "both"
     is_admin = Column(Boolean, default=False)  # Admin account flag
+    voice_identity_path = Column(String(512), nullable=True)  # Path to voice identity file
     
     # Relationships
     sent_messages = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")

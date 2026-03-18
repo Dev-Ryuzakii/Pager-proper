@@ -48,12 +48,15 @@ def _watermark_image(data: bytes, content_type: str, payload_text: str) -> Optio
     overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
     # Larger, more visible font (username as watermark)
-    font_size = max(18, min(w, h) // 22)
+    # High-visibility RED watermark (thick, bold)
+    font_size = max(24, min(w, h) // 18)
     font = None
     for path in (
+        "/System/Library/Fonts/Helvetica-Bold.ttc",
+        "/System/Library/Fonts/SFNSDisplay-Bold.otf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
     ):
         try:
             font = ImageFont.truetype(path, font_size)
@@ -64,9 +67,11 @@ def _watermark_image(data: bytes, content_type: str, payload_text: str) -> Optio
         font = ImageFont.load_default()
 
     # More visible: darker gray, higher alpha
-    fill = (80, 80, 80, 160)
+    # Bright thick red with high alpha
+    fill = (220, 20, 60, 220)  # Crimson red
     for x, y in positions:
-        draw.text((x, y), payload_text, fill=fill, font=font)
+        # Draw twice with slight offset for "thick" look if needed, or just high contrast red
+        draw.text((x, y), payload_text, fill=fill, font=font, stroke_width=2, stroke_fill=(0,0,0,100))
 
     try:
         out = Image.alpha_composite(img, overlay)
@@ -112,7 +117,8 @@ def _watermark_pdf(data: bytes, payload_text: str) -> Optional[bytes]:
             from PIL import ImageDraw, ImageFont
             draw = ImageDraw.Draw(img)
             font = ImageFont.load_default()
-            draw.text((5, 5), payload_text, fill=(80, 80, 80, 180), font=font)
+            # Red watermark for PDF as well
+            draw.text((5, 5), payload_text, fill=(220, 20, 60, 230), font=font)
         except Exception:
             pass
         wm_buf = io.BytesIO()

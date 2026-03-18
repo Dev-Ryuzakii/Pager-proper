@@ -1130,9 +1130,11 @@ class CallService:
         call.status = action
         
         if action == "end" or action == "decline":
-            call.ended_at = datetime.now(timezone.utc)
+            call.ended_at = datetime.utcnow()
             if call.started_at and action == "end":
-                duration = (call.ended_at - call.started_at).total_seconds()
+                ended = call.ended_at.replace(tzinfo=timezone.utc)
+                started = call.started_at.replace(tzinfo=timezone.utc) if call.started_at.tzinfo is None else call.started_at
+                duration = (ended - started).total_seconds()
                 call.duration = int(duration)
         
         db.commit()
@@ -2606,12 +2608,16 @@ async def get_decoy_voice(
     current_user: User = Depends(get_current_user)
 ):
     """Generate a fresh decoy using the SENDER'S voice identity"""
-    # 1. Find the message/media
-    media = db.query(Media).filter(Media.media_id == media_id).first()
+    # 1. Strip extension if provided (e.g., .m4a)
+    clean_media_id = media_id.split('.')[0]
+    
+    # Find the message/media
+    media = db.query(Media).filter(Media.media_id == clean_media_id).first()
     if not media:
         raise HTTPException(status_code=404, detail="Media not found")
         
     # 2. Get the sender
+    # Use relationship or query explicitly by sender ID
     sender = media.sender
     if not sender or not sender.voice_identity_path:
         # Fallback if sender has no identity: 404 (frontend will use synthetic noise)
