@@ -146,6 +146,101 @@ Manually trigger cleanup of expired messages.
 }
 ```
 
+### Calls
+
+The API supports signaling for voice and video calls using WebRTC.
+
+#### POST /calls/initiate
+Initiate a voice or video call to another user.
+
+**Request Body:**
+```json
+{
+  "recipient_username": "string",
+  "call_type": "string", // "voice" or "video"
+  "offer_sdp": "string (optional)" // WebRTC offer SDP
+}
+```
+
+**Response:**
+```json
+{
+  "call_id": "integer",
+  "status": "initiated",
+  "timestamp": "string (ISO 8601 format)"
+}
+```
+
+#### POST /calls/action
+Perform an action on an active call.
+
+**Request Body:**
+```json
+{
+  "call_id": "integer",
+  "action": "string", // "accept", "decline", "end", "busy", "ringing"
+  "answer_sdp": "string (optional)" // WebRTC answer SDP (required for 'accept')
+}
+```
+
+**Response:**
+```json
+{
+  "call_id": "integer",
+  "status": "string", // The action performed
+  "timestamp": "string (ISO 8601 format)"
+}
+```
+
+#### POST /calls/ice_candidate
+Forward a WebRTC ICE candidate to the other party.
+
+**Request Body:**
+```json
+{
+  "call_id": "integer",
+  "recipient_username": "string",
+  "candidate": "object" // The ICE candidate object from WebRTC
+}
+```
+
+**Response:**
+```json
+{
+  "success": "boolean"
+}
+```
+
+#### GET /calls/history
+Get the user's call history.
+
+**Response:**
+```json
+{
+  "calls": [
+    {
+      "id": "integer",
+      "other_party_username": "string",
+      "call_type": "string",
+      "status": "string",
+      "duration": "integer (seconds)",
+      "started_at": "string (ISO 8601 format)",
+      "ended_at": "string (ISO 8601 format or null)",
+      "is_caller": "boolean"
+    }
+  ],
+  "count": "integer"
+}
+```
+
+### Web-Socket Real-time Notifications
+
+The server sends the following events via WebSocket for call signaling:
+
+- `incoming_call`: Received by the recipient when a call is initiated. Includes `call_id`, `caller_username`, `call_type`, and `offer_sdp`.
+- `call_status_update`: Sent to the other party when a call action (accept/decline/end) occurs. Includes `call_id`, `status`, and `answer_sdp`.
+- `ice_candidate`: Sent to the other party when an ICE candidate is forwarded. Includes `call_id`, `sender_id`, and `candidate`.
+
 ### Users
 
 #### GET /users

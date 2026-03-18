@@ -250,6 +250,33 @@ class Media(Base):
     def __repr__(self):
         return f"<Media(media_id='{self.media_id}', filename='{self.filename}', type='{self.media_type}')>"
 
+class Call(Base):
+    """Call table for tracking voice and video calls between users"""
+    __tablename__ = "calls"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    caller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    # Call details
+    call_type = Column(String(20), nullable=False)  # voice, video
+    status = Column(String(20), default="initiated")  # initiated, ringing, accepted, declined, ended, missed
+    
+    # Metadata
+    duration = Column(Integer, default=0)  # duration in seconds
+    encryption_key = Column(Text, nullable=True)  # Optional per-call encryption key
+    
+    # Timestamps
+    started_at = Column(DateTime, default=func.now())
+    ended_at = Column(DateTime, nullable=True)
+    
+    # Relationships
+    caller = relationship("User", foreign_keys=[caller_id])
+    recipient = relationship("User", foreign_keys=[recipient_id])
+    
+    def __repr__(self):
+        return f"<Call(id={self.id}, caller={self.caller_id}, recipient={self.recipient_id}, type='{self.call_type}', status='{self.status}')>"
+
 # Add relationship to Message model
 Message.media_files = relationship("Media", back_populates="message")
 

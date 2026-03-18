@@ -44,7 +44,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 
@@ -170,6 +170,23 @@ class MediaResponse(BaseModel):
     expires_at: Optional[datetime]
     auto_delete: bool
     downloaded: bool
+
+# Call signaling models
+class CallRequest(BaseModel):
+    recipient_username: str = Field(..., description="Username of the person to call")
+    call_type: str = Field(..., pattern="^(voice|video)$", description="Type of call: voice or video")
+    offer_sdp: Optional[str] = Field(None, description="WebRTC offer SDP")
+
+class CallAction(BaseModel):
+    call_id: int = Field(..., description="ID of the call")
+    action: str = Field(..., pattern="^(accept|decline|end|busy|ringing)$", description="Action to perform on the call")
+    answer_sdp: Optional[str] = Field(None, description="WebRTC answer SDP (required for accept)")
+    mastertoken: Optional[str] = Field(None, description="Master token for authorization (required for accept)")
+
+class IceCandidatePayload(BaseModel):
+    call_id: int = Field(..., description="ID of the call")
+    recipient_username: str = Field(..., description="Who to send this candidate to")
+    candidate: Dict = Field(..., description="The ICE candidate object")
 
 def validate_master_token(db: Session, user_id: int, mastertoken: str) -> bool:
     """Validate the master token for a user"""
@@ -1043,6 +1060,114 @@ class MediaService:
         
         return deleted_count
 
+class CallService:
+    """Service class for managing voice and video calls"""
+    
+    @staticmethod
+    async def initiate_call(db: Session, caller_id: int, recipient_username: str, call_type: str, offer_sdp: Optional[str] = None) -> Call:
+        """Create a new call record and notify the recipient"""
+        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
+        if not recipient:
+            raise HTTPException(status_code=404, detail="Recipient not found")
+        
+        if recipient.id == caller_id:
+            raise HTTPException(status_code=400, detail="You cannot call yourself")
+        
+        # Create call record
+        call = Call(
+            caller_id=caller_id,
+            recipient_id=recipient.id,
+            call_type=call_type,
+            status="initiated",
+            started_at=datetime.now(timezone.utc)
+        )
+        db.add(call)
+        db.commit()
+        db.refresh(call)
+        
+        # Send WebSocket notification to recipient
+        caller = db.query(User).filter(User.id == caller_id).first()
+        notification = {
+            "type": "incoming_call",
+            "data": {
+                "call_id": int(call.id),
+                "caller_id": int(caller_id),
+                "caller_username": str(caller.username),
+                "call_type": str(call_type),
+                "offer_sdp": offer_sdp,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        }
+        
+        sent = await ws_manager.send_to_user(recipient.id, notification)
+        if not sent:
+            # If the user is offline, mark as missed immediately or later?
+            # For now, let's keep it initiated and let client timeout.
+            logger.info(f"Recipient {recipient_username} (ID: {recipient.id}) is offline, call notification not sent via WebSocket.")
+            
+        return call
+
+    @staticmethod
+    async def update_call_status(db: Session, call_id: int, user_id: int, action: str, answer_sdp: Optional[str] = None) -> Call:
+        """Update call status and notify the other party"""
+        call = db.query(Call).filter(Call.id == call_id).first()
+        if not call:
+            raise HTTPException(status_code=404, detail="Call not found")
+        
+        # Verify user is part of the call
+        if call.caller_id != user_id and call.recipient_id != user_id:
+            raise HTTPException(status_code=403, detail="Not authorized to update this call")
+            
+        old_status = call.status
+        call.status = action
+        
+        if action == "end" or action == "decline":
+            call.ended_at = datetime.now(timezone.utc)
+            if call.started_at and action == "end":
+                duration = (call.ended_at - call.started_at).total_seconds()
+                call.duration = int(duration)
+        
+        db.commit()
+        
+        # Notify the other party
+        other_party_id = call.recipient_id if user_id == call.caller_id else call.caller_id
+        notification = {
+            "type": "call_status_update",
+            "data": {
+                "call_id": int(call_id),
+                "status": str(action),
+                "answer_sdp": answer_sdp,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        }
+        await ws_manager.send_to_user(other_party_id, notification)
+        
+        return call
+
+    @staticmethod
+    async def forward_ice_candidate(db: Session, sender_id: int, call_id: int, recipient_username: str, candidate: Dict) -> bool:
+        """Forward an ICE candidate to the other party via WebSocket"""
+        recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
+        if not recipient:
+            return False
+            
+        # Verify call exists
+        call = db.query(Call).filter(Call.id == call_id).first()
+        if not call:
+            return False
+            
+        notification = {
+            "type": "ice_candidate",
+            "data": {
+                "call_id": int(call_id),
+                "sender_id": int(sender_id),
+                "candidate": candidate,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        }
+        
+        return await ws_manager.send_to_user(recipient.id, notification)
+
 class AdminService:
     """Service class for admin operations"""
     
@@ -1336,7 +1461,7 @@ class ConnectionManager:
         """Send JSON to all WebSockets for a user. Returns True if at least one was sent."""
         if user_id not in self._connections:
             return False
-        payload = json.dumps(data)
+        payload = json.dumps(data, default=str)  # Use default=str for datetime/other non-serializables
         dead = set()
         sent = False
         for ws in list(self._connections[user_id]):
@@ -1875,6 +2000,84 @@ async def send_decoy_document(
         raise HTTPException(status_code=500, detail="Failed to send decoy document")
 
 
+# --- Call Endpoints ---
+
+@app.post("/calls/initiate")
+async def initiate_call(
+    call_data: CallRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Initiate a voice or video call"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        call = await CallService.initiate_call(
+            db, user_id, call_data.recipient_username, call_data.call_type, call_data.offer_sdp
+        )
+        return {
+            "call_id": int(call.id),
+            "status": "initiated",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Initiate call error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to initiate call")
+
+@app.post("/calls/action")
+async def call_action(
+    action_data: CallAction,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Perform an action on a call (accept, decline, end, etc.)"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        
+        # Require mastertoken for accepting calls
+        if action_data.action == "accept":
+            if not action_data.mastertoken:
+                raise HTTPException(status_code=401, detail="Master token required to accept call")
+            if not DecryptService.validate_master_token(db, user_id, action_data.mastertoken):
+                raise HTTPException(status_code=401, detail="Invalid master token")
+
+        call = await CallService.update_call_status(
+            db, action_data.call_id, user_id, action_data.action, action_data.answer_sdp
+        )
+        return {
+            "call_id": int(call.id),
+            "status": action_data.action,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Call action error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to perform call action")
+
+@app.post("/calls/ice_candidate")
+async def send_ice_candidate(
+    payload: IceCandidatePayload,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Forward a WebRTC ICE candidate to the other party"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        success = await CallService.forward_ice_candidate(
+            db, user_id, payload.call_id, payload.recipient_username, payload.candidate
+        )
+        if not success:
+            raise HTTPException(status_code=400, detail="Failed to forward ICE candidate (recipient offline or call invalid)")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Send ICE candidate error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to forward ICE candidate")
+
+
 @app.get("/messages/inbox")
 async def get_inbox(current_user: User = Depends(get_current_user),
                    db: Session = Depends(get_database_session)):
@@ -2205,6 +2408,39 @@ async def admin_get_user_registration_details(username: str,
     except Exception as e:
         logger.error(f"Admin get user registration details error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve user registration details")
+
+@app.get("/calls/history")
+async def get_call_history(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Retrieve call history for the current user"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        calls = db.query(Call).filter(
+            or_(Call.caller_id == user_id, Call.recipient_id == user_id)
+        ).order_by(Call.started_at.desc()).limit(50).all()
+        
+        result = []
+        for call in calls:
+            other_party_id = call.recipient_id if call.caller_id == user_id else call.caller_id
+            other_party = db.query(User).filter(User.id == other_party_id).first()
+            
+            result.append({
+                "id": int(call.id),
+                "other_party_username": str(other_party.username) if other_party else "unknown",
+                "call_type": str(call.call_type),
+                "status": str(call.status),
+                "duration": int(call.duration),
+                "started_at": call.started_at.isoformat(),
+                "ended_at": call.ended_at.isoformat() if call.ended_at else None,
+                "is_caller": call.caller_id == user_id
+            })
+            
+        return {"calls": result, "count": len(result)}
+    except Exception as e:
+        logger.error(f"Call history error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve call history")
 
 @app.post("/mastertoken/create")
 async def create_mastertoken(token_data: MasterToken, 
@@ -2909,6 +3145,7 @@ async def upload_raw_media(
     username: str = Form(...),
     file: UploadFile = File(...),
     disappear_after_hours: Optional[int] = Form(None),
+    content_type: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_database_session)
@@ -2955,7 +3192,7 @@ async def upload_raw_media(
             sender_id=sender_id,
             recipient_id=recipient.id,
             encrypted_content=unique_filename,  # Use the actual media ID
-            content_type=f"media/raw",
+            content_type=content_type or f"media/raw",
             delivered=True,
             read=False,
             is_offline=False,  # Set to False so it appears in regular inbox
