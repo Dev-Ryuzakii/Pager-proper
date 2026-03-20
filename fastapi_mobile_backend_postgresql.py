@@ -996,17 +996,50 @@ class MediaService:
         ).order_by(Media.uploaded_at.desc()).limit(limit).all()
     
     @staticmethod
-    def get_media_by_id(db: Session, media_id: int, user_id: int) -> Optional[Media]:
-        """Get specific media file by ID for a user"""
-        return db.query(Media).filter(
+    def get_media_by_id(db: Session, media_id: Any, user_id: int) -> Optional[Media]:
+        """Get specific media file by ID or media_id (UUID) for a user"""
+        # 1. Try exact match on media_id (UUID string)
+        media = db.query(Media).filter(
             and_(
-                Media.id == media_id,
+                Media.media_id == str(media_id),
                 or_(
                     Media.sender_id == user_id,
                     Media.recipient_id == user_id
                 )
             )
         ).first()
+        
+        if media:
+            return media
+            
+        # 2. Try stripping extension and matching on media_id
+        if isinstance(media_id, str) and '.' in media_id:
+            stripped_id = media_id.split('.')[0]
+            media = db.query(Media).filter(
+                and_(
+                    Media.media_id == stripped_id,
+                    or_(
+                        Media.sender_id == user_id,
+                        Media.recipient_id == user_id
+                    )
+                )
+            ).first()
+            if media:
+                return media
+                
+        # 3. Try numeric ID if possible
+        if isinstance(media_id, int) or (isinstance(media_id, str) and media_id.isdigit()):
+            return db.query(Media).filter(
+                and_(
+                    Media.id == int(media_id),
+                    or_(
+                        Media.sender_id == user_id,
+                        Media.recipient_id == user_id
+                    )
+                )
+            ).first()
+            
+        return None
     
     @staticmethod
     def mark_media_downloaded(db: Session, media_id: int) -> bool:
@@ -2396,6 +2429,20 @@ async def get_user_public_key(username: str,
         logger.error(f"Get public key error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve public key")
 
+@app.post("/users/update_public_key")
+async def update_public_key(public_key: str = Body(..., embed=True),
+                            current_user: User = Depends(get_current_user),
+                            db: Session = Depends(get_database_session)):
+    """Update current user's public key"""
+    try:
+        current_user.public_key = public_key
+        db.commit()
+        logger.info(f"🔑 Public key updated for user: {current_user.username}")
+        return {"message": "Public key updated successfully"}
+    except Exception as e:
+        logger.error(f"Update public key error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update public key")
+
 def normalize_phone_number(phone: str) -> str:
     """Normalize phone number by removing spaces, hyphens, parentheses, and handling country code variations"""
     if not phone:
@@ -3093,7 +3140,7 @@ async def get_media_inbox(
 
 @app.get("/media/{media_id}")
 async def get_media_file(
-    media_id: int,
+    media_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
@@ -3126,7 +3173,7 @@ async def get_media_file(
             encoded_content = base64.b64encode(encrypted_content).decode('utf-8')
             
             # Mark as downloaded
-            MediaService.mark_media_downloaded(db, media_id)
+            MediaService.mark_media_downloaded(db, media.id)
             
             # Auto-delete from server after viewing (one-time view, user cannot go back)
             MediaService.delete_media_file_from_disk(media.encrypted_file_path)
@@ -3341,6 +3388,7 @@ async def upload_raw_media(
     file: UploadFile = File(...),
     disappear_after_hours: Optional[int] = Form(None),
     content_type: Optional[str] = Form(None),
+    encryption_metadata: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_database_session)
@@ -3349,7 +3397,16 @@ async def upload_raw_media(
     Endpoint for direct raw media upload without base64 encoding
     """
     try:
+        # Parse encryption metadata if provided
+        metadata_json = None
+        if encryption_metadata:
+            try:
+                metadata_json = json.loads(encryption_metadata)
+            except Exception as e:
+                logger.warning(f"Failed to parse encryption metadata: {e}")
+        
         # Get recipient user by username
+
         recipient = db.query(User).filter(User.username == username, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
@@ -3413,12 +3470,14 @@ async def upload_raw_media(
             media_type=mediaListType,
             content_type=content_type or file.content_type or "application/octet-stream",
             encrypted_file_path=file_path,
+            encryption_metadata=metadata_json,
             message_id=message.id,
             sender_id=sender_id,
             recipient_id=recipient.id,
             expires_at=expires_at,
             auto_delete=auto_delete
         )
+
         
         db.add(media)
         db.commit()
