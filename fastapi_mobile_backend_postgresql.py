@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, File, Form, UploadFile, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, File, Form, UploadFile, Response, WebSocket, WebSocketDisconnect, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -44,7 +44,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -92,8 +92,20 @@ class AdminCreateUser(BaseModel):
     phone_number: str = Field(..., min_length=10, max_length=20, description="User's phone number")
     token: str = Field(..., description="User authentication token")
 
+class AdminUpdateUser(BaseModel):
+    username: Optional[str] = Field(None, min_length=3, max_length=50)
+    phone_number: Optional[str] = Field(None, min_length=10, max_length=20)
+    token: Optional[str] = Field(None)
+    is_active: Optional[bool] = Field(None)
+
 class UserLogin(UserAuth):
     pass  # Same as auth - just username and token
+
+class GroupMessageSend(BaseModel):
+    group_id: int = Field(..., description="ID of the group to send message to")
+    message: str = Field(..., min_length=1, description="Message content")
+    addressed_to_username: Optional[str] = Field(None, description="Admin ONLY: Address message to a specific user in the group")
+    disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
 
 class MessageSend(BaseModel):
     username: str = Field(..., description="Recipient username")
@@ -112,10 +124,12 @@ class MessageResponse(BaseModel):
     sender: str
     recipient: str
     content: str
+    is_admin_announcement: bool = Field(default=False)
     content_type: str = Field(default="TLS 1.3 + AES-256-GCM + RSA-4096")
     timestamp: datetime
     delivered: bool
     read: bool
+    read_by: Optional[List[str]] = []
     server_hmac: bool = Field(default=True, description="Message authentication status")
     decrypt_time: float = Field(default=0.0, description="Time taken to decrypt in seconds")
 
@@ -166,11 +180,43 @@ class MediaResponse(BaseModel):
     content_type: str
     file_size: int
     sender: str
-    recipient: str
+    recipient: Optional[str] = None # Optional for group media
+    group_id: Optional[int] = None # Added for group media
     timestamp: datetime
     expires_at: Optional[datetime]
     auto_delete: bool
     downloaded: bool
+
+# Group Chat Models
+class GroupCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=255)
+    members: List[str] = Field(..., description="List of participant usernames")
+
+class AdminGroupUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=255)
+    members: Optional[List[str]] = Field(None, description="List of participant usernames")
+
+class GroupResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    created_at: datetime
+    created_by: int
+    member_count: int
+
+class GroupMemberResponse(BaseModel):
+    user_id: int
+    username: str
+    role: str
+    joined_at: datetime
+
+class GroupMessageSend(BaseModel):
+    group_id: int
+    message: str
+    addressed_to_username: Optional[str] = None
+    disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
 
 # Call signaling models
 class CallRequest(BaseModel):
@@ -256,33 +302,23 @@ class MessageService:
     """Service class for message operations"""
     
     @staticmethod
-    def send_message(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = None) -> Message:
-        """Send a message - simplified"""
-        return MessageService.send_message_by_username(db, sender_id, recipient_username, message_content, disappear_after_hours)
-    
-    @staticmethod
     def send_message_by_username(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = None) -> Message:
-        """Send a message by username - simplified"""
-        # Get recipient by username
+        """Send a message to a specific user by username"""
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
-        # Generate decoy text for the message
         try:
             decoy_text = FakeTextGenerator.generate_decoy_text_for_message(message_content)
         except Exception as e:
-            print(f"⚠️  Error generating decoy text: {e}")
             decoy_text = "[ENCRYPTED MESSAGE] Tap to decrypt"
         
-        # Calculate expiration time if disappearing message
         expires_at = None
         auto_delete = False
         if disappear_after_hours is not None and disappear_after_hours > 0:
             expires_at = datetime.now(timezone.utc) + timedelta(hours=disappear_after_hours)
             auto_delete = True
         
-        # Create message - simplified
         message = Message(
             sender_id=sender_id,
             recipient_id=recipient.id,
@@ -290,32 +326,72 @@ class MessageService:
             content_type="encrypted",
             delivered=False,
             read=False,
-            is_offline=True,  # Mark as offline initially
+            is_offline=True,
             expires_at=expires_at,
-            auto_delete=auto_delete
+            auto_delete=auto_delete,
+            decoy_content=decoy_text
         )
-        
-        # Try to set decoy_content, but handle case where column might not exist yet
-        try:
-            setattr(message, 'decoy_content', decoy_text)
-        except Exception as e:
-            print(f"⚠️  Could not set decoy_content: {e}")
-            # Continue without setting decoy_content
         
         db.add(message)
         db.commit()
         db.refresh(message)
+        return message
+
+    @staticmethod
+    def send_message_to_group(db: Session, sender_id: int, group_id: int, message_content: str, 
+                             disappear_after_hours: Optional[int] = None, 
+                             addressed_to_id: Optional[int] = None,
+                             is_admin_announcement: bool = False) -> Message:
+        """Send a message to a group"""
+        # Verify sender is a member
+        membership = db.query(GroupMember).filter(
+            GroupMember.group_id == group_id, 
+            GroupMember.user_id == sender_id
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="You are not a member of this group")
+            
+        try:
+            decoy_text = FakeTextGenerator.generate_decoy_text_for_message(message_content)
+        except Exception:
+            decoy_text = "[ENCRYPTED GROUP MESSAGE] Tap to decrypt"
+            
+        expires_at = None
+        auto_delete = False
+        if disappear_after_hours and disappear_after_hours > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=disappear_after_hours)
+            auto_delete = True
+            
+        message = Message(
+            sender_id=sender_id,
+            group_id=group_id,
+            recipient_id=addressed_to_id,
+            encrypted_content=message_content,
+            content_type="encrypted",
+            is_admin_announcement=is_admin_announcement,
+            delivered=True,
+            read=False,
+            expires_at=expires_at,
+            auto_delete=auto_delete,
+            decoy_content=decoy_text
+        )
         
-        logger.info(f"📤 Message sent: {sender_id} → {recipient.id}")
+        db.add(message)
+        db.commit()
+        db.refresh(message)
         return message
     
     @staticmethod
     def get_user_messages(db: Session, user_id: int, limit: int = 50) -> List[Message]:
-        """Get messages for a user (inbox)"""
+        """Get all messages for a user (direct and group)"""
+        # Get IDs of groups the user is in
+        group_ids = [m.group_id for m in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()]
+        
         return db.query(Message).filter(
             or_(
                 Message.recipient_id == user_id,
-                Message.sender_id == user_id
+                Message.sender_id == user_id,
+                Message.group_id.in_(group_ids) if group_ids else False
             )
         ).order_by(Message.timestamp.desc()).limit(limit).all()
     
@@ -335,7 +411,6 @@ class MessageService:
         """Mark message as delivered"""
         message = db.query(Message).filter(Message.id == message_id).first()
         if message:
-            # Use setattr for SQLAlchemy models to avoid type errors
             setattr(message, 'delivered', True)
             setattr(message, 'is_offline', False)
             db.commit()
@@ -347,12 +422,185 @@ class MessageService:
         """Mark message as read"""
         message = db.query(Message).filter(Message.id == message_id).first()
         if message:
-            # Use setattr for SQLAlchemy models to avoid type errors
             setattr(message, 'read', True)
             setattr(message, 'read_timestamp', datetime.now(timezone.utc))
             db.commit()
             return True
         return False
+
+class GroupService:
+    """Service class for group operations"""
+    
+    @staticmethod
+    def create_group(db: Session, creator_id: int, name: str, description: Optional[str], member_usernames: List[str]) -> Group:
+        """Create a new group and add initial members"""
+        group = Group(name=name, description=description, created_by=creator_id)
+        db.add(group)
+        db.commit()
+        db.refresh(group)
+        
+        # Add creator as admin
+        creator_member = GroupMember(group_id=group.id, user_id=creator_id, role="admin")
+        db.add(creator_member)
+        
+        # Add other members
+        for username in member_usernames:
+            user = db.query(User).filter(User.username == username, User.is_active == True).first()
+            if user and user.id != creator_id:
+                member = GroupMember(group_id=group.id, user_id=user.id, role="member")
+                db.add(member)
+        
+        db.commit()
+        db.refresh(group)
+        
+        # Send notification message in the group
+        creator = db.query(User).filter(User.id == creator_id).first()
+        creator_name = str(getattr(creator, 'username', 'Admin'))
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        
+        notification_text = f"📢 Group '{name}' created by {creator_name}.\nWelcome all members! (Created on {now_str})"
+        MessageService.send_message_to_group(db, creator_id, group.id, notification_text, is_admin_announcement=True)
+        
+        AuditService.log_event(db, creator_id, "group_created", f"Group '{name}' created with ID {group.id}")
+        return group
+    
+    @staticmethod
+    def get_user_groups(db: Session, user_id: int) -> List[Group]:
+        """Get all groups a user belongs to"""
+        return db.query(Group).join(GroupMember).filter(GroupMember.user_id == user_id).all()
+        
+    @staticmethod
+    def get_group_members(db: Session, group_id: int) -> List[Dict]:
+        """Get all members of a group with their usernames"""
+        members = db.query(GroupMember, User.username).join(User, GroupMember.user_id == User.id).filter(GroupMember.group_id == group_id).all()
+        return [{"user_id": m[0].user_id, "username": m[1], "role": m[0].role, "joined_at": m[0].joined_at} for m in members]
+
+    @staticmethod
+    def add_member(db: Session, group_id: int, username: str, actor_id: int) -> bool:
+        """Add a member to a group (must be an admin or the group creator)"""
+        # Check permissions
+        actor_member = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == actor_id).first()
+        if not actor_member or actor_member.role != "admin":
+            raise HTTPException(status_code=403, detail="Only admins can add members")
+            
+        user = db.query(User).filter(User.username == username, User.is_active == True).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        # Check if already a member
+        existing = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user.id).first()
+        if existing:
+            return True
+            
+        member = GroupMember(group_id=group_id, user_id=user.id)
+        db.add(member)
+        db.commit()
+        
+        # Send notification message
+        actor = db.query(User).filter(User.id == actor_id).first()
+        actor_name = str(getattr(actor, 'username', 'Admin'))
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        
+        group = db.query(Group).filter(Group.id == group_id).first()
+        group_name = str(getattr(group, 'name', 'this group'))
+        
+        notification_text = f"👤 {username} has been added to '{group_name}' by {actor_name}.\nJoin date: {now_str}"
+        MessageService.send_message_to_group(db, actor_id, group_id, notification_text, addressed_to_id=user.id, is_admin_announcement=True)
+        
+        # Send a private DM notification as well
+        dm_text = f"👋 Hello! I've added you to the group '{group_name}'. You can find it in your Groups tab."
+        recipient_username = str(getattr(user, 'username', ''))
+        MessageService.send_message_by_username(db, actor_id, recipient_username, dm_text)
+        
+        return True
+
+    @staticmethod
+    def leave_group(db: Session, group_id: int, user_id: int) -> bool:
+        """Allow a user to leave a group"""
+        membership = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user_id).first()
+        if not membership:
+            return False
+            
+        # Log before deletion
+        user = db.query(User).filter(User.id == user_id).first()
+        username = str(getattr(user, 'username', 'User'))
+        
+        db.delete(membership)
+        db.commit()
+        
+        # Send notification message (using system/ghost sender if possible, otherwise use user_id before deletion? No, user is gone from members).
+        # We can use the user_id even if they left.
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        notification_text = f"🚪 {username} has left the group.\nDate: {now_str}"
+        # We try to send this message. 
+        # Note: if it's the last member, this might be weird but fine.
+        try:
+            MessageService.send_message_to_group(db, user_id, group_id, notification_text)
+        except:
+            pass
+            
+        AuditService.log_event(db, user_id, "group_leave", f"User {username} left group {group_id}")
+        return True
+
+    @staticmethod
+    def delete_group(db: Session, group_id: int, creator_id: int) -> bool:
+        """Delete a group and its messages/members (admin only)"""
+        group = db.query(Group).filter(Group.id == group_id).first()
+        if not group:
+            return False
+            
+        # Delete messages in the group
+        db.query(Message).filter(Message.group_id == group_id).delete()
+        
+        # Delete media in the group
+        db.query(Media).filter(Media.group_id == group_id).delete()
+        
+        # Delete members
+        db.query(GroupMember).filter(GroupMember.group_id == group_id).delete()
+        
+        # Delete group
+        db.delete(group)
+        db.commit()
+        
+        AuditService.log_event(db, creator_id, "group_deleted", f"Group ID {group_id} deleted by admin")
+        return True
+
+    @staticmethod
+    def update_group(db: Session, group_id: int, name: Optional[str], description: Optional[str], member_usernames: Optional[List[str]], actor_id: int) -> bool:
+        """Update group details and membership (admin only)"""
+        group = db.query(Group).filter(Group.id == group_id).first()
+        if not group:
+            return False
+            
+        if name:
+            group.name = name
+        if description is not None:
+            group.description = description
+            
+        if member_usernames is not None:
+            # Sync members: remove existing, add new list
+            # Skip creator preservation if admin is doing the sync, unless desired
+            db.query(GroupMember).filter(GroupMember.group_id == group_id).delete()
+            
+            # Re-add members from the new list
+            for username in member_usernames:
+                user = db.query(User).filter(User.username == username, User.is_active == True).first()
+                if user:
+                    # Check if they were already added in this loop (usernames might not be unique in input)
+                    existing = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user.id).first()
+                    if not existing:
+                        role = "admin" if user.id == group.created_by else "member"
+                        member = GroupMember(group_id=group_id, user_id=user.id, role=role)
+                        db.add(member)
+            
+        db.commit()
+        AuditService.log_event(db, actor_id, "group_updated", f"Group '{group.name}' (ID {group_id}) updated by admin")
+        return True
+
+    @staticmethod
+    def get_all_groups(db: Session) -> List[Group]:
+        """Get all groups (admin only)"""
+        return db.query(Group).all()
     
     @staticmethod
     def delete_expired_messages(db: Session) -> int:
@@ -1222,13 +1470,18 @@ class AdminService:
     
     @staticmethod
     def authenticate_user(db: Session, username: str, token: str, ip_address: Optional[str] = None) -> Optional[User]:
-        """Authenticate user with username and token, update last login"""
+        """Authenticate user by username and token, or admin by password (passed as token)"""
+        # 1. Try token authentication first
         user = db.query(User).filter(
             User.username == username, 
             User.token == token,
             User.is_active == True
         ).first()
         
+        # 2. If token fails, try treating the 'token' as an admin password
+        if not user:
+            user = AdminService.authenticate_admin(db, username, token, ip_address)
+            
         if user:
             # Use setattr for SQLAlchemy models
             setattr(user, 'last_login', datetime.now(timezone.utc))
@@ -1339,6 +1592,48 @@ class AdminService:
         
         logger.info(f"✅ User registered by admin: {user_data.phone_number}")
         return user
+
+    @staticmethod
+    def update_user(db: Session, admin_user_id: int, phone_number: str, user_data: AdminUpdateUser) -> User:
+        """Update an existing user (admin only)"""
+        # Check if requesting user is admin
+        if not AdminService.is_admin(db, admin_user_id):
+            raise HTTPException(status_code=403, detail="Only admin users can update accounts")
+        
+        # Find user
+        user = db.query(User).filter(User.phone_number == phone_number).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Update fields if provided
+        if user_data.username is not None:
+            user.username = user_data.username
+        if user_data.phone_number is not None:
+            # Check if new phone number already exists
+            if user_data.phone_number != phone_number:
+                existing = db.query(User).filter(User.phone_number == user_data.phone_number).first()
+                if existing:
+                    raise HTTPException(status_code=400, detail="New phone number already in use")
+            user.phone_number = user_data.phone_number
+        if user_data.token is not None:
+            # Enforce token uniqueness
+            existing_token_user = db.query(User).filter(User.token == user_data.token, User.id != user.id).first()
+            if existing_token_user:
+                raise HTTPException(status_code=400, detail="Token already in use by another user")
+            user.token = user_data.token
+        if user_data.is_active is not None:
+            user.is_active = user_data.is_active
+            
+        db.commit()
+        db.refresh(user)
+        
+        # Log update
+        AuditService.log_event(
+            db, admin_user_id, "admin_update_user", 
+            f"User {phone_number} updated by admin"
+        )
+        
+        return user
     
     @staticmethod
     def delete_user(db: Session, admin_user_id: int, phone_number: str) -> bool:
@@ -1359,86 +1654,63 @@ class AdminService:
         # Get user ID for logging
         user_id = getattr(user, 'id', None)
         
-        # Delete associated data first due to foreign key constraints
-        # Delete audit logs associated with the user
-        db.query(AuditLog).filter(AuditLog.user_id == user_id).delete()
-        
-        # Delete user sessions
-        db.query(UserSession).filter(UserSession.user_id == user_id).delete()
-        
-        # Delete user keys
-        db.query(UserKey).filter(UserKey.user_id == user_id).delete()
-        
-        # Delete user master tokens
-        db.query(DBMasterToken).filter(DBMasterToken.user_id == user_id).delete()
-        
-        # Delete media files associated with user FIRST (to avoid foreign key constraint violations)
-        media_files = db.query(Media).filter(
-            or_(Media.sender_id == user_id, Media.recipient_id == user_id)
-        ).all()
-import os
-import time
-import hashlib
-from typing import Dict, Optional
-
-from sqlalchemy.orm import Session
-from fastapi import FastAPI, HTTPException, Depends, Body
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timezone
-import logging
-
-from database_config import db_config
-
-# Initialize logger
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Function to delete a user account
-def delete_user(db: Session, user_id: int, admin_user_id: int) -> bool:
-    user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
-    if not user:
-        logger.error(f"User {user_id} not found or is already inactive")
-        return False
-    
-    phone_number = user.phone_number
-    
-    # Delete all associated media files
-    media_files = db.query(Media).filter(Media.user_id == user_id).all()
-    
-    for media in media_files:
-        # Delete encrypted file from filesystem
         try:
-            file_path = getattr(media, 'encrypted_file_path', '')
-            if file_path and os.path.exists(file_path):
-                os.remove(file_path)
+            # 1. Remove from group memberships
+            db.query(GroupMember).filter(GroupMember.user_id == user_id).delete()
+            
+            # 2. Delete audit logs associated with the user
+            db.query(AuditLog).filter(AuditLog.user_id == user_id).delete()
+            
+            # 3. Delete user sessions
+            db.query(UserSession).filter(UserSession.user_id == user_id).delete()
+            
+            # 4. Delete user keys
+            db.query(UserKey).filter(UserKey.user_id == user_id).delete()
+            
+            # 5. Delete user master tokens
+            db.query(DBMasterToken).filter(DBMasterToken.user_id == user_id).delete()
+            
+            # 6. Delete media files (filesystem and DB)
+            media_files = db.query(Media).filter(
+                or_(Media.sender_id == user_id, Media.recipient_id == user_id)
+            ).all()
+            
+            for media in media_files:
+                file_path = getattr(media, 'encrypted_file_path', None)
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except Exception as e:
+                        logger.error(f"Error deleting file {file_path}: {e}")
+                db.delete(media)
+            
+            # 7. Delete messages
+            db.query(Message).filter(
+                or_(Message.sender_id == user_id, Message.recipient_id == user_id)
+            ).delete()
+            
+            # 8. Delete calls
+            db.query(Call).filter(
+                or_(Call.caller_id == user_id, Call.recipient_id == user_id)
+            ).delete()
+            
+            # 9. Finally delete the user
+            db.delete(user)
+            db.commit()
+            
+            # Log deletion
+            AuditService.log_event(
+                db, admin_user_id, "admin_delete_user", 
+                f"User {phone_number} and all associated data deleted by admin"
+            )
+            
+            logger.info(f"✅ User deleted by admin: {phone_number}")
+            return True
+            
         except Exception as e:
-            logger.error(f"Error deleting media file: {e}")
-        
-        # Delete media record
-        db.delete(media)
-    
-    # Commit the media deletions to avoid foreign key constraint violations
-    db.commit()
-    
-    # Delete messages sent by user
-    db.query(Message).filter(Message.sender_id == user_id).delete()
-    
-    # Delete messages received by user
-    db.query(Message).filter(Message.recipient_id == user_id).delete()
-    
-    # Log the deletion (after all associated data is deleted)
-    AuditService.log_event(
-        db, admin_user_id, "account_deleted_by_admin", 
-        f"User account {phone_number} deleted by admin user {admin_user_id}"
-    )
-    
-    # Finally delete the user
-    db.delete(user)
-    db.commit()
-    
-    logger.info(f"✅ User account and all associated data deleted by admin: {phone_number}")
-    return True
+            db.rollback()
+            logger.error(f"Error deleting user {phone_number}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to delete user: {str(e)}")
 
 # FastAPI app with lifespan
 @asynccontextmanager
@@ -1604,6 +1876,38 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             )
         
         return user
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Auth error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication failed",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+# Add admin authentication dependency
+async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
+                        db: Session = Depends(get_database_session)) -> User:
+    """Get current authenticated admin user"""
+    try:
+        user = await get_current_user(credentials, db)
+        if not user.is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only admin users can access this endpoint"
+            )
+        return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin auth error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Admin authentication failed",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
         
     except Exception as e:
         logger.error(f"Authentication error: {e}")
@@ -1924,9 +2228,14 @@ async def get_status(db: Session = Depends(get_database_session)):
 async def login_user(login_data: UserLogin, db: Session = Depends(get_database_session)):
     """Login user with username and token - simplified JSON: {username, token}"""
     try:
-        user = AdminService.authenticate_user(db, login_data.username, login_data.token, ip_address="mobile_app")
+        user = AdminService.authenticate_user(
+            db, 
+            login_data.username, 
+            login_data.token, 
+            ip_address="mobile_app"
+        )
         if not user:
-            raise HTTPException(status_code=401, detail="Invalid username or token")
+            raise HTTPException(status_code=401, detail="Invalid username, token, or password")
         
         # Create session
         user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
@@ -1934,7 +2243,8 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
         
         return {
             "username": str(getattr(user, 'username', '')),
-            "token": str(getattr(session, 'session_token', ''))
+            "token": str(getattr(session, 'session_token', '')),
+            "is_admin": bool(getattr(user, 'is_admin', False))
         }
         
     except HTTPException:
@@ -2197,7 +2507,9 @@ async def get_inbox(current_user: User = Depends(get_current_user),
             result.append({
                 "id": int(getattr(msg, 'id', 0)),
                 "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
-                "recipient": str(getattr(recipient, 'username', '')) if recipient else "unknown",
+                "recipient": str(getattr(recipient, 'username', '')) if recipient else "group",
+                "group_id": int(getattr(msg, 'group_id', 0)) if getattr(msg, 'group_id', None) else None,
+                "is_admin_announcement": bool(getattr(msg, 'is_admin_announcement', False)),
                 "content": str(getattr(msg, 'encrypted_content', '')),
                 "content_type": str(getattr(msg, 'content_type', '')),
                 "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
@@ -2243,6 +2555,7 @@ async def get_conversation(
                 "id": int(getattr(msg, 'id', 0)),
                 "sender": current_username if msg.sender_id == user_id else partner_username,
                 "recipient": partner_username if msg.sender_id == user_id else current_username,
+                "is_admin_announcement": bool(getattr(msg, 'is_admin_announcement', False)),
                 "content": str(getattr(msg, 'encrypted_content', '')),
                 "content_type": str(getattr(msg, 'content_type', '')),
                 "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
@@ -2387,6 +2700,319 @@ async def get_users(current_user: User = Depends(get_current_user),
         users = UserService.get_all_users(db)
         
         result = []
+        for user in users:
+            result.append({
+                "username": str(getattr(user, "username", "")),
+                "is_active": bool(getattr(user, "is_active", True))
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching users: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch users")
+
+# --- Group Chat Endpoints ---
+
+@app.post("/groups/create", response_model=GroupResponse)
+async def create_group_route(
+    group_data: GroupCreate,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Create a new group chat (admin only)"""
+    try:
+        admin_user_id = int(getattr(current_user, 'id', 0))
+        group = GroupService.create_group(
+            db, admin_user_id, group_data.name, group_data.description, group_data.members
+        )
+        
+        return {
+            "id": int(group.id),
+            "name": str(group.name),
+            "description": group.description,
+            "created_at": group.created_at,
+            "created_by": int(group.created_by),
+            "member_count": len(group.members)
+        }
+    except Exception as e:
+        logger.error(f"Group creation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create group: {str(e)}")
+
+@app.get("/groups", response_model=List[GroupResponse])
+async def get_groups(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Get all groups the user belongs to"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        groups = GroupService.get_user_groups(db, user_id)
+        
+        result = []
+        for g in groups:
+            result.append({
+                "id": int(g.id),
+                "name": str(g.name),
+                "description": g.description,
+                "created_at": g.created_at,
+                "created_by": int(g.created_by),
+                "member_count": len(g.members)
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Get groups error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve groups")
+
+@app.get("/groups/{group_id}", response_model=GroupResponse)
+async def get_group_details(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Get details of a specific group"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        # Verify user is a member or admin
+        membership = db.query(GroupMember).filter(
+            GroupMember.group_id == group_id, 
+            GroupMember.user_id == user_id
+        ).first()
+        
+        is_sys_admin = bool(getattr(current_user, 'is_admin', False))
+        
+        if not membership and not is_sys_admin:
+            raise HTTPException(status_code=403, detail="You are not a member of this group")
+            
+        g = db.query(Group).filter(Group.id == group_id).first()
+        if not g:
+            raise HTTPException(status_code=404, detail="Group not found")
+            
+        return {
+            "id": int(g.id),
+            "name": str(g.name),
+            "description": g.description,
+            "created_at": g.created_at,
+            "created_by": int(g.created_by),
+            "member_count": len(g.members)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get group details error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve group details")
+
+@app.get("/groups/{group_id}/members", response_model=List[GroupMemberResponse])
+async def get_group_members(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Get members of a specific group"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        # Verify user is a member
+        membership = db.query(GroupMember).filter(
+            GroupMember.group_id == group_id, 
+            GroupMember.user_id == user_id
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="You are not a member of this group")
+            
+        return GroupService.get_group_members(db, group_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get group members error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve group members")
+
+@app.post("/groups/{group_id}/leave")
+async def leave_group(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Leave a group"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        success = GroupService.leave_group(db, group_id, user_id)
+        if success:
+            return {"message": "Successfully left the group"}
+        else:
+            raise HTTPException(status_code=400, detail="Failed to leave group (maybe not a member)")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Leave group error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to leave group")
+async def add_group_member(
+    group_id: int,
+    username: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Add a user to a group"""
+    try:
+        actor_id = int(getattr(current_user, 'id', 0))
+        success = GroupService.add_member(db, group_id, username, actor_id)
+        if success:
+            return {"message": f"User {username} added to group"}
+        else:
+            raise HTTPException(status_code=400, detail="Failed to add member")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Add group member error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to add group member")
+
+@app.get("/groups/{group_id}/messages", response_model=List[MessageResponse])
+async def get_group_messages(
+    group_id: int,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Get all messages for a specific group"""
+    user_id = int(getattr(current_user, 'id', 0))
+    # Check if user is a member
+    membership = db.query(GroupMember).filter(
+        GroupMember.group_id == group_id, 
+        GroupMember.user_id == user_id
+    ).first()
+    if not membership:
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+        
+    messages = db.query(Message).filter(
+        Message.group_id == group_id
+    ).order_by(Message.timestamp.desc()).limit(limit).all()
+    
+    # Map messages to response model
+    result = []
+    for m in messages:
+        sender_user = db.query(User).filter(User.id == m.sender_id).first()
+        
+        # Get who read this message
+        read_by_users = db.query(User.username).join(
+            GroupMessageRead, User.id == GroupMessageRead.user_id
+        ).filter(GroupMessageRead.message_id == m.id).all()
+        read_by_list = [u.username for u in read_by_users]
+        
+        result.append({
+            "id": int(m.id),
+            "sender": str(getattr(sender_user, 'username', 'Unknown')),
+            "recipient": "group",
+            "content": str(m.encrypted_content),
+            "content_type": str(m.content_type),
+            "timestamp": m.timestamp,
+            "delivered": bool(m.delivered),
+            "read": user_id in [u.user_id for u in db.query(GroupMessageRead.user_id).filter(GroupMessageRead.message_id == m.id).all()],
+            "read_by": read_by_list,
+            "is_admin_announcement": bool(getattr(m, 'is_admin_announcement', False)),
+            "decoy_content": str(getattr(m, 'decoy_content', '')),
+            "group_id": int(group_id)
+        })
+    return result
+
+@app.post("/messages/group/send")
+async def send_group_message(
+    payload: GroupMessageSend,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Send a message to a group"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        is_admin = bool(getattr(current_user, 'is_admin', False))
+        
+        addressed_to_id = None
+        is_announcement = False
+        
+        if payload.addressed_to_username:
+            if not is_admin:
+                raise HTTPException(status_code=403, detail="Only admins can address group messages to individuals")
+            
+            # Find the user
+            target_user = db.query(User).filter(User.username == payload.addressed_to_username, User.is_active == True).first()
+            if not target_user:
+                raise HTTPException(status_code=404, detail="Target user for announcement not found")
+            
+            addressed_to_id = target_user.id
+            is_announcement = True
+            
+        message = MessageService.send_message_to_group(
+            db, user_id, payload.group_id, payload.message, 
+            payload.disappear_after_hours, addressed_to_id, is_announcement
+        )
+        
+        # Notify all group members via WebSocket
+        members = db.query(GroupMember).filter(GroupMember.group_id == payload.group_id).all()
+        sender_username = str(getattr(current_user, 'username', ''))
+        
+        notification = {
+            "type": "new_group_message",
+            "data": {
+                "message_id": int(message.id),
+                "group_id": int(payload.group_id),
+                "sender_username": sender_username,
+                "recipient_username": payload.addressed_to_username if payload.addressed_to_username else "group",
+                "is_admin_announcement": is_announcement,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "decoy_content": getattr(message, 'decoy_content', '')
+            }
+        }
+        
+        for member in members:
+            if member.user_id != user_id:
+                await ws_manager.send_to_user(member.user_id, notification)
+                
+        return {
+            "status": "sent",
+            "message_id": int(message.id)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Send group message error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send group message")
+
+@app.get("/messages/group/{group_id}")
+async def get_group_conversation(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Get all messages in a group"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        # Verify membership
+        membership = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user_id).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="Not a member of this group")
+            
+        msgs = db.query(Message).filter(Message.group_id == group_id).order_by(Message.timestamp.asc()).limit(200).all()
+        
+        result = []
+        for msg in msgs:
+            sender = db.query(User).filter(User.id == msg.sender_id).first()
+            recipient = None
+            if msg.recipient_id:
+                recipient = db.query(User).filter(User.id == msg.recipient_id).first()
+                
+            result.append({
+                "id": int(getattr(msg, 'id', 0)),
+                "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
+                "recipient": str(getattr(recipient, 'username', '')) if recipient else "group",
+                "is_admin_announcement": bool(getattr(msg, 'is_admin_announcement', False)),
+                "content": str(getattr(msg, 'encrypted_content', '')),
+                "content_type": str(getattr(msg, 'content_type', '')),
+                "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
+                "decoy_content": getattr(msg, 'decoy_content', '')
+            })
+            
+        return {"messages": result, "count": len(result)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Group conversation fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve group conversation")
         current_user_id = int(getattr(current_user, 'id', 0))
         for user in users:
             user_id = int(getattr(user, 'id', 0))
@@ -2456,41 +3082,6 @@ def normalize_phone_number(phone: str) -> str:
         cleaned = cleaned[1:]
     
     return cleaned
-
-# Add admin authentication dependency
-async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
-                        db: Session = Depends(get_database_session)) -> User:
-    """Get current authenticated admin user"""
-    try:
-        token = credentials.credentials
-        
-        # Validate session
-        session = SessionService.validate_session(db, token)
-        if not session:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired session",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        
-        # Get user
-        user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.is_admin == True).first()
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Admin user not found",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        
-        return user
-        
-    except Exception as e:
-        logger.error(f"Admin authentication error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate admin credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
 
 @app.get("/admin/users/{username}/registration_details", response_model=AdminUserRegistrationDetails)
 async def admin_get_user_registration_details(username: str,
@@ -3341,6 +3932,93 @@ async def admin_delete_user(phone_number: str,
         logger.error(f"Admin delete user error: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete user account")
 
+@app.put("/admin/users/{phone_number}")
+async def admin_update_user(phone_number: str,
+                           user_data: AdminUpdateUser,
+                           current_user: User = Depends(get_admin_user),
+                           db: Session = Depends(get_database_session)):
+    """Update a user account (admin only)"""
+    try:
+        admin_user_id = int(getattr(current_user, 'id', 0))
+        updated_user = AdminService.update_user(db, admin_user_id, phone_number, user_data)
+        
+        return {
+            "username": str(getattr(updated_user, 'username', '')),
+            "phone_number": str(getattr(updated_user, 'phone_number', '')),
+            "message": "User updated successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin update user error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update user")
+
+# --- Admin Group Management Routes ---
+
+@app.get("/admin/groups", response_model=List[GroupResponse])
+async def admin_get_all_groups(current_user: User = Depends(get_admin_user),
+                              db: Session = Depends(get_database_session)):
+    """Get all groups (admin only)"""
+    try:
+        groups = GroupService.get_all_groups(db)
+        
+        result = []
+        for g in groups:
+            result.append({
+                "id": int(g.id),
+                "name": str(g.name),
+                "description": g.description,
+                "created_at": g.created_at,
+                "created_by": int(g.created_by),
+                "member_count": len(g.members)
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Admin list groups error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list groups")
+
+@app.put("/admin/groups/{group_id}")
+async def admin_update_group(group_id: int,
+                            group_data: AdminGroupUpdate,
+                            current_user: User = Depends(get_admin_user),
+                            db: Session = Depends(get_database_session)):
+    """Update a group (admin only)"""
+    try:
+        admin_user_id = int(getattr(current_user, 'id', 0))
+        success = GroupService.update_group(
+            db, group_id, group_data.name, group_data.description, group_data.members, admin_user_id
+        )
+        
+        if success:
+            return {"message": "Group updated successfully"}
+        else:
+            raise HTTPException(status_code=404, detail="Group not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin update group error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update group: {str(e)}")
+
+@app.delete("/admin/groups/{group_id}")
+async def admin_delete_group(group_id: int,
+                            current_user: User = Depends(get_admin_user),
+                            db: Session = Depends(get_database_session)):
+    """Delete a group (admin only)"""
+    try:
+        admin_user_id = int(getattr(current_user, 'id', 0))
+        success = GroupService.delete_group(db, group_id, admin_user_id)
+        
+        if success:
+            return {"message": "Group deleted successfully", "deleted": True}
+        else:
+            raise HTTPException(status_code=404, detail="Group not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin delete group error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete group: {str(e)}")
+
 @app.get("/admin/users")
 async def admin_get_all_users(current_user: User = Depends(get_admin_user),
                              db: Session = Depends(get_database_session)):
@@ -3358,6 +4036,7 @@ async def admin_get_all_users(current_user: User = Depends(get_admin_user),
             last_login = getattr(user, 'last_login', None)
             registered = getattr(user, 'registered', datetime.now(timezone.utc))
             result.append({
+                "id": int(getattr(user, 'id', 0)),
                 "phone_number": str(getattr(user, 'phone_number', '')),
                 "username": str(getattr(user, 'username', '')),
                 "registered": registered.isoformat() if registered else datetime.now(timezone.utc).isoformat(),

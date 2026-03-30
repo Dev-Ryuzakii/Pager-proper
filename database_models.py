@@ -49,7 +49,8 @@ class User(Base):
     received_messages = relationship("Message", foreign_keys="Message.recipient_id", back_populates="recipient")
     user_keys = relationship("UserKey", back_populates="user")
     sessions = relationship("UserSession", back_populates="user")
-    master_tokens = relationship("MasterToken", back_populates="user")  # Add this line
+    master_tokens = relationship("MasterToken", back_populates="user")
+    group_memberships = relationship("GroupMember", back_populates="user")
     
     def __repr__(self):
         return f"<User(phone='{self.phone_number}', username='{self.username}', type='{self.user_type}', admin={self.is_admin})>"
@@ -60,7 +61,8 @@ class Message(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
     
     # Message content (encrypted)
     encrypted_content = Column(Text, nullable=False)
@@ -88,10 +90,16 @@ class Message(Base):
     delivery_attempts = Column(Integer, default=0)
     max_delivery_attempts = Column(Integer, default=10)
     
+    # Broadcast and targeting
+    is_admin_announcement = Column(Boolean, default=False)
+    is_broadcast = Column(Boolean, default=False)
+    
     # Relationships
     sender = relationship("User", foreign_keys=[sender_id], back_populates="sent_messages")
     recipient = relationship("User", foreign_keys=[recipient_id], back_populates="received_messages")
-    media_files = relationship("Media", back_populates="message")  # Add this line
+    group = relationship("Group", back_populates="messages")
+    media_files = relationship("Media", back_populates="message")
+    group_read_receipts = relationship("GroupMessageRead", back_populates="message", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Message(sender={self.sender_id}, recipient={self.recipient_id}, timestamp={self.timestamp})>"
@@ -234,7 +242,8 @@ class Media(Base):
     
     # Ownership
     sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
     
     # Disappearing media
     expires_at = Column(DateTime, nullable=True)  # When the media should be deleted
@@ -250,6 +259,57 @@ class Media(Base):
     
     def __repr__(self):
         return f"<Media(media_id='{self.media_id}', filename='{self.filename}', type='{self.media_type}')>"
+
+class Group(Base):
+    """Group chat table"""
+    __tablename__ = "groups"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    avatar_path = Column(String(512), nullable=True)
+    
+    # Relationships
+    members = relationship("GroupMember", back_populates="group", cascade="all, delete-orphan")
+    messages = relationship("Message", back_populates="group")
+    
+    def __repr__(self):
+        return f"<Group(id={self.id}, name='{self.name}')>"
+
+class GroupMember(Base):
+    """Junction table for group members"""
+    __tablename__ = "group_members"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    role = Column(String(20), default="member")  # admin, member
+    joined_at = Column(DateTime, default=func.now())
+    
+    # Relationships
+    group = relationship("Group", back_populates="members")
+    user = relationship("User", back_populates="group_memberships")
+    
+    def __repr__(self):
+        return f"<GroupMember(group_id={self.group_id}, user_id={self.user_id}, role='{self.role}')>"
+
+class GroupMessageRead(Base):
+    """Table to track which members have read which group messages"""
+    __tablename__ = "group_message_reads"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    read_at = Column(DateTime, default=func.now())
+    
+    # Relationships
+    message = relationship("Message", back_populates="group_read_receipts")
+    user = relationship("User")
+    
+    def __repr__(self):
+        return f"<GroupMessageRead(message_id={self.message_id}, user_id={self.user_id})>"
 
 class Call(Base):
     """Call table for tracking voice and video calls between users"""
