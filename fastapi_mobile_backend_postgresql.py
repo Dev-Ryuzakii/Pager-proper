@@ -1730,6 +1730,12 @@ async def lifespan(app: FastAPI):
             logger.warning("⚠️  App will start but database functionality may be limited")
         else:
             logger.info("✅ PostgreSQL database connected successfully")
+            
+            # Create tables if they don't exist
+            if db_config.create_tables():
+                logger.info("✅ Database tables verified/created successfully")
+            else:
+                logger.error("❌ Failed to create/verify database tables")
 
     # Start periodic online status broadcast task
     import asyncio
@@ -2890,10 +2896,12 @@ async def get_group_messages(
         sender_user = db.query(User).filter(User.id == m.sender_id).first()
         
         # Get who read this message
-        read_by_users = db.query(User.username).join(
+        read_by_rows = db.query(User.username, GroupMessageRead.user_id).join(
             GroupMessageRead, User.id == GroupMessageRead.user_id
         ).filter(GroupMessageRead.message_id == m.id).all()
-        read_by_list = [u.username for u in read_by_users]
+        
+        read_by_list = [row.username for row in read_by_rows]
+        is_read_by_me = any(row.user_id == user_id for row in read_by_rows)
         
         result.append({
             "id": int(m.id),
@@ -2903,13 +2911,47 @@ async def get_group_messages(
             "content_type": str(m.content_type),
             "timestamp": m.timestamp,
             "delivered": bool(m.delivered),
-            "read": user_id in [u.user_id for u in db.query(GroupMessageRead.user_id).filter(GroupMessageRead.message_id == m.id).all()],
+            "read": is_read_by_me,
             "read_by": read_by_list,
             "is_admin_announcement": bool(getattr(m, 'is_admin_announcement', False)),
             "decoy_content": str(getattr(m, 'decoy_content', '')),
             "group_id": int(group_id)
         })
     return result
+
+@app.post("/groups/{group_id}/messages/{message_id}/read")
+async def mark_group_message_read(
+    group_id: int,
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Mark a group message as read by the current user"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        
+        # Verify message exists and belongs to this group
+        msg = db.query(Message).filter(Message.id == message_id, Message.group_id == group_id).first()
+        if not msg:
+            raise HTTPException(status_code=404, detail="Message not found in this group")
+            
+        # Check if already marked as read
+        existing = db.query(GroupMessageRead).filter(
+            GroupMessageRead.message_id == message_id,
+            GroupMessageRead.user_id == user_id
+        ).first()
+        
+        if not existing:
+            new_read = GroupMessageRead(message_id=message_id, user_id=user_id)
+            db.add(new_read)
+            db.commit()
+            
+        return {"message": "Message marked as read"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Mark group message read error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to mark message as read")
 
 @app.post("/messages/group/send")
 async def send_group_message(
