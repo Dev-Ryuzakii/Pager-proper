@@ -8,6 +8,10 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker, relationship
 from sqlalchemy.sql import func
 from datetime import datetime
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 class Base(DeclarativeBase):
     pass
@@ -337,9 +341,6 @@ class Call(Base):
     
     def __repr__(self):
         return f"<Call(id={self.id}, caller={self.caller_id}, recipient={self.recipient_id}, type='{self.call_type}', status='{self.status}')>"
-
-# Add relationship to Message model
-Message.media_files = relationship("Media", back_populates="message")
 
 # Database connection configuration
 DATABASE_URL = os.getenv(
