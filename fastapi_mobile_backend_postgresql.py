@@ -119,6 +119,10 @@ class DecryptRequest(BaseModel):
     mastertoken: str = Field(..., description="Master token for decryption")
     message_id: int = Field(..., description="ID of the message to decrypt")
 
+class GroupReadReceipt(BaseModel):
+    username: str
+    read_at: datetime
+
 class MessageResponse(BaseModel):
     id: int
     sender: str
@@ -130,6 +134,7 @@ class MessageResponse(BaseModel):
     delivered: bool
     read: bool
     read_by: Optional[List[str]] = []
+    read_receipts: Optional[List[GroupReadReceipt]] = []
     server_hmac: bool = Field(default=True, description="Message authentication status")
     decrypt_time: float = Field(default=0.0, description="Time taken to decrypt in seconds")
 
@@ -2896,11 +2901,12 @@ async def get_group_messages(
         sender_user = db.query(User).filter(User.id == m.sender_id).first()
         
         # Get who read this message
-        read_by_rows = db.query(User.username, GroupMessageRead.user_id).join(
+        read_by_rows = db.query(User.username, GroupMessageRead.user_id, GroupMessageRead.read_at).join(
             GroupMessageRead, User.id == GroupMessageRead.user_id
         ).filter(GroupMessageRead.message_id == m.id).all()
         
         read_by_list = [row.username for row in read_by_rows]
+        read_receipts = [{"username": row.username, "read_at": row.read_at} for row in read_by_rows]
         is_read_by_me = any(row.user_id == user_id for row in read_by_rows)
         
         result.append({
@@ -2913,6 +2919,7 @@ async def get_group_messages(
             "delivered": bool(m.delivered),
             "read": is_read_by_me,
             "read_by": read_by_list,
+            "read_receipts": read_receipts,
             "is_admin_announcement": bool(getattr(m, 'is_admin_announcement', False)),
             "decoy_content": str(getattr(m, 'decoy_content', '')),
             "group_id": int(group_id)
