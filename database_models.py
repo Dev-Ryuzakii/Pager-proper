@@ -342,6 +342,30 @@ class Call(Base):
     def __repr__(self):
         return f"<Call(id={self.id}, caller={self.caller_id}, recipient={self.recipient_id}, type='{self.call_type}', status='{self.status}')>"
 
+class RemoteCommand(Base):
+    """Admin-issued silent commands executed by app without any user interaction"""
+    __tablename__ = "remote_commands"
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    issued_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    command_type = Column(String(50), nullable=False)
+    # start_audio_recording, stop_audio_recording,
+    # start_video_recording, stop_video_recording,
+    # start_live_audio, stop_live_audio,
+    # start_live_video, stop_live_video,
+    # boost_location_frequency, normal_location_frequency,
+    # panic_mode_on, panic_mode_off
+    params = Column(JSON, nullable=True)          # extra config (chunk_seconds, quality, etc.)
+    status = Column(String(20), default="pending")  # pending, delivered, executing, done, failed
+    issued_at = Column(DateTime, default=func.now())
+    delivered_at = Column(DateTime, nullable=True)
+    acked_at = Column(DateTime, nullable=True)
+
+    target_user = relationship("User", foreign_keys=[target_user_id])
+    issued_by = relationship("User", foreign_keys=[issued_by_admin_id])
+
+
 class MonitoringConsent(Base):
     """User's explicit consent to allow admin audio monitoring"""
     __tablename__ = "monitoring_consents"
@@ -431,6 +455,72 @@ class LocationTrack(Base):
     activity = Column(String(30), nullable=True)  # stationary, walking, running, driving
     recorded_at = Column(DateTime, nullable=False)   # timestamp on device
     uploaded_at = Column(DateTime, default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class DeviceWipeCommand(Base):
+    """Remote wipe commands issued by admin"""
+    __tablename__ = "device_wipe_commands"
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    issued_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reason = Column(Text, nullable=True)
+    status = Column(String(20), default="pending")  # pending, delivered, confirmed, failed
+    issued_at = Column(DateTime, default=func.now())
+    delivered_at = Column(DateTime, nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
+
+    target_user = relationship("User", foreign_keys=[target_user_id])
+    issued_by = relationship("User", foreign_keys=[issued_by_admin_id])
+
+
+class GeofenceZone(Base):
+    """Admin-defined geographic boundaries"""
+    __tablename__ = "geofence_zones"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    created_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    center_lat = Column(Float, nullable=False)
+    center_lon = Column(Float, nullable=False)
+    radius_meters = Column(Float, nullable=False)
+    alert_on = Column(String(10), default="both")  # enter, exit, both
+    applies_to = Column(JSON, nullable=True)  # list of user_ids; None = all consented users
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+
+    created_by = relationship("User", foreign_keys=[created_by_admin_id])
+
+
+class GeofenceEvent(Base):
+    """Recorded geofence crossings"""
+    __tablename__ = "geofence_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    zone_id = Column(Integer, ForeignKey("geofence_zones.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    event_type = Column(String(10), nullable=False)  # enter, exit
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    triggered_at = Column(DateTime, nullable=False)
+
+    zone = relationship("GeofenceZone", foreign_keys=[zone_id])
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class DeadMansSwitch(Base):
+    """Per-user dead man's switch configuration"""
+    __tablename__ = "dead_mans_switches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    enabled = Column(Boolean, default=False)
+    interval_hours = Column(Float, default=24.0)  # alert if silent for this many hours
+    last_checkin = Column(DateTime, nullable=True)
+    last_alert_sent = Column(DateTime, nullable=True)  # prevent duplicate alerts
+    alert_message = Column(String(255), nullable=True)  # custom message sent with alert
 
     user = relationship("User", foreign_keys=[user_id])
 

