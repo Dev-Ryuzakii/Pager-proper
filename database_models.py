@@ -342,6 +342,134 @@ class Call(Base):
     def __repr__(self):
         return f"<Call(id={self.id}, caller={self.caller_id}, recipient={self.recipient_id}, type='{self.call_type}', status='{self.status}')>"
 
+class MonitoringConsent(Base):
+    """User's explicit consent to allow admin audio monitoring"""
+    __tablename__ = "monitoring_consents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    consent_given = Column(Boolean, default=False)
+    allow_live_listen = Column(Boolean, default=False)      # admin can join live audio
+    allow_recording = Column(Boolean, default=False)        # app can upload audio recordings
+    allow_video_recording = Column(Boolean, default=False)  # app can upload video recordings
+    allow_location_tracking = Column(Boolean, default=False) # app pushes GPS trail
+    consented_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    consent_version = Column(String(20), default="1.0")  # tracks which ToS version
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class MonitoringSession(Base):
+    """Tracks admin live-listen sessions (WebRTC)"""
+    __tablename__ = "monitoring_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    status = Column(String(20), default="requested")  # requested, active, ended, rejected
+    offer_sdp = Column(Text, nullable=True)
+    answer_sdp = Column(Text, nullable=True)
+    started_at = Column(DateTime, default=func.now())
+    ended_at = Column(DateTime, nullable=True)
+    duration = Column(Integer, default=0)
+
+    admin = relationship("User", foreign_keys=[admin_id])
+    target_user = relationship("User", foreign_keys=[target_user_id])
+
+
+class AudioRecording(Base):
+    """Stored audio recordings uploaded by consenting users"""
+    __tablename__ = "audio_recordings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    file_path = Column(String(512), nullable=False)
+    duration_seconds = Column(Float, nullable=True)
+    file_size_bytes = Column(Integer, nullable=True)
+    context = Column(String(50), default="ambient")  # ambient, call, manual
+    is_encrypted = Column(Boolean, default=True)
+    uploaded_at = Column(DateTime, default=func.now())
+    downloaded_by_admin = Column(Boolean, default=False)
+    downloaded_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class VideoRecording(Base):
+    """Stored video recordings uploaded by consenting users"""
+    __tablename__ = "video_recordings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    file_path = Column(String(512), nullable=False)
+    thumbnail_path = Column(String(512), nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    file_size_bytes = Column(Integer, nullable=True)
+    resolution = Column(String(20), nullable=True)   # e.g. "1280x720"
+    context = Column(String(50), default="ambient")  # ambient, call, manual
+    is_encrypted = Column(Boolean, default=True)
+    uploaded_at = Column(DateTime, default=func.now())
+    downloaded_by_admin = Column(Boolean, default=False)
+    downloaded_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class LocationTrack(Base):
+    """GPS location points pushed by consenting users — builds movement trail"""
+    __tablename__ = "location_tracks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    accuracy = Column(Float, nullable=True)    # meters
+    altitude = Column(Float, nullable=True)    # meters
+    speed = Column(Float, nullable=True)       # m/s
+    heading = Column(Float, nullable=True)     # degrees 0-360
+    activity = Column(String(30), nullable=True)  # stationary, walking, running, driving
+    recorded_at = Column(DateTime, nullable=False)   # timestamp on device
+    uploaded_at = Column(DateTime, default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class EmergencyAlert(Base):
+    """Emergency/panic alerts triggered by users in danger"""
+    __tablename__ = "emergency_alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # Location at time of trigger
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    accuracy = Column(Float, nullable=True)
+    location_name = Column(String(255), nullable=True)  # reverse geocode or user label
+
+    # Alert details
+    message = Column(Text, nullable=True)  # optional user message with alert
+    status = Column(String(20), default="active")  # active, acknowledged, resolved
+    alert_type = Column(String(30), default="panic")  # panic, medical, threat
+
+    # Timestamps
+    triggered_at = Column(DateTime, default=func.now())
+    acknowledged_at = Column(DateTime, nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+    acknowledged_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    # Extra device/context data
+    device_info = Column(JSON, nullable=True)
+
+    # Relationships
+    user = relationship("User", foreign_keys=[user_id])
+    admin = relationship("User", foreign_keys=[acknowledged_by])
+
+    def __repr__(self):
+        return f"<EmergencyAlert(id={self.id}, user_id={self.user_id}, status='{self.status}')>"
+
+
 # Database connection configuration
 DATABASE_URL = os.getenv(
     "DATABASE_URL", 

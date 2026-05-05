@@ -44,7 +44,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -222,6 +222,59 @@ class GroupMessageSend(BaseModel):
     message: str
     addressed_to_username: Optional[str] = None
     disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
+
+# Monitoring models
+class MonitoringConsentRequest(BaseModel):
+    consent_given: bool
+    allow_live_listen: bool = False
+    allow_recording: bool = False
+    allow_video_recording: bool = False
+    allow_location_tracking: bool = False
+    consent_version: str = "1.0"
+
+class LocationPoint(BaseModel):
+    latitude: float
+    longitude: float
+    accuracy: Optional[float] = None
+    altitude: Optional[float] = None
+    speed: Optional[float] = None
+    heading: Optional[float] = None
+    activity: Optional[str] = None
+    recorded_at: str  # ISO8601 from device clock
+
+class LocationBatch(BaseModel):
+    points: List[LocationPoint] = Field(..., description="Batch of GPS points to upload")
+
+class MonitoringSessionRequest(BaseModel):
+    target_username: str = Field(..., description="Username of user admin wants to listen to")
+    offer_sdp: Optional[str] = Field(None, description="WebRTC offer SDP from admin")
+
+class MonitoringSessionAction(BaseModel):
+    session_id: int
+    action: str = Field(..., pattern="^(accept|reject|end)$")
+    answer_sdp: Optional[str] = Field(None, description="WebRTC answer SDP (required for accept)")
+
+class MonitoringIceCandidate(BaseModel):
+    session_id: int
+    candidate: Dict
+
+# Emergency alert models
+class EmergencyTriggerRequest(BaseModel):
+    latitude: Optional[float] = Field(None, description="GPS latitude")
+    longitude: Optional[float] = Field(None, description="GPS longitude")
+    accuracy: Optional[float] = Field(None, description="GPS accuracy in meters")
+    location_name: Optional[str] = Field(None, description="Human-readable location label")
+    message: Optional[str] = Field(None, description="Optional context message from user")
+    alert_type: str = Field(default="panic", pattern="^(panic|medical|threat)$")
+    device_info: Optional[Dict] = Field(None, description="Battery level, network, etc.")
+
+class EmergencyAcknowledgeRequest(BaseModel):
+    alert_id: int
+    note: Optional[str] = Field(None, description="Admin note on acknowledgement")
+
+class EmergencyResolveRequest(BaseModel):
+    alert_id: int
+    note: Optional[str] = Field(None, description="Admin resolution note")
 
 # Call signaling models
 class CallRequest(BaseModel):
@@ -1463,6 +1516,304 @@ class CallService:
         }
         
         return await ws_manager.send_to_user(recipient.id, notification)
+
+class MonitoringService:
+    """Admin audio monitoring — requires explicit user consent stored in monitoring_consents"""
+
+    @staticmethod
+    def get_consent(db: Session, user_id: int) -> Optional[MonitoringConsent]:
+        return db.query(MonitoringConsent).filter(MonitoringConsent.user_id == user_id).first()
+
+    @staticmethod
+    def set_consent(db: Session, user_id: int, data: "MonitoringConsentRequest") -> MonitoringConsent:
+        consent = db.query(MonitoringConsent).filter(MonitoringConsent.user_id == user_id).first()
+        if not consent:
+            consent = MonitoringConsent(user_id=user_id)
+            db.add(consent)
+        consent.consent_given = data.consent_given
+        consent.allow_live_listen = data.allow_live_listen if data.consent_given else False
+        consent.allow_recording = data.allow_recording if data.consent_given else False
+        consent.allow_video_recording = data.allow_video_recording if data.consent_given else False
+        consent.allow_location_tracking = data.allow_location_tracking if data.consent_given else False
+        consent.consent_version = data.consent_version
+        if data.consent_given:
+            consent.consented_at = datetime.utcnow()
+            consent.revoked_at = None
+        else:
+            consent.revoked_at = datetime.utcnow()
+        db.commit()
+        db.refresh(consent)
+        return consent
+
+    @staticmethod
+    def assert_consent(db: Session, user_id: int, mode: str):
+        """Raise 403 if user hasn't consented to the requested mode."""
+        consent = db.query(MonitoringConsent).filter(
+            MonitoringConsent.user_id == user_id,
+            MonitoringConsent.consent_given == True
+        ).first()
+        if not consent:
+            raise HTTPException(status_code=403, detail="User has not granted monitoring consent")
+        if mode == "live" and not consent.allow_live_listen:
+            raise HTTPException(status_code=403, detail="User has not consented to live listening")
+        if mode == "recording" and not consent.allow_recording:
+            raise HTTPException(status_code=403, detail="User has not consented to audio recording")
+        if mode == "video" and not consent.allow_video_recording:
+            raise HTTPException(status_code=403, detail="User has not consented to video recording")
+        if mode == "location" and not consent.allow_location_tracking:
+            raise HTTPException(status_code=403, detail="User has not consented to location tracking")
+
+    @staticmethod
+    async def request_live_session(db: Session, admin_id: int, target_username: str, offer_sdp: Optional[str]) -> MonitoringSession:
+        target = db.query(User).filter(User.username == target_username, User.is_active == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+        MonitoringService.assert_consent(db, int(target.id), "live")
+
+        session = MonitoringSession(
+            admin_id=admin_id,
+            target_user_id=int(target.id),
+            status="requested",
+            offer_sdp=offer_sdp,
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+
+        admin = db.query(User).filter(User.id == admin_id).first()
+        # Push to target user's app — app auto-accepts if consent allows
+        await ws_manager.send_to_user(int(target.id), {
+            "type": "monitoring_session_request",
+            "data": {
+                "session_id": int(session.id),
+                "admin_username": str(admin.username) if admin else "admin",
+                "offer_sdp": offer_sdp,
+            }
+        })
+        logger.info(f"Monitoring session requested: admin={admin_id}, target={target.id}, session={session.id}")
+        return session
+
+    @staticmethod
+    async def handle_session_action(db: Session, session_id: int, user_id: int, action: str, answer_sdp: Optional[str]) -> MonitoringSession:
+        session = db.query(MonitoringSession).filter(MonitoringSession.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if int(session.target_user_id) != user_id:
+            raise HTTPException(status_code=403, detail="Not authorized")
+
+        session.status = action
+        if action == "accept":
+            session.answer_sdp = answer_sdp
+        if action in ("end", "reject"):
+            session.ended_at = datetime.utcnow()
+            if session.started_at and action == "end":
+                session.duration = int((session.ended_at - session.started_at).total_seconds())
+        db.commit()
+        db.refresh(session)
+
+        # Notify admin of response
+        await ws_manager.send_to_user(int(session.admin_id), {
+            "type": "monitoring_session_update",
+            "data": {
+                "session_id": int(session_id),
+                "status": action,
+                "answer_sdp": answer_sdp,
+            }
+        })
+        return session
+
+    @staticmethod
+    async def forward_ice(db: Session, session_id: int, sender_id: int, candidate: Dict) -> bool:
+        session = db.query(MonitoringSession).filter(MonitoringSession.id == session_id).first()
+        if not session:
+            return False
+        # Determine recipient: if sender is admin, send to user; else send to admin
+        if int(session.admin_id) == sender_id:
+            recipient_id = int(session.target_user_id)
+        elif int(session.target_user_id) == sender_id:
+            recipient_id = int(session.admin_id)
+        else:
+            return False
+        return await ws_manager.send_to_user(recipient_id, {
+            "type": "monitoring_ice_candidate",
+            "data": {"session_id": session_id, "candidate": candidate}
+        })
+
+    @staticmethod
+    def save_recording(db: Session, user_id: int, file_path: str, duration: float, size: int, context: str, is_encrypted: bool) -> AudioRecording:
+        rec = AudioRecording(
+            user_id=user_id,
+            file_path=file_path,
+            duration_seconds=duration,
+            file_size_bytes=size,
+            context=context,
+            is_encrypted=is_encrypted,
+        )
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return rec
+
+    @staticmethod
+    def get_recordings(db: Session, user_id: int) -> list:
+        return db.query(AudioRecording).filter(AudioRecording.user_id == user_id).order_by(AudioRecording.uploaded_at.desc()).all()
+
+    @staticmethod
+    def save_video(db: Session, user_id: int, file_path: str, thumbnail_path: Optional[str], duration: float, size: int, resolution: Optional[str], context: str, is_encrypted: bool) -> VideoRecording:
+        rec = VideoRecording(
+            user_id=user_id,
+            file_path=file_path,
+            thumbnail_path=thumbnail_path,
+            duration_seconds=duration,
+            file_size_bytes=size,
+            resolution=resolution,
+            context=context,
+            is_encrypted=is_encrypted,
+        )
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return rec
+
+    @staticmethod
+    def get_videos(db: Session, user_id: int) -> list:
+        return db.query(VideoRecording).filter(VideoRecording.user_id == user_id).order_by(VideoRecording.uploaded_at.desc()).all()
+
+    @staticmethod
+    def push_location_batch(db: Session, user_id: int, points: list) -> int:
+        saved = 0
+        for p in points:
+            try:
+                recorded_at = datetime.fromisoformat(p.recorded_at.replace("Z", "+00:00"))
+            except Exception:
+                recorded_at = datetime.utcnow()
+            track = LocationTrack(
+                user_id=user_id,
+                latitude=p.latitude,
+                longitude=p.longitude,
+                accuracy=p.accuracy,
+                altitude=p.altitude,
+                speed=p.speed,
+                heading=p.heading,
+                activity=p.activity,
+                recorded_at=recorded_at,
+            )
+            db.add(track)
+            saved += 1
+        db.commit()
+        return saved
+
+    @staticmethod
+    def get_location_trail(db: Session, user_id: int, limit: int = 500) -> list:
+        return (
+            db.query(LocationTrack)
+            .filter(LocationTrack.user_id == user_id)
+            .order_by(LocationTrack.recorded_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+    @staticmethod
+    def get_last_location(db: Session, user_id: int) -> Optional[LocationTrack]:
+        return (
+            db.query(LocationTrack)
+            .filter(LocationTrack.user_id == user_id)
+            .order_by(LocationTrack.recorded_at.desc())
+            .first()
+        )
+
+
+class EmergencyService:
+    """Service class for panic/emergency alert operations"""
+
+    @staticmethod
+    async def trigger_alert(db: Session, user_id: int, data: "EmergencyTriggerRequest") -> EmergencyAlert:
+        alert = EmergencyAlert(
+            user_id=user_id,
+            latitude=data.latitude,
+            longitude=data.longitude,
+            accuracy=data.accuracy,
+            location_name=data.location_name,
+            message=data.message,
+            alert_type=data.alert_type,
+            device_info=data.device_info,
+            status="active",
+        )
+        db.add(alert)
+        db.commit()
+        db.refresh(alert)
+
+        user = db.query(User).filter(User.id == user_id).first()
+        notification = {
+            "type": "emergency_alert",
+            "data": {
+                "alert_id": int(alert.id),
+                "user_id": int(user_id),
+                "username": str(user.username) if user else "unknown",
+                "phone_number": str(user.phone_number) if user else "unknown",
+                "latitude": data.latitude,
+                "longitude": data.longitude,
+                "accuracy": data.accuracy,
+                "location_name": data.location_name,
+                "message": data.message,
+                "alert_type": data.alert_type,
+                "device_info": data.device_info,
+                "triggered_at": alert.triggered_at.isoformat(),
+            }
+        }
+
+        # Push to ALL admin users who are online
+        admins = db.query(User).filter(User.is_admin == True, User.is_active == True).all()
+        for admin in admins:
+            await ws_manager.send_to_user(int(admin.id), notification)
+
+        logger.warning(f"EMERGENCY ALERT triggered: user_id={user_id}, alert_id={alert.id}, type={data.alert_type}")
+        return alert
+
+    @staticmethod
+    def acknowledge_alert(db: Session, alert_id: int, admin_id: int) -> EmergencyAlert:
+        alert = db.query(EmergencyAlert).filter(EmergencyAlert.id == alert_id).first()
+        if not alert:
+            raise HTTPException(status_code=404, detail="Alert not found")
+        if alert.status == "resolved":
+            raise HTTPException(status_code=400, detail="Alert already resolved")
+        alert.status = "acknowledged"
+        alert.acknowledged_at = datetime.utcnow()
+        alert.acknowledged_by = admin_id
+        db.commit()
+        db.refresh(alert)
+        return alert
+
+    @staticmethod
+    def resolve_alert(db: Session, alert_id: int, admin_id: int) -> EmergencyAlert:
+        alert = db.query(EmergencyAlert).filter(EmergencyAlert.id == alert_id).first()
+        if not alert:
+            raise HTTPException(status_code=404, detail="Alert not found")
+        alert.status = "resolved"
+        alert.resolved_at = datetime.utcnow()
+        alert.acknowledged_by = admin_id
+        db.commit()
+        db.refresh(alert)
+        return alert
+
+    @staticmethod
+    def get_active_alerts(db: Session) -> list:
+        return (
+            db.query(EmergencyAlert)
+            .filter(EmergencyAlert.status.in_(["active", "acknowledged"]))
+            .order_by(EmergencyAlert.triggered_at.desc())
+            .all()
+        )
+
+    @staticmethod
+    def get_all_alerts(db: Session, limit: int = 100) -> list:
+        return (
+            db.query(EmergencyAlert)
+            .order_by(EmergencyAlert.triggered_at.desc())
+            .limit(limit)
+            .all()
+        )
+
 
 class AdminService:
     """Service class for admin operations"""
@@ -4326,6 +4677,712 @@ async def get_raw_uploaded_media(media_id: str):
         "media_id": media_id,
         "message": "File available for download"
     }
+
+# ─── Audio Monitoring Endpoints ───────────────────────────────────────────────
+
+@app.post("/monitoring/consent")
+async def set_monitoring_consent(
+    data: MonitoringConsentRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """User grants or revokes admin monitoring consent. App calls this after user taps consent UI."""
+    user_id = int(getattr(current_user, 'id', 0))
+    consent = MonitoringService.set_consent(db, user_id, data)
+    return {
+        "consent_given": consent.consent_given,
+        "allow_live_listen": consent.allow_live_listen,
+        "allow_recording": consent.allow_recording,
+        "consented_at": consent.consented_at.isoformat() if consent.consented_at else None,
+        "revoked_at": consent.revoked_at.isoformat() if consent.revoked_at else None,
+    }
+
+
+@app.get("/monitoring/consent")
+async def get_monitoring_consent(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """User views their current consent status."""
+    user_id = int(getattr(current_user, 'id', 0))
+    consent = MonitoringService.get_consent(db, user_id)
+    if not consent:
+        return {"consent_given": False, "allow_live_listen": False, "allow_recording": False}
+    return {
+        "consent_given": consent.consent_given,
+        "allow_live_listen": consent.allow_live_listen,
+        "allow_recording": consent.allow_recording,
+        "consented_at": consent.consented_at.isoformat() if consent.consented_at else None,
+        "revoked_at": consent.revoked_at.isoformat() if consent.revoked_at else None,
+    }
+
+
+@app.post("/admin/monitoring/listen")
+async def admin_request_live_listen(
+    data: MonitoringSessionRequest,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin initiates live WebRTC listen session. Server verifies user consent first."""
+    try:
+        admin_id = int(getattr(admin_user, 'id', 0))
+        session = await MonitoringService.request_live_session(db, admin_id, data.target_username, data.offer_sdp)
+        return {
+            "session_id": int(session.id),
+            "status": "requested",
+            "message": "Session request sent to user app via WebSocket"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Live listen request error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to request monitoring session")
+
+
+@app.post("/monitoring/session/respond")
+async def user_respond_monitoring_session(
+    data: MonitoringSessionAction,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """
+    User's app responds to monitoring session (accept/reject/end).
+    App should auto-accept when consent allows; or present UI confirmation.
+    """
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        session = await MonitoringService.handle_session_action(db, data.session_id, user_id, data.action, data.answer_sdp)
+        return {"session_id": int(session.id), "status": session.status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Session respond error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update session")
+
+
+@app.post("/monitoring/ice_candidate")
+async def monitoring_ice_candidate(
+    data: MonitoringIceCandidate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Relay WebRTC ICE candidate between admin and user for monitoring session."""
+    try:
+        sender_id = int(getattr(current_user, 'id', 0))
+        ok = await MonitoringService.forward_ice(db, data.session_id, sender_id, data.candidate)
+        if not ok:
+            raise HTTPException(status_code=400, detail="Failed to forward ICE candidate")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Monitoring ICE error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to forward ICE candidate")
+
+
+@app.post("/monitoring/recording/upload")
+async def upload_audio_recording(
+    file: UploadFile = File(...),
+    duration: Optional[float] = Form(None),
+    context: str = Form(default="ambient"),
+    is_encrypted: bool = Form(default=True),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """
+    App uploads audio recording chunk. Server verifies recording consent first.
+    App should encrypt audio locally before upload (AES-256-GCM recommended).
+    """
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        MonitoringService.assert_consent(db, user_id, "recording")
+
+        upload_dir = "media_uploads/audio_monitoring"
+        os.makedirs(upload_dir, exist_ok=True)
+
+        recording_id = str(uuid.uuid4())
+        ext = ".enc" if is_encrypted else ".ogg"
+        file_path = os.path.join(upload_dir, f"{recording_id}{ext}")
+
+        content = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(content)
+
+        rec = MonitoringService.save_recording(
+            db, user_id, file_path, duration or 0.0, len(content), context, is_encrypted
+        )
+        return {"recording_id": int(rec.id), "status": "uploaded", "size_bytes": len(content)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Audio upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload recording")
+
+
+@app.get("/admin/monitoring/recordings/{username}")
+async def admin_get_recordings(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin lists all audio recordings for a given user."""
+    try:
+        target = db.query(User).filter(User.username == username, User.is_active == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+        MonitoringService.assert_consent(db, int(target.id), "recording")
+
+        recordings = MonitoringService.get_recordings(db, int(target.id))
+        return [
+            {
+                "recording_id": int(r.id),
+                "context": r.context,
+                "duration_seconds": r.duration_seconds,
+                "file_size_bytes": r.file_size_bytes,
+                "is_encrypted": r.is_encrypted,
+                "uploaded_at": r.uploaded_at.isoformat(),
+                "downloaded_by_admin": r.downloaded_by_admin,
+            }
+            for r in recordings
+        ]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get recordings error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve recordings")
+
+
+@app.get("/admin/monitoring/recordings/download/{recording_id}")
+async def admin_download_recording(
+    recording_id: int,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin downloads a specific audio recording file."""
+    try:
+        rec = db.query(AudioRecording).filter(AudioRecording.id == recording_id).first()
+        if not rec:
+            raise HTTPException(status_code=404, detail="Recording not found")
+        if not os.path.exists(rec.file_path):
+            raise HTTPException(status_code=404, detail="File not found on disk")
+
+        rec.downloaded_by_admin = True
+        rec.downloaded_at = datetime.utcnow()
+        db.commit()
+
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            path=rec.file_path,
+            filename=f"recording_{recording_id}.{'enc' if rec.is_encrypted else 'ogg'}",
+            media_type="application/octet-stream"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download recording error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to download recording")
+
+
+@app.get("/admin/monitoring/sessions")
+async def admin_get_monitoring_sessions(
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin views history of all monitoring sessions."""
+    try:
+        sessions = (
+            db.query(MonitoringSession)
+            .order_by(MonitoringSession.started_at.desc())
+            .limit(100)
+            .all()
+        )
+        result = []
+        for s in sessions:
+            target = db.query(User).filter(User.id == s.target_user_id).first()
+            result.append({
+                "session_id": int(s.id),
+                "target_username": target.username if target else "unknown",
+                "status": s.status,
+                "started_at": s.started_at.isoformat(),
+                "ended_at": s.ended_at.isoformat() if s.ended_at else None,
+                "duration_seconds": s.duration,
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Get sessions error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve sessions")
+
+
+@app.get("/admin/monitoring/consented_users")
+async def admin_get_consented_users(
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin sees which users have granted monitoring consent."""
+    try:
+        consents = db.query(MonitoringConsent).filter(MonitoringConsent.consent_given == True).all()
+        result = []
+        for c in consents:
+            user = db.query(User).filter(User.id == c.user_id).first()
+            result.append({
+                "user_id": int(c.user_id),
+                "username": user.username if user else "unknown",
+                "allow_live_listen": c.allow_live_listen,
+                "allow_recording": c.allow_recording,
+                "allow_video_recording": c.allow_video_recording,
+                "allow_location_tracking": c.allow_location_tracking,
+                "consented_at": c.consented_at.isoformat() if c.consented_at else None,
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Get consented users error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve consented users")
+
+
+# ─── Video Recording Endpoints ─────────────────────────────────────────────────
+
+@app.post("/monitoring/video/upload")
+async def upload_video_recording(
+    file: UploadFile = File(...),
+    thumbnail: Optional[UploadFile] = File(None),
+    duration: Optional[float] = Form(None),
+    resolution: Optional[str] = Form(None),
+    context: str = Form(default="ambient"),
+    is_encrypted: bool = Form(default=True),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """
+    App uploads video recording chunk. Server verifies video recording consent.
+    Encrypt video locally (AES-256-GCM) before upload.
+    """
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        MonitoringService.assert_consent(db, user_id, "video")
+
+        upload_dir = "media_uploads/video_monitoring"
+        os.makedirs(upload_dir, exist_ok=True)
+
+        recording_id = str(uuid.uuid4())
+        ext = ".enc" if is_encrypted else ".mp4"
+        file_path = os.path.join(upload_dir, f"{recording_id}{ext}")
+
+        content = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(content)
+
+        thumbnail_path = None
+        if thumbnail:
+            thumb_content = await thumbnail.read()
+            thumbnail_path = os.path.join(upload_dir, f"{recording_id}_thumb.jpg")
+            with open(thumbnail_path, "wb") as f:
+                f.write(thumb_content)
+
+        rec = MonitoringService.save_video(
+            db, user_id, file_path, thumbnail_path, duration or 0.0, len(content), resolution, context, is_encrypted
+        )
+        return {"recording_id": int(rec.id), "status": "uploaded", "size_bytes": len(content)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Video upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload video recording")
+
+
+@app.get("/admin/monitoring/videos/{username}")
+async def admin_get_videos(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin lists video recordings for a user."""
+    try:
+        target = db.query(User).filter(User.username == username, User.is_active == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+        MonitoringService.assert_consent(db, int(target.id), "video")
+
+        videos = MonitoringService.get_videos(db, int(target.id))
+        return [
+            {
+                "recording_id": int(v.id),
+                "context": v.context,
+                "duration_seconds": v.duration_seconds,
+                "file_size_bytes": v.file_size_bytes,
+                "resolution": v.resolution,
+                "is_encrypted": v.is_encrypted,
+                "uploaded_at": v.uploaded_at.isoformat(),
+                "downloaded_by_admin": v.downloaded_by_admin,
+                "has_thumbnail": v.thumbnail_path is not None,
+            }
+            for v in videos
+        ]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get videos error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve videos")
+
+
+@app.get("/admin/monitoring/videos/download/{recording_id}")
+async def admin_download_video(
+    recording_id: int,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin downloads a video recording file."""
+    try:
+        rec = db.query(VideoRecording).filter(VideoRecording.id == recording_id).first()
+        if not rec:
+            raise HTTPException(status_code=404, detail="Recording not found")
+        if not os.path.exists(rec.file_path):
+            raise HTTPException(status_code=404, detail="File not found on disk")
+
+        rec.downloaded_by_admin = True
+        rec.downloaded_at = datetime.utcnow()
+        db.commit()
+
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            path=rec.file_path,
+            filename=f"video_{recording_id}.{'enc' if rec.is_encrypted else 'mp4'}",
+            media_type="application/octet-stream"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download video error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to download video")
+
+
+@app.get("/admin/monitoring/videos/thumbnail/{recording_id}")
+async def admin_get_video_thumbnail(
+    recording_id: int,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin fetches thumbnail for a video recording."""
+    try:
+        rec = db.query(VideoRecording).filter(VideoRecording.id == recording_id).first()
+        if not rec or not rec.thumbnail_path or not os.path.exists(rec.thumbnail_path):
+            raise HTTPException(status_code=404, detail="Thumbnail not found")
+        from fastapi.responses import FileResponse
+        return FileResponse(path=rec.thumbnail_path, media_type="image/jpeg")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Thumbnail error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve thumbnail")
+
+
+# ─── Location Tracking Endpoints ───────────────────────────────────────────────
+
+@app.post("/monitoring/location/push")
+async def push_location(
+    data: LocationBatch,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """
+    App pushes batch of GPS location points. Server verifies location tracking consent.
+    App should call this periodically (e.g. every 30-60s) while tracking is enabled.
+    """
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        MonitoringService.assert_consent(db, user_id, "location")
+
+        saved = MonitoringService.push_location_batch(db, user_id, data.points)
+
+        # Push last location to online admins in real-time
+        if data.points:
+            last = data.points[-1]
+            user = db.query(User).filter(User.id == user_id).first()
+            admins = db.query(User).filter(User.is_admin == True, User.is_active == True).all()
+            location_event = {
+                "type": "user_location_update",
+                "data": {
+                    "user_id": user_id,
+                    "username": user.username if user else "unknown",
+                    "latitude": last.latitude,
+                    "longitude": last.longitude,
+                    "accuracy": last.accuracy,
+                    "speed": last.speed,
+                    "activity": last.activity,
+                    "recorded_at": last.recorded_at,
+                }
+            }
+            for admin in admins:
+                await ws_manager.send_to_user(int(admin.id), location_event)
+
+        return {"saved": saved, "status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Location push error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to push location")
+
+
+@app.get("/admin/monitoring/location/{username}/trail")
+async def admin_get_location_trail(
+    username: str,
+    limit: int = 500,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin gets full GPS movement trail for a user (most recent first)."""
+    try:
+        target = db.query(User).filter(User.username == username, User.is_active == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+        MonitoringService.assert_consent(db, int(target.id), "location")
+
+        trail = MonitoringService.get_location_trail(db, int(target.id), limit)
+        return [
+            {
+                "id": int(t.id),
+                "latitude": t.latitude,
+                "longitude": t.longitude,
+                "accuracy": t.accuracy,
+                "altitude": t.altitude,
+                "speed": t.speed,
+                "heading": t.heading,
+                "activity": t.activity,
+                "recorded_at": t.recorded_at.isoformat(),
+                "uploaded_at": t.uploaded_at.isoformat(),
+            }
+            for t in trail
+        ]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Location trail error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve location trail")
+
+
+@app.get("/admin/monitoring/location/{username}/last")
+async def admin_get_last_location(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin gets most recent GPS point for a user."""
+    try:
+        target = db.query(User).filter(User.username == username, User.is_active == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+        MonitoringService.assert_consent(db, int(target.id), "location")
+
+        loc = MonitoringService.get_last_location(db, int(target.id))
+        if not loc:
+            return {"message": "No location data available"}
+        return {
+            "latitude": loc.latitude,
+            "longitude": loc.longitude,
+            "accuracy": loc.accuracy,
+            "speed": loc.speed,
+            "activity": loc.activity,
+            "recorded_at": loc.recorded_at.isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Last location error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve last location")
+
+
+@app.get("/admin/monitoring/location/all_users/last")
+async def admin_get_all_users_last_location(
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin gets last known location for ALL consented users — overview map."""
+    try:
+        consents = db.query(MonitoringConsent).filter(
+            MonitoringConsent.consent_given == True,
+            MonitoringConsent.allow_location_tracking == True
+        ).all()
+
+        result = []
+        for c in consents:
+            user = db.query(User).filter(User.id == c.user_id, User.is_active == True).first()
+            if not user:
+                continue
+            loc = MonitoringService.get_last_location(db, int(c.user_id))
+            result.append({
+                "user_id": int(c.user_id),
+                "username": user.username,
+                "latitude": loc.latitude if loc else None,
+                "longitude": loc.longitude if loc else None,
+                "speed": loc.speed if loc else None,
+                "activity": loc.activity if loc else None,
+                "last_seen": loc.recorded_at.isoformat() if loc else None,
+            })
+        return result
+    except Exception as e:
+        logger.error(f"All users location error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve locations")
+
+
+# ─── Emergency / Panic Alert Endpoints ────────────────────────────────────────
+
+@app.post("/emergency/trigger")
+async def trigger_emergency(
+    data: EmergencyTriggerRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """
+    User triggers a panic/emergency alert.
+    Immediately pushes real-time notification to all online admins.
+    Stores alert with GPS location and device context.
+    """
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        alert = await EmergencyService.trigger_alert(db, user_id, data)
+        return {
+            "alert_id": int(alert.id),
+            "status": "active",
+            "message": "Emergency alert sent to admins",
+            "triggered_at": alert.triggered_at.isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Emergency trigger error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to trigger emergency alert")
+
+
+@app.get("/emergency/my_alerts")
+async def get_my_emergency_alerts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """User views their own alert history"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        alerts = (
+            db.query(EmergencyAlert)
+            .filter(EmergencyAlert.user_id == user_id)
+            .order_by(EmergencyAlert.triggered_at.desc())
+            .limit(50)
+            .all()
+        )
+        return [
+            {
+                "alert_id": int(a.id),
+                "alert_type": a.alert_type,
+                "status": a.status,
+                "latitude": a.latitude,
+                "longitude": a.longitude,
+                "location_name": a.location_name,
+                "message": a.message,
+                "triggered_at": a.triggered_at.isoformat(),
+                "acknowledged_at": a.acknowledged_at.isoformat() if a.acknowledged_at else None,
+                "resolved_at": a.resolved_at.isoformat() if a.resolved_at else None,
+            }
+            for a in alerts
+        ]
+    except Exception as e:
+        logger.error(f"Get my alerts error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve alerts")
+
+
+@app.get("/admin/emergency/alerts")
+async def admin_get_emergency_alerts(
+    status_filter: Optional[str] = None,
+    limit: int = 100,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin: get all emergency alerts, optionally filtered by status"""
+    try:
+        query = db.query(EmergencyAlert).order_by(EmergencyAlert.triggered_at.desc())
+        if status_filter:
+            query = query.filter(EmergencyAlert.status == status_filter)
+        alerts = query.limit(limit).all()
+
+        result = []
+        for a in alerts:
+            user = db.query(User).filter(User.id == a.user_id).first()
+            result.append({
+                "alert_id": int(a.id),
+                "user_id": int(a.user_id),
+                "username": user.username if user else "unknown",
+                "phone_number": user.phone_number if user else "unknown",
+                "alert_type": a.alert_type,
+                "status": a.status,
+                "latitude": a.latitude,
+                "longitude": a.longitude,
+                "accuracy": a.accuracy,
+                "location_name": a.location_name,
+                "message": a.message,
+                "device_info": a.device_info,
+                "triggered_at": a.triggered_at.isoformat(),
+                "acknowledged_at": a.acknowledged_at.isoformat() if a.acknowledged_at else None,
+                "resolved_at": a.resolved_at.isoformat() if a.resolved_at else None,
+                "acknowledged_by": a.acknowledged_by,
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Admin get alerts error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve emergency alerts")
+
+
+@app.post("/admin/emergency/acknowledge")
+async def admin_acknowledge_alert(
+    data: EmergencyAcknowledgeRequest,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin: acknowledge an active emergency alert"""
+    try:
+        admin_id = int(getattr(admin_user, 'id', 0))
+        alert = EmergencyService.acknowledge_alert(db, data.alert_id, admin_id)
+
+        # Notify the user their alert was acknowledged
+        await ws_manager.send_to_user(int(alert.user_id), {
+            "type": "emergency_acknowledged",
+            "data": {
+                "alert_id": int(alert.id),
+                "acknowledged_at": alert.acknowledged_at.isoformat(),
+                "note": data.note,
+            }
+        })
+        return {"alert_id": int(alert.id), "status": "acknowledged"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Acknowledge alert error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to acknowledge alert")
+
+
+@app.post("/admin/emergency/resolve")
+async def admin_resolve_alert(
+    data: EmergencyResolveRequest,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin: mark emergency alert as resolved"""
+    try:
+        admin_id = int(getattr(admin_user, 'id', 0))
+        alert = EmergencyService.resolve_alert(db, data.alert_id, admin_id)
+
+        # Notify the user their alert was resolved
+        await ws_manager.send_to_user(int(alert.user_id), {
+            "type": "emergency_resolved",
+            "data": {
+                "alert_id": int(alert.id),
+                "resolved_at": alert.resolved_at.isoformat(),
+                "note": data.note,
+            }
+        })
+        return {"alert_id": int(alert.id), "status": "resolved"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Resolve alert error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to resolve alert")
+
 
 # Health check endpoint
 @app.get("/status")
