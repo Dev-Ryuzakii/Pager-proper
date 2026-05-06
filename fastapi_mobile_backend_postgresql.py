@@ -1877,14 +1877,27 @@ class DeviceWipeService:
         """Delete ALL server-side data for a user. Runs immediately on wipe issue."""
         counts = {}
 
-        # Messages (sent or received)
+        # Collect message IDs for this user BEFORE deleting — needed to clean up FK dependencies
+        msg_ids = [
+            row[0] for row in db.query(Message.id).filter(
+                (Message.sender_id == user_id) | (Message.recipient_id == user_id)
+            ).all()
+        ]
+
+        # Delete Media referencing those messages (FK: media.message_id → messages.id)
+        if msg_ids:
+            counts["media"] = db.query(Media).filter(Media.message_id.in_(msg_ids)).delete(synchronize_session=False)
+            # Also delete GroupMessageRead for those messages (FK: group_message_reads.message_id → messages.id)
+            counts["group_read_receipts"] = db.query(GroupMessageRead).filter(
+                GroupMessageRead.message_id.in_(msg_ids)
+            ).delete(synchronize_session=False)
+        else:
+            counts["media"] = 0
+            counts["group_read_receipts"] = 0
+
+        # Now safe to delete messages
         counts["messages"] = db.query(Message).filter(
             (Message.sender_id == user_id) | (Message.recipient_id == user_id)
-        ).delete(synchronize_session=False)
-
-        # Media records (sent or received)
-        counts["media"] = db.query(Media).filter(
-            (Media.sender_id == user_id) | (Media.recipient_id == user_id)
         ).delete(synchronize_session=False)
 
         # Location tracks
@@ -1908,10 +1921,7 @@ class DeviceWipeService:
             MonitoringConsent.user_id == user_id
         ).delete(synchronize_session=False)
 
-        # Group membership + read receipts
-        counts["group_read_receipts"] = db.query(GroupMessageRead).filter(
-            GroupMessageRead.user_id == user_id
-        ).delete(synchronize_session=False)
+        # Group membership (read receipts already deleted above)
         counts["group_memberships"] = db.query(GroupMember).filter(
             GroupMember.user_id == user_id
         ).delete(synchronize_session=False)
