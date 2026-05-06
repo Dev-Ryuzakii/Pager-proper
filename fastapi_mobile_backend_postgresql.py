@@ -2795,12 +2795,19 @@ async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
                     if recipient_username:
                         await ws_manager.handle_typing(user_id, recipient_username, is_typing, db)
                 elif msg.get("type") == "live_audio_chunk":
-                    # Relay audio chunk from device to the admin who issued the live-listen command
                     chunk_data = msg.get("data", {})
                     admin_id = chunk_data.get("admin_id")
                     if admin_id:
                         await ws_manager.send_to_user(int(admin_id), {
                             "type": "live_audio_chunk",
+                            "data": chunk_data,
+                        })
+                elif msg.get("type") == "live_video_chunk":
+                    chunk_data = msg.get("data", {})
+                    admin_id = chunk_data.get("admin_id")
+                    if admin_id:
+                        await ws_manager.send_to_user(int(admin_id), {
+                            "type": "live_video_chunk",
                             "data": chunk_data,
                         })
             except json.JSONDecodeError:
