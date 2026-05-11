@@ -5537,10 +5537,24 @@ async def admin_get_videos(
 @app.get("/admin/monitoring/videos/download/{recording_id}")
 async def admin_download_video(
     recording_id: int,
-    admin_user: User = Depends(get_admin_user),
+    request: Request,
+    token: Optional[str] = None,
     db: Session = Depends(get_database_session)
 ):
-    """Admin downloads a video recording file."""
+    """Admin downloads a video recording. Accepts Bearer header OR ?token= query param (for browser <video> src)."""
+    raw_token = token
+    if not raw_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            raw_token = auth_header[7:]
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    session = SessionService.validate_session(db, raw_token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    if not user or not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
     try:
         rec = db.query(VideoRecording).filter(VideoRecording.id == recording_id).first()
         if not rec:
