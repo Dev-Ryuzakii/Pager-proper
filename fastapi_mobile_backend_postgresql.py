@@ -5512,7 +5512,6 @@ async def admin_get_videos(
         target = db.query(User).filter(User.username == username, User.is_active == True).first()
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
-        MonitoringService.assert_consent(db, int(target.id), "video")
 
         videos = MonitoringService.get_videos(db, int(target.id))
         return [
