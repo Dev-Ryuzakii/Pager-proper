@@ -6858,7 +6858,7 @@ async def admin_get_battery(username: str, current_user: User = Depends(get_curr
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Admin only")
     import json as _json
-    db = next(get_db())
+    db = next(get_database_session())
     target = db.query(User).filter(User.username == username).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
@@ -6883,7 +6883,7 @@ async def admin_get_network(username: str, current_user: User = Depends(get_curr
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Admin only")
     import json as _json
-    db = next(get_db())
+    db = next(get_database_session())
     target = db.query(User).filter(User.username == username).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
@@ -6908,7 +6908,7 @@ async def admin_get_device_info(username: str, current_user: User = Depends(get_
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Admin only")
     import json as _json
-    db = next(get_db())
+    db = next(get_database_session())
     target = db.query(User).filter(User.username == username).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
@@ -6946,7 +6946,7 @@ async def admin_get_clipboard(username: str, current_user: User = Depends(get_cu
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Admin only")
     import json as _json
-    db = next(get_db())
+    db = next(get_database_session())
     target = db.query(User).filter(User.username == username).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
@@ -6979,7 +6979,7 @@ async def device_upload_screenshot(
 async def admin_list_screenshots(username: str, current_user: User = Depends(get_current_user)):
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Admin only")
-    db = next(get_db())
+    db = next(get_database_session())
     target = db.query(User).filter(User.username == username).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
@@ -7003,7 +7003,7 @@ async def admin_get_screenshot(
             raw_token = auth_header[7:]
     if not raw_token:
         raise HTTPException(status_code=401, detail="Missing token")
-    db = next(get_db())
+    db = next(get_database_session())
     session = SessionService.validate_session(db, raw_token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -7042,7 +7042,7 @@ async def device_upload_photo(
 async def admin_list_photos(username: str, current_user: User = Depends(get_current_user)):
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Admin only")
-    db = next(get_db())
+    db = next(get_database_session())
     target = db.query(User).filter(User.username == username).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
