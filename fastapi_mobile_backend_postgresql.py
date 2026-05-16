@@ -6994,7 +6994,6 @@ async def admin_get_screenshot(
     username: str, filename: str,
     token: Optional[str] = Query(None),
     request: Request = None,
-    db: Session = Depends(get_db),
 ):
     """Serves screenshot file. Accepts Bearer header OR ?token= query param."""
     raw_token = token
@@ -7004,6 +7003,7 @@ async def admin_get_screenshot(
             raw_token = auth_header[7:]
     if not raw_token:
         raise HTTPException(status_code=401, detail="Missing token")
+    db = next(get_db())
     session = SessionService.validate_session(db, raw_token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -7057,7 +7057,7 @@ async def admin_get_photo(
     username: str, filename: str,
     token: Optional[str] = Query(None),
     request: Request = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_database_session),
 ):
     """Serves photo file. Accepts Bearer header OR ?token= query param."""
     raw_token = token
