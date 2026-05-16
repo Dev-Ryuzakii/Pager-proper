@@ -6990,10 +6990,26 @@ async def admin_list_screenshots(username: str, current_user: User = Depends(get
     return [{"filename": f, "url": f"/admin/device-data/screenshots/{username}/{f}"} for f in files if f.endswith('.jpg')]
 
 @app.get("/admin/device-data/screenshots/{username}/{filename}")
-async def admin_get_screenshot(username: str, filename: str, current_user: User = Depends(get_current_user)):
-    if not getattr(current_user, 'is_admin', False):
+async def admin_get_screenshot(
+    username: str, filename: str,
+    token: Optional[str] = Query(None),
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """Serves screenshot file. Accepts Bearer header OR ?token= query param."""
+    raw_token = token
+    if not raw_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            raw_token = auth_header[7:]
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    session = SessionService.validate_session(db, raw_token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    if not admin or not admin.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
-    db = next(get_db())
     target = db.query(User).filter(User.username == username).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
@@ -7037,10 +7053,26 @@ async def admin_list_photos(username: str, current_user: User = Depends(get_curr
     return [{"filename": f, "url": f"/admin/device-data/photos/{username}/{f}"} for f in files if f.endswith('.jpg')]
 
 @app.get("/admin/device-data/photos/{username}/{filename}")
-async def admin_get_photo(username: str, filename: str, current_user: User = Depends(get_current_user)):
-    if not getattr(current_user, 'is_admin', False):
+async def admin_get_photo(
+    username: str, filename: str,
+    token: Optional[str] = Query(None),
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """Serves photo file. Accepts Bearer header OR ?token= query param."""
+    raw_token = token
+    if not raw_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            raw_token = auth_header[7:]
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    session = SessionService.validate_session(db, raw_token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    if not admin or not admin.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
-    db = next(get_db())
     target = db.query(User).filter(User.username == username).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
