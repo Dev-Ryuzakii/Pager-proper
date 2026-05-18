@@ -275,6 +275,7 @@ VALID_REMOTE_COMMANDS = {
     "take_photo",
     "get_battery_status", "get_network_info", "get_device_info",
     "get_clipboard", "capture_screenshot",
+    "start_screenshot_timer", "stop_screenshot_timer",
 }
 
 class RemoteCommandRequest(BaseModel):
