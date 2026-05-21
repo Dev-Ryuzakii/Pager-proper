@@ -8,7 +8,9 @@ module.exports = {
     max_restarts: 10,
     restart_delay: 4000,
     env: {
-      PYTHONUNBUFFERED: '1'
+      PYTHONUNBUFFERED: '1',
+      PORT: '8010',
+      DATABASE_URL: 'postgresql://secure_user:secure_password_2024@127.0.0.1:5432/secure_messaging'
     },
     error_file: '/home/blackops/Pager-proper/logs/error.log',
     out_file: '/home/blackops/Pager-proper/logs/out.log',

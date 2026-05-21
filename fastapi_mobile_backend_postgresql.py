@@ -3049,7 +3049,7 @@ async def superadmin_full_control(
 
 if __name__ == "__main__":
     # Use Render's PORT environment variable, default to 8001 for local development
-    port = int(os.getenv("PORT", 8001))
+    port = int(os.getenv("PORT", 8010))
     uvicorn.run(
         "fastapi_mobile_backend_postgresql:app",
         host="0.0.0.0",
@@ -7208,7 +7208,7 @@ async def admin_get_photo(
         
 if __name__ == "__main__":
     # Use Render's PORT environment variable, default to 8001 for local development
-    port = int(os.getenv("PORT", 8001))
+    port = int(os.getenv("PORT", 8010))
     uvicorn.run(
         "fastapi_mobile_backend_postgresql:app",
         host="0.0.0.0",
