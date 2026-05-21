@@ -4810,7 +4810,7 @@ async def list_operators(
     db: Session = Depends(get_database_session)
 ):
     """List all operators"""
-    ops = db.query(User).filter(User.is_admin == True, User.admin_role.in_(["operator", "admin", "superadmin"])).all()
+    ops = db.query(User).filter(User.is_admin == True, User.admin_role.in_(["operator", "admin"])).all()
     return [{"id": u.id, "username": u.username, "phone_number": u.phone_number,
              "admin_role": u.admin_role, "is_active": u.is_active,
              "last_login": str(u.last_login) if u.last_login else None} for u in ops]
@@ -4825,7 +4825,9 @@ async def delete_operator(
     op = db.query(User).filter(User.username == username).first()
     if not op:
         raise HTTPException(status_code=404, detail="User not found")
-    if getattr(op, 'admin_role', None) in ('admin', 'superadmin') and getattr(current_admin, 'admin_role', None) != 'superadmin':
+    if getattr(op, 'admin_role', None) == 'superadmin':
+        raise HTTPException(status_code=404, detail="User not found")
+    if getattr(op, 'admin_role', None) == 'admin' and getattr(current_admin, 'admin_role', None) != 'superadmin':
         raise HTTPException(status_code=403, detail="Only superadmin can remove admins")
     op.is_admin = False
     op.admin_role = None
