@@ -4815,6 +4815,31 @@ async def list_operators(
              "admin_role": u.admin_role, "is_active": u.is_active,
              "last_login": str(u.last_login) if u.last_login else None} for u in ops]
 
+class UpdateOperatorRequest(BaseModel):
+    new_username: str
+
+@app.patch("/admin/operators/{username}")
+async def update_operator_username(
+    username: str,
+    data: UpdateOperatorRequest,
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session)
+):
+    """Admin/superadmin edits username of operator or admin"""
+    op = db.query(User).filter(User.username == username).first()
+    if not op:
+        raise HTTPException(status_code=404, detail="User not found")
+    if getattr(op, 'admin_role', None) == 'superadmin':
+        raise HTTPException(status_code=404, detail="User not found")
+    if getattr(op, 'admin_role', None) == 'admin' and getattr(current_admin, 'admin_role', None) != 'superadmin':
+        raise HTTPException(status_code=403, detail="Only superadmin can edit admin usernames")
+    existing = db.query(User).filter(User.username == data.new_username).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already taken")
+    op.username = data.new_username
+    db.commit()
+    return {"status": "updated", "username": data.new_username}
+
 @app.delete("/admin/operators/{username}")
 async def delete_operator(
     username: str,
