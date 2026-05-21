@@ -402,7 +402,7 @@ class MessageService:
     """Service class for message operations"""
     
     @staticmethod
-    def send_message_by_username(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = None) -> Message:
+    def send_message_by_username(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = 12) -> Message:
         """Send a message to a specific user by username"""
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
         if not recipient:
@@ -438,8 +438,8 @@ class MessageService:
         return message
 
     @staticmethod
-    def send_message_to_group(db: Session, sender_id: int, group_id: int, message_content: str, 
-                             disappear_after_hours: Optional[int] = None, 
+    def send_message_to_group(db: Session, sender_id: int, group_id: int, message_content: str,
+                             disappear_after_hours: Optional[int] = 12,
                              addressed_to_id: Optional[int] = None,
                              is_admin_announcement: bool = False) -> Message:
         """Send a message to a group"""
@@ -2583,14 +2583,31 @@ async def lifespan(app: FastAPI):
                 logger.error(f"Error in periodic broadcast: {e}")
             await asyncio.sleep(15)  # Every 15 seconds
 
+    async def periodic_message_cleanup():
+        while True:
+            try:
+                await asyncio.sleep(1800)  # every 30 minutes
+                db = next(get_database_session())
+                try:
+                    deleted = MessageService.delete_expired_messages(db)
+                    MediaService.delete_expired_media(db)
+                    if deleted > 0:
+                        logger.info(f"Auto-cleanup: removed {deleted} expired messages")
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.error(f"Auto-cleanup error: {e}")
+
     broadcast_task = asyncio.create_task(periodic_status_broadcast())
     deadmans_task = asyncio.create_task(DeadMansSwitchService.run_checker(None))
+    cleanup_task = asyncio.create_task(periodic_message_cleanup())
 
     yield
 
     # Cancel periodic tasks during shutdown
     broadcast_task.cancel()
     deadmans_task.cancel()
+    cleanup_task.cancel()
     
     # Shutdown
     logger.info("📴 Shutting down FastAPI Mobile Backend")
