@@ -4792,7 +4792,7 @@ async def create_operator(
     op = User(
         username=data.username,
         phone_number=data.phone_number,
-        password_hash=hashlib.sha256(data.password.encode()).hexdigest(),
+        password_hash=hash_password(data.password),
         is_admin=True,
         admin_role=op_role,
         is_active=True,
