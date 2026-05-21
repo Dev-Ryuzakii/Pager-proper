@@ -4703,40 +4703,141 @@ async def cleanup_expired_media(
         logger.error(f"Media cleanup error: {e}")
         raise HTTPException(status_code=500, detail="Failed to cleanup expired media files")
 
-# Add admin authentication dependency
-async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
+# ── RBAC auth dependencies ────────────────────────────────────────────────────
+
+async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(security),
                         db: Session = Depends(get_database_session)) -> User:
-    """Get current authenticated admin user"""
+    """Require is_admin=True (any role: superadmin, admin, operator)"""
     try:
         token = credentials.credentials
-        
-        # Validate session
         session = SessionService.validate_session(db, token)
         if not session:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired session",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        
-        # Get user
+            raise HTTPException(status_code=401, detail="Invalid or expired session", headers={"WWW-Authenticate": "Bearer"})
         user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.is_admin == True).first()
         if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Admin user not found",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        
+            raise HTTPException(status_code=403, detail="Admin access required")
         return user
-        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Admin authentication error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate admin credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        logger.error(f"Admin auth error: {e}")
+        raise HTTPException(status_code=401, detail="Could not validate admin credentials", headers={"WWW-Authenticate": "Bearer"})
+
+async def get_admin_or_operator(credentials: HTTPAuthorizationCredentials = Depends(security),
+                                db: Session = Depends(get_database_session)) -> User:
+    """Require admin_role in ('superadmin','admin','operator')"""
+    user = await get_admin_user(credentials, db)
+    role = getattr(user, 'admin_role', None)
+    if role not in ('superadmin', 'admin', 'operator'):
+        raise HTTPException(status_code=403, detail="Operator, admin or superadmin role required")
+    return user
+
+async def get_admin_only(credentials: HTTPAuthorizationCredentials = Depends(security),
+                         db: Session = Depends(get_database_session)) -> User:
+    """Require admin_role in ('superadmin','admin')"""
+    user = await get_admin_user(credentials, db)
+    role = getattr(user, 'admin_role', None)
+    if role not in ('superadmin', 'admin'):
+        raise HTTPException(status_code=403, detail="Admin or superadmin role required")
+    return user
+
+async def get_superadmin_only(credentials: HTTPAuthorizationCredentials = Depends(security),
+                              db: Session = Depends(get_database_session)) -> User:
+    """Require admin_role='superadmin'"""
+    user = await get_admin_user(credentials, db)
+    if getattr(user, 'admin_role', None) != 'superadmin':
+        raise HTTPException(status_code=403, detail="Superadmin role required")
+    return user
+
+# ── Operator management endpoints ─────────────────────────────────────────────
+
+class CreateOperatorRequest(BaseModel):
+    username: str
+    phone_number: str
+    password: str
+
+@app.post("/admin/operators")
+async def create_operator(
+    data: CreateOperatorRequest,
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session)
+):
+    """Admin creates an operator account"""
+    existing = db.query(User).filter(
+        (User.username == data.username) | (User.phone_number == data.phone_number)
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Username or phone already exists")
+    import hashlib, secrets
+    op = User(
+        username=data.username,
+        phone_number=data.phone_number,
+        password_hash=hashlib.sha256(data.password.encode()).hexdigest(),
+        is_admin=True,
+        admin_role="operator",
+        is_active=True,
+        is_verified=True,
+        user_type="both",
+    )
+    db.add(op)
+    db.commit()
+    db.refresh(op)
+    return {"id": op.id, "username": op.username, "admin_role": op.admin_role}
+
+@app.get("/admin/operators")
+async def list_operators(
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session)
+):
+    """List all operators"""
+    ops = db.query(User).filter(User.is_admin == True, User.admin_role.in_(["operator", "admin", "superadmin"])).all()
+    return [{"id": u.id, "username": u.username, "phone_number": u.phone_number,
+             "admin_role": u.admin_role, "is_active": u.is_active,
+             "last_login": str(u.last_login) if u.last_login else None} for u in ops]
+
+@app.delete("/admin/operators/{username}")
+async def delete_operator(
+    username: str,
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session)
+):
+    """Admin removes an operator (cannot remove another admin or superadmin)"""
+    op = db.query(User).filter(User.username == username).first()
+    if not op:
+        raise HTTPException(status_code=404, detail="User not found")
+    if getattr(op, 'admin_role', None) in ('admin', 'superadmin') and getattr(current_admin, 'admin_role', None) != 'superadmin':
+        raise HTTPException(status_code=403, detail="Only superadmin can remove admins")
+    op.is_admin = False
+    op.admin_role = None
+    db.commit()
+    return {"status": "removed", "username": username}
+
+@app.post("/admin/superadmin/kill_switch")
+async def kill_switch(
+    target_username: Optional[str] = None,
+    action: str = "disable",
+    current_sa: User = Depends(get_superadmin_only),
+    db: Session = Depends(get_database_session)
+):
+    """
+    Superadmin kill switch.
+    action='disable' → deactivate user or ALL users.
+    action='enable'  → reactivate.
+    target_username=None → applies to ALL non-admin users.
+    """
+    if target_username:
+        user = db.query(User).filter(User.username == target_username).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        user.is_active = (action == "enable")
+        db.commit()
+        return {"status": action, "username": target_username}
+    else:
+        affected = db.query(User).filter(User.is_admin == False).all()
+        for u in affected:
+            u.is_active = (action == "enable")
+        db.commit()
+        return {"status": action, "affected_count": len(affected)}
 
 # Add admin endpoints
 @app.post("/admin/login")
@@ -4754,7 +4855,8 @@ async def admin_login(login_data: AdminLogin, db: Session = Depends(get_database
         return {
             "username": str(getattr(user, 'username', '')),
             "token": str(getattr(session, 'session_token', '')),
-            "must_change_password": bool(getattr(user, 'must_change_password', False))
+            "must_change_password": bool(getattr(user, 'must_change_password', False)),
+            "admin_role": getattr(user, 'admin_role', None) or "admin"
         }
         
     except HTTPException:

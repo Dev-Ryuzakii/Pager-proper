@@ -46,6 +46,7 @@ class User(Base):
     is_verified = Column(Boolean, default=False)
     user_type = Column(String(20), default="tls")  # "tls", "mobile", "both"
     is_admin = Column(Boolean, default=False)  # Admin account flag
+    admin_role = Column(String(20), nullable=True)  # "superadmin", "admin", "operator" — null for regular users
     voice_identity_path = Column(String(512), nullable=True)  # Path to voice identity file
     
     # Relationships
