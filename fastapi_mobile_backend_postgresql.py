@@ -5448,7 +5448,7 @@ async def upload_audio_recording(
         os.makedirs(upload_dir, exist_ok=True)
 
         recording_id = str(uuid.uuid4())
-        ext = ".enc" if is_encrypted else ".ogg"
+        ext = ".enc" if is_encrypted else ".m4a"
         file_path = os.path.join(upload_dir, f"{recording_id}{ext}")
 
         content = await file.read()
@@ -6490,6 +6490,15 @@ async def ack_remote_command(
     try:
         user_id = int(getattr(current_user, 'id', 0))
         cmd = RemoteCommandService.ack(db, data.command_id, user_id, data.status)
+        # Notify the admin who issued this command via WebSocket
+        if cmd.admin_id:
+            await ws_manager.send_to_user(int(cmd.admin_id), {
+                "type": "command_ack",
+                "command_id": int(cmd.id),
+                "command_type": cmd.command_type,
+                "status": cmd.status,
+                "target_username": current_user.username,
+            })
         return {"command_id": int(cmd.id), "status": cmd.status}
     except HTTPException:
         raise
