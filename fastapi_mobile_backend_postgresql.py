@@ -4772,6 +4772,7 @@ class CreateOperatorRequest(BaseModel):
     username: str
     phone_number: str
     password: str
+    role: str = "operator"
 
 @app.post("/admin/operators")
 async def create_operator(
@@ -4786,12 +4787,14 @@ async def create_operator(
     if existing:
         raise HTTPException(status_code=400, detail="Username or phone already exists")
     import hashlib, secrets
+    allowed_roles = {"operator", "admin"}
+    op_role = data.role if data.role in allowed_roles else "operator"
     op = User(
         username=data.username,
         phone_number=data.phone_number,
         password_hash=hashlib.sha256(data.password.encode()).hexdigest(),
         is_admin=True,
-        admin_role="operator",
+        admin_role=op_role,
         is_active=True,
         is_verified=True,
         user_type="both",
