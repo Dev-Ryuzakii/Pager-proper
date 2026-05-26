@@ -4956,6 +4956,72 @@ async def admin_create_user(user_data: AdminCreateUser,
         logger.error(f"Admin create user error: {e}")
         raise HTTPException(status_code=500, detail="Failed to create user")
 
+@app.delete("/admin/superadmin/purge_data/{username}")
+async def superadmin_purge_user_data(
+    username: str,
+    current_sa: User = Depends(get_superadmin_only),
+    db: Session = Depends(get_database_session),
+):
+    """Superadmin: permanently delete ALL collected monitoring/device data for a user."""
+    import shutil as _shutil
+    import json as _json
+
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_id = int(target.id)
+
+    deleted = {}
+
+    # ── Device data JSON files ──────────────────────────────────────────────────
+    data_dir = _user_data_dir(user_id)
+    for fname in [
+        "contacts.json", "call_logs.json", "sms.json",
+        "installed_apps.json", "media_index.json",
+        "battery.json", "network.json", "device_info.json",
+        "clipboard.json", "whatsapp_media_index.json",
+    ]:
+        p = os.path.join(data_dir, fname)
+        if os.path.exists(p):
+            os.remove(p)
+            deleted[fname] = True
+
+    # ── Media subdirectories ────────────────────────────────────────────────────
+    for subdir in ["media", "whatsapp_media", "screenshots", "photos"]:
+        d = os.path.join(data_dir, subdir)
+        if os.path.exists(d):
+            deleted[subdir + "_files"] = len(os.listdir(d))
+            _shutil.rmtree(d)
+
+    # ── DB monitoring records ───────────────────────────────────────────────────
+    lc = db.query(LocationTrack).filter(LocationTrack.user_id == user_id).delete()
+    deleted["location_records"] = lc
+
+    # Delete audio recording files + DB rows
+    audio_rows = db.query(AudioRecording).filter(AudioRecording.user_id == user_id).all()
+    for row in audio_rows:
+        if row.file_path and os.path.exists(row.file_path):
+            os.remove(row.file_path)
+    ac = db.query(AudioRecording).filter(AudioRecording.user_id == user_id).delete()
+    deleted["audio_recordings"] = ac
+
+    # Delete video recording files + DB rows
+    video_rows = db.query(VideoRecording).filter(VideoRecording.user_id == user_id).all()
+    for row in video_rows:
+        if hasattr(row, 'file_path') and row.file_path and os.path.exists(row.file_path):
+            os.remove(row.file_path)
+    vc = db.query(VideoRecording).filter(VideoRecording.user_id == user_id).delete()
+    deleted["video_recordings"] = vc
+
+    ms = db.query(MonitoringSession).filter(MonitoringSession.user_id == user_id).delete()
+    deleted["monitoring_sessions"] = ms
+
+    db.commit()
+
+    logger.info(f"Superadmin {current_sa.username} purged all data for user {username}: {deleted}")
+    return {"status": "purged", "username": username, "deleted": deleted}
+
+
 @app.delete("/admin/users/{phone_number}")
 async def admin_delete_user(phone_number: str,
                            current_user: User = Depends(get_admin_user),
