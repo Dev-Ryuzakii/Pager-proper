@@ -5,4 +5,5 @@ media_uploads/
 media_uploads/*
 .env
 *.log
-.DS_Store
+.DS_Storedevice_data/
+.env
