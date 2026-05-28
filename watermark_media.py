@@ -25,7 +25,9 @@ def _watermark_image(data: bytes, content_type: str, payload_text: str) -> Optio
         return None
 
     try:
-        img = Image.open(io.BytesIO(data)).convert("RGBA")
+        _imgobj = Image.open(io.BytesIO(data))
+        _pil_fmt = _imgobj.format or ""
+        img = _imgobj.convert("RGBA")
         w, h = img.size
     except Exception as e:
         logger.debug("Image open failed (not an image?): %s", e)
@@ -76,7 +78,7 @@ def _watermark_image(data: bytes, content_type: str, payload_text: str) -> Optio
     try:
         out = Image.alpha_composite(img, overlay)
         buf = io.BytesIO()
-        fmt = "PNG" if content_type in ("image/png", "image/x-png") else "JPEG"
+        fmt = "PNG" if _pil_fmt == "PNG" or content_type in ("image/png", "image/x-png") else "JPEG"
         if fmt == "JPEG":
             out = out.convert("RGB")
         out.save(buf, format=fmt, quality=92)
@@ -160,8 +162,8 @@ def apply_watermark(
     ct = (content_type or "").lower()
     fn = (filename or "").lower()
 
-    # Images
-    if ct.startswith("image/") or fn.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")):
+    # Images (also handle backend's internal media/photo type)
+    if ct.startswith("image/") or ct == "media/photo" or fn.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")):
         out = _watermark_image(data, ct, payload_text)
         if out is not None:
             return out
