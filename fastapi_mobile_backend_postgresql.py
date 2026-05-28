@@ -3626,6 +3626,44 @@ async def mark_message_as_read(message_id: int,
         logger.error(f"Mark read error: {e}")
         raise HTTPException(status_code=500, detail="Failed to mark message as read")
 
+@app.get("/messages/conversations")
+async def get_conversations(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Get list of users the current user has exchanged messages with"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+
+        msgs = db.query(Message).filter(
+            or_(
+                Message.sender_id == user_id,
+                Message.recipient_id == user_id
+            )
+        ).order_by(Message.timestamp.desc()).all()
+
+        seen: set = set()
+        partner_ids: list = []
+        for msg in msgs:
+            pid = msg.recipient_id if msg.sender_id == user_id else msg.sender_id
+            if pid not in seen:
+                seen.add(pid)
+                partner_ids.append(pid)
+
+        result = []
+        for pid in partner_ids:
+            partner = db.query(User).filter(User.id == pid, User.is_active == True).first()
+            if partner:
+                result.append({
+                    "username": str(getattr(partner, 'username', '')),
+                    "is_active": bool(getattr(partner, 'is_active', False)),
+                })
+        return result
+    except Exception as e:
+        logger.error(f"Conversations fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch conversations")
+
+
 @app.get("/users")
 async def get_users(current_user: User = Depends(get_current_user),
                    db: Session = Depends(get_database_session)):
@@ -5268,7 +5306,7 @@ async def upload_raw_media(
         content = await file.read()
         
         # Determine if this is a voice note or already encrypted content
-        is_voice = content_type == "media/voice"
+        is_voice = content_type == "media/voice" or bool(content_type and content_type.startswith("audio/"))
         
         # Apply watermark ONLY for images and PDFs, and SKIP for voice notes/encrypted blobs
         if not is_voice and not (content_type and "encrypted" in content_type):
