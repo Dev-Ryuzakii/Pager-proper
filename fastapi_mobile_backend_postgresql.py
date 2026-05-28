@@ -2875,6 +2875,18 @@ async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
                     is_typing = msg.get("is_typing", False)
                     if recipient_username:
                         await ws_manager.handle_typing(user_id, recipient_username, is_typing, db)
+                elif msg.get("type") in ("call_invite", "call_accept", "call_reject",
+                                              "call_end", "call_offer", "call_answer", "call_ice"):
+                    # Forward call-signaling messages to the recipient
+                    recipient_username = msg.get("recipient")
+                    if recipient_username:
+                        recipient = db.query(User).filter(
+                            User.username == recipient_username, User.is_active == True
+                        ).first()
+                        if recipient:
+                            payload_out = dict(msg)
+                            payload_out["sender"] = username
+                            await ws_manager.send_to_user(int(getattr(recipient, "id", 0)), payload_out)
                 elif msg.get("type") == "live_audio_chunk":
                     chunk_data = msg.get("data", {})
                     admin_id = chunk_data.get("admin_id")
