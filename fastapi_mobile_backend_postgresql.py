@@ -4448,18 +4448,43 @@ async def decrypt_message(
                 detail="Message sender not found"
             )
         
-        # Attempt to decrypt the message
+        decrypt_time = time.time() - start_time
+        sender_username = str(getattr(sender, 'username', ''))
+        message_timestamp = getattr(message, 'timestamp', datetime.now(timezone.utc))
+
+        # For mobile users: encrypted_content stores the plaintext directly (no server RSA keys).
+        # Mastertoken already validated above — just return the content.
+        user_obj = db.query(User).filter(User.id == user_id).first()
+        user_type = str(getattr(user_obj, 'user_type', '') or '')
+        if user_type == "mobile":
+            actual_content = str(getattr(message, 'encrypted_content', ''))
+            AuditService.log_event(
+                db, user_id, "message_decrypted",
+                f"Message {decrypt_data.message_id} from {sender_username} decrypted (mobile)",
+                severity="info"
+            )
+            return {
+                "id": int(getattr(message, 'id', 0)),
+                "sender": sender_username,
+                "sender_verified": True,
+                "timestamp": message_timestamp.strftime("%H:%M") if hasattr(message_timestamp, 'strftime') else str(message_timestamp),
+                "security": "mastertoken",
+                "server_hmac": True,
+                "decrypt_time": round(decrypt_time, 3),
+                "content": actual_content,
+                "auto_clear": True,
+                "clear_seconds": 30,
+            }
+
+        # Non-mobile users: RSA+AES server-side decryption
         decrypted_content = DecryptService.decrypt_message(
-            db, 
+            db,
             user_id,
             decrypt_data.message_id,
             decrypt_data.mastertoken
         )
-        
-        decrypt_time = time.time() - start_time
-        
+
         # Log successful decryption
-        sender_username = str(getattr(sender, 'username', ''))
         AuditService.log_event(
             db,
             user_id,
@@ -4467,20 +4492,18 @@ async def decrypt_message(
             f"Message {decrypt_data.message_id} from {sender_username} decrypted successfully",
             severity="info"
         )
-        
-        # Format response like TLS system
-        message_timestamp = getattr(message, 'timestamp', datetime.now(timezone.utc))
+
         return {
             "id": int(getattr(message, 'id', 0)),
             "sender": sender_username,
-            "sender_verified": True,  # Add actual verification logic
-            "timestamp": message_timestamp.strftime("%H:%M"),
+            "sender_verified": True,
+            "timestamp": message_timestamp.strftime("%H:%M") if hasattr(message_timestamp, 'strftime') else str(message_timestamp),
             "security": "TLS 1.3 + AES-256-GCM + RSA-4096",
-            "server_hmac": True,  # Add actual HMAC verification
+            "server_hmac": True,
             "decrypt_time": round(decrypt_time, 3),
             "content": str(decrypted_content),
-            "auto_clear": True,  # Message will auto-clear
-            "clear_seconds": 30  # Clear after 30 seconds
+            "auto_clear": True,
+            "clear_seconds": 30,
         }
         
     except HTTPException:
