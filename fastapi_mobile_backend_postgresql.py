@@ -2473,76 +2473,133 @@ class AdminService:
     
     @staticmethod
     def delete_user(db: Session, admin_user_id: int, phone_number: str) -> bool:
-        """Delete a user account (admin only)"""
-        # Check if requesting user is admin
+        """Delete a user account and ALL associated data (admin only)."""
         if not AdminService.is_admin(db, admin_user_id):
             raise HTTPException(status_code=403, detail="Only admin users can delete accounts")
-        
-        # Get the user to delete by phone number
+
         user = db.query(User).filter(User.phone_number == phone_number).first()
         if not user:
             return False
-        
-        # Prevent admin from deleting themselves
+
         if user.id == admin_user_id:
             raise HTTPException(status_code=400, detail="Admin cannot delete their own account")
-        
-        # Get user ID for logging
-        user_id = getattr(user, 'id', None)
-        
+
+        user_id = int(getattr(user, 'id', 0))
+
         try:
-            # 1. Remove from group memberships
+            # ── 1. Leaf tables (no children) ──────────────────────────────────
             db.query(GroupMember).filter(GroupMember.user_id == user_id).delete()
-            
-            # 2. Delete audit logs associated with the user
-            db.query(AuditLog).filter(AuditLog.user_id == user_id).delete()
-            
-            # 3. Delete user sessions
             db.query(UserSession).filter(UserSession.user_id == user_id).delete()
-            
-            # 4. Delete user keys
             db.query(UserKey).filter(UserKey.user_id == user_id).delete()
-            
-            # 5. Delete user master tokens
             db.query(DBMasterToken).filter(DBMasterToken.user_id == user_id).delete()
-            
-            # 6. Delete media files (filesystem and DB)
+            db.query(MonitoringConsent).filter(MonitoringConsent.user_id == user_id).delete()
+            db.query(LocationTrack).filter(LocationTrack.user_id == user_id).delete()
+            db.query(GeofenceEvent).filter(GeofenceEvent.user_id == user_id).delete()
+            db.query(DeadMansSwitch).filter(DeadMansSwitch.user_id == user_id).delete()
+
+            # ── 2. Monitoring sessions (admin_id or target_user_id) ───────────
+            db.query(MonitoringSession).filter(
+                or_(MonitoringSession.admin_id == user_id,
+                    MonitoringSession.target_user_id == user_id)
+            ).delete()
+
+            # ── 3. Remote commands (issued_by or target) ──────────────────────
+            db.query(RemoteCommand).filter(
+                or_(RemoteCommand.issued_by_admin_id == user_id,
+                    RemoteCommand.target_user_id == user_id)
+            ).delete()
+
+            # ── 4. Device wipe commands ───────────────────────────────────────
+            db.query(DeviceWipeCommand).filter(
+                or_(DeviceWipeCommand.target_user_id == user_id,
+                    DeviceWipeCommand.issued_by_admin_id == user_id)
+            ).delete()
+
+            # ── 5. Audio & video recordings (delete files from disk too) ──────
+            audio_recs = db.query(AudioRecording).filter(
+                AudioRecording.user_id == user_id
+            ).all()
+            for rec in audio_recs:
+                fp = getattr(rec, 'file_path', None)
+                if fp and os.path.exists(fp):
+                    try:
+                        os.remove(fp)
+                    except Exception as e:
+                        logger.warning(f"Could not delete audio file {fp}: {e}")
+                db.delete(rec)
+
+            video_recs = db.query(VideoRecording).filter(
+                VideoRecording.user_id == user_id
+            ).all()
+            for rec in video_recs:
+                for fp in [getattr(rec, 'file_path', None),
+                           getattr(rec, 'thumbnail_path', None)]:
+                    if fp and os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except Exception as e:
+                            logger.warning(f"Could not delete video file {fp}: {e}")
+                db.delete(rec)
+
+            # ── 6. Emergency alerts ───────────────────────────────────────────
+            db.query(EmergencyAlert).filter(
+                or_(EmergencyAlert.user_id == user_id,
+                    EmergencyAlert.acknowledged_by == user_id)
+            ).delete()
+
+            # ── 7. Media files (disk + DB) ────────────────────────────────────
             media_files = db.query(Media).filter(
                 or_(Media.sender_id == user_id, Media.recipient_id == user_id)
             ).all()
-            
             for media in media_files:
-                file_path = getattr(media, 'encrypted_file_path', None)
-                if file_path and os.path.exists(file_path):
+                fp = getattr(media, 'encrypted_file_path', None)
+                if fp and os.path.exists(fp):
                     try:
-                        os.remove(file_path)
+                        os.remove(fp)
                     except Exception as e:
-                        logger.error(f"Error deleting file {file_path}: {e}")
+                        logger.warning(f"Could not delete media file {fp}: {e}")
                 db.delete(media)
-            
-            # 7. Delete messages
+
+            db.flush()  # persist media deletes before message deletes
+
+            # ── 8. Group message read receipts (FK → messages.id) ─────────────
+            db.query(GroupMessageRead).filter(GroupMessageRead.user_id == user_id).delete()
+
+            # Also clean up read receipts for messages sent/received by this user
+            msg_ids = [
+                m.id for m in db.query(Message.id).filter(
+                    or_(Message.sender_id == user_id, Message.recipient_id == user_id)
+                ).all()
+            ]
+            if msg_ids:
+                db.query(GroupMessageRead).filter(
+                    GroupMessageRead.message_id.in_(msg_ids)
+                ).delete(synchronize_session=False)
+
+            # ── 9. Messages ───────────────────────────────────────────────────
             db.query(Message).filter(
                 or_(Message.sender_id == user_id, Message.recipient_id == user_id)
             ).delete()
-            
-            # 8. Delete calls
+
+            # ── 10. Calls ─────────────────────────────────────────────────────
             db.query(Call).filter(
                 or_(Call.caller_id == user_id, Call.recipient_id == user_id)
             ).delete()
-            
-            # 9. Finally delete the user
+
+            # ── 11. Audit logs ────────────────────────────────────────────────
+            db.query(AuditLog).filter(AuditLog.user_id == user_id).delete()
+
+            # ── 12. Delete user row ───────────────────────────────────────────
             db.delete(user)
             db.commit()
-            
-            # Log deletion
+
             AuditService.log_event(
-                db, admin_user_id, "admin_delete_user", 
-                f"User {phone_number} and all associated data deleted by admin"
+                db, admin_user_id, "admin_delete_user",
+                f"User {phone_number} and all associated data permanently deleted by admin"
             )
-            
-            logger.info(f"✅ User deleted by admin: {phone_number}")
+            logger.info(f"✅ User fully deleted by admin: {phone_number}")
             return True
-            
+
         except Exception as e:
             db.rollback()
             logger.error(f"Error deleting user {phone_number}: {e}")
