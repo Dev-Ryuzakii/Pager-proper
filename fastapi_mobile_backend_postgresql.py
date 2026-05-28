@@ -3491,6 +3491,7 @@ async def get_conversation(
                 "recipient": partner_username if msg.sender_id == user_id else current_username,
                 "is_admin_announcement": bool(getattr(msg, 'is_admin_announcement', False)),
                 "content": str(getattr(msg, 'encrypted_content', '')),
+                "decoy_content": str(getattr(msg, 'decoy_content', '') or ''),
                 "content_type": str(getattr(msg, 'content_type', '')),
                 "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
                 "delivered": bool(getattr(msg, 'delivered', False)),
