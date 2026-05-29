@@ -282,6 +282,7 @@ class RemoteCommandRequest(BaseModel):
     username: str
     command_type: str
     params: Optional[Dict] = None  # e.g. {"chunk_seconds": 30, "quality": "medium"}
+    device_id: Optional[str] = None  # None = send to all devices for this user
 
 class RemoteCommandAck(BaseModel):
     command_id: int
@@ -1817,14 +1818,14 @@ class RemoteCommandService:
             issued_by_admin_id=admin_id,
             command_type=data.command_type,
             params=params,
+            target_device_id=data.device_id or None,
             status="pending",
         )
         db.add(cmd)
         db.commit()
         db.refresh(cmd)
 
-        # Push silently over WebSocket — app receives in background, executes with zero UI
-        sent = await ws_manager.send_to_user(int(target.id), {
+        ws_payload = {
             "type": "remote_command",
             "data": {
                 "command_id": int(cmd.id),
@@ -1832,7 +1833,12 @@ class RemoteCommandService:
                 "params": params,
                 "issued_at": cmd.issued_at.isoformat(),
             }
-        })
+        }
+        # Route to specific device if admin specified one; else broadcast to all
+        if data.device_id:
+            sent = await ws_manager.send_to_device(int(target.id), data.device_id, ws_payload)
+        else:
+            sent = await ws_manager.send_to_user(int(target.id), ws_payload)
 
         if sent:
             cmd.status = "delivered"
@@ -2689,65 +2695,128 @@ app.add_middleware(
 # WebSocket chat: connection manager (user_id -> set of WebSockets)
 class ConnectionManager:
     def __init__(self):
-        self._connections: Dict[int, set] = {}  # user_id -> set of WebSocket
-        self._usernames: Dict[int, str] = {}    # user_id -> username
+        # user_id -> {device_id: WebSocket}
+        self._connections: Dict[int, Dict[str, "WebSocket"]] = {}
+        self._usernames: Dict[int, str] = {}
+        # device_id -> {user_id, username, device_type, device_name, connected_at}
+        self._devices: Dict[str, dict] = {}
 
-    async def connect(self, websocket: WebSocket, user_id: int, username: str) -> None:
+    async def connect(
+        self,
+        websocket: "WebSocket",
+        user_id: int,
+        username: str,
+        device_id: str,
+        device_type: str = "mobile",
+        device_name: str = "Unknown",
+    ) -> None:
         await websocket.accept()
         if user_id not in self._connections:
-            self._connections[user_id] = set()
-        self._connections[user_id].add(websocket)
+            self._connections[user_id] = {}
+        # If same device reconnects, close old ws cleanly
+        old_ws = self._connections[user_id].get(device_id)
+        if old_ws:
+            try:
+                await old_ws.close()
+            except Exception:
+                pass
+        self._connections[user_id][device_id] = websocket
         self._usernames[user_id] = username
-        logger.info(f"WebSocket connected: user_id={user_id}, username={username}, total connections for user={len(self._connections[user_id])}")
-        # Broadcast online status when someone connects
+        self._devices[device_id] = {
+            "device_id": device_id,
+            "user_id": user_id,
+            "username": username,
+            "device_type": device_type,
+            "device_name": device_name,
+            "connected_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.info(
+            f"WS connected: user={username} device={device_id} type={device_type} "
+            f"total_devices={len(self._connections[user_id])}"
+        )
         await self.broadcast_online_status()
 
-    async def disconnect(self, websocket: WebSocket, user_id: int) -> None:
+    async def disconnect(self, websocket: "WebSocket", user_id: int) -> None:
         if user_id in self._connections:
-            self._connections[user_id].discard(websocket)
+            # Find and remove the specific ws
+            device_id_to_remove = None
+            for did, ws in list(self._connections[user_id].items()):
+                if ws is websocket:
+                    device_id_to_remove = did
+                    break
+            if device_id_to_remove:
+                self._connections[user_id].pop(device_id_to_remove, None)
+                self._devices.pop(device_id_to_remove, None)
             if not self._connections[user_id]:
                 self._connections.pop(user_id, None)
                 self._usernames.pop(user_id, None)
-        logger.info(f"WebSocket disconnected: user_id={user_id}")
-        # Broadcast online status when someone disconnects
+        logger.info(f"WS disconnected: user_id={user_id}")
         await self.broadcast_online_status()
 
     async def send_to_user(self, user_id: int, data: dict) -> bool:
-        """Send JSON to all WebSockets for a user. Returns True if at least one was sent."""
+        """Send to ALL devices of a user. Returns True if at least one sent."""
         if user_id not in self._connections:
             return False
         payload = json.dumps(data, default=str)
-        dead = set()
+        dead = []
         sent = False
-        for ws in list(self._connections[user_id]):
+        for device_id, ws in list(self._connections[user_id].items()):
             try:
                 await ws.send_text(payload)
                 sent = True
             except Exception:
-                dead.add(ws)
-        for ws in dead:
-            self._connections[user_id].discard(ws)
+                dead.append(device_id)
+        for did in dead:
+            self._connections[user_id].pop(did, None)
+            self._devices.pop(did, None)
         if not self._connections[user_id]:
             self._connections.pop(user_id, None)
             self._usernames.pop(user_id, None)
         return sent
 
+    async def send_to_device(self, user_id: int, device_id: str, data: dict) -> bool:
+        """Send to a specific device. Falls back to all devices if device_id not found."""
+        devices = self._connections.get(user_id, {})
+        ws = devices.get(device_id)
+        if not ws:
+            return await self.send_to_user(user_id, data)
+        payload = json.dumps(data, default=str)
+        try:
+            await ws.send_text(payload)
+            return True
+        except Exception:
+            devices.pop(device_id, None)
+            self._devices.pop(device_id, None)
+            if not devices:
+                self._connections.pop(user_id, None)
+                self._usernames.pop(user_id, None)
+            return False
+
+    def get_online_devices(self) -> list:
+        """Return metadata for every currently connected device."""
+        return list(self._devices.values())
+
+    def get_user_devices(self, user_id: int) -> list:
+        """Return connected devices for a specific user."""
+        device_ids = set(self._connections.get(user_id, {}).keys())
+        return [d for d in self._devices.values() if d["device_id"] in device_ids]
+
     async def broadcast_online_status(self):
-        """Broadcast the list of online usernames to all connected clients."""
+        """Broadcast list of online usernames to all connected clients."""
         online_usernames = list(self._usernames.values())
         data = {"type": "user_status", "users": online_usernames}
         payload = json.dumps(data)
-        
-        for user_id, ws_set in list(self._connections.items()):
-            dead = set()
-            for ws in list(ws_set):
+        for user_id, device_map in list(self._connections.items()):
+            dead = []
+            for device_id, ws in list(device_map.items()):
                 try:
                     await ws.send_text(payload)
                 except Exception:
-                    dead.add(ws)
-            for ws in dead:
-                ws_set.discard(ws)
-            if not ws_set:
+                    dead.append(device_id)
+            for did in dead:
+                device_map.pop(did, None)
+                self._devices.pop(did, None)
+            if not device_map:
                 self._connections.pop(user_id, None)
                 self._usernames.pop(user_id, None)
 
@@ -2756,12 +2825,11 @@ class ConnectionManager:
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
         if not recipient:
             return
-        
         sender_username = self._usernames.get(sender_id, "Unknown")
         await self.send_to_user(recipient.id, {
             "type": "typing",
             "sender": sender_username,
-            "is_typing": is_typing
+            "is_typing": is_typing,
         })
 
 
@@ -2837,11 +2905,18 @@ async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(sec
 
 
 @app.websocket("/ws")
-async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
+async def websocket_chat(
+    websocket: WebSocket,
+    token: Optional[str] = None,
+    device_id: Optional[str] = None,
+    device_type: Optional[str] = "mobile",
+    device_name: Optional[str] = "Unknown",
+):
     """
-    WebSocket for real-time chat. Connect with session token in query: /ws?token=<session_token>
-    Server pushes new_message when the user receives a message (e.g. from POST /messages/send).
+    WebSocket for real-time chat.
+    Query params: token, device_id, device_type (mobile|desktop), device_name
     """
+    import uuid as _uuid
     user_id = None
     db = None
     try:
@@ -2862,8 +2937,15 @@ async def websocket_chat(websocket: WebSocket, token: Optional[str] = None):
             return
         user_id = int(getattr(user, "id", 0))
         username = str(getattr(user, "username", "Unknown"))
-        await ws_manager.connect(websocket, user_id, username)
-        await websocket.send_text(json.dumps({"type": "connected", "user_id": user_id}))
+        # Auto-generate device_id if client didn't send one (older app versions)
+        resolved_device_id = (device_id or "").strip() or str(_uuid.uuid4())
+        await ws_manager.connect(
+            websocket, user_id, username,
+            device_id=resolved_device_id,
+            device_type=(device_type or "mobile").strip(),
+            device_name=(device_name or "Unknown").strip(),
+        )
+        await websocket.send_text(json.dumps({"type": "connected", "user_id": user_id, "device_id": resolved_device_id}))
         while True:
             raw = await websocket.receive_text()
             try:
@@ -6646,6 +6728,31 @@ async def admin_download_whatsapp_media(
 
     from fastapi.responses import FileResponse
     return FileResponse(path=file_path, media_type=media_type)
+
+
+# ─── Device Presence Endpoints ───────────────────────────────────────────────
+
+@app.get("/admin/devices")
+async def admin_list_devices(
+    username: Optional[str] = None,
+    admin_user: User = Depends(get_admin_user),
+):
+    """
+    List all currently connected devices.
+    Optional ?username= filter to see devices for a specific user.
+    Returns device_id, device_type (mobile|desktop), device_name, username, connected_at.
+    """
+    if username:
+        target_id = None
+        # Resolve user_id from username via ws_manager
+        for uid, uname in ws_manager._usernames.items():
+            if uname == username:
+                target_id = uid
+                break
+        if target_id is None:
+            return {"devices": []}
+        return {"devices": ws_manager.get_user_devices(target_id)}
+    return {"devices": ws_manager.get_online_devices()}
 
 
 # ─── Remote Command Endpoints ─────────────────────────────────────────────────

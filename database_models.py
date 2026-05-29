@@ -358,6 +358,7 @@ class RemoteCommand(Base):
     # boost_location_frequency, normal_location_frequency,
     # panic_mode_on, panic_mode_off
     params = Column(JSON, nullable=True)          # extra config (chunk_seconds, quality, etc.)
+    target_device_id = Column(String(255), nullable=True)   # None = broadcast to all devices
     status = Column(String(20), default="pending")  # pending, delivered, executing, done, failed
     issued_at = Column(DateTime, default=func.now())
     delivered_at = Column(DateTime, nullable=True)
