@@ -1818,8 +1818,8 @@ class RemoteCommandService:
             issued_by_admin_id=admin_id,
             command_type=data.command_type,
             params=params,
-            target_device_id=data.device_id or None,
             status="pending",
+            # target_device_id omitted — column needs migration before use
         )
         db.add(cmd)
         db.commit()
