@@ -5323,6 +5323,22 @@ async def admin_get_all_groups(current_user: User = Depends(get_admin_user),
         logger.error(f"Admin list groups error: {e}")
         raise HTTPException(status_code=500, detail="Failed to list groups")
 
+@app.get("/admin/groups/{group_id}/members")
+async def admin_get_group_members(group_id: int,
+                                  current_user: User = Depends(get_admin_user),
+                                  db: Session = Depends(get_database_session)):
+    """Get members of a group (admin — no membership check)"""
+    try:
+        group = db.query(Group).filter(Group.id == group_id).first()
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+        return GroupService.get_group_members(db, group_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin get group members error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve group members")
+
 @app.put("/admin/groups/{group_id}")
 async def admin_update_group(group_id: int,
                             group_data: AdminGroupUpdate,
