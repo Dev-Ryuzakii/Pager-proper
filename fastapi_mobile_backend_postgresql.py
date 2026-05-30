@@ -3965,18 +3965,28 @@ async def get_group_messages(
         read_receipts = [{"username": row.username, "read_at": row.read_at} for row in read_by_rows]
         is_read_by_me = any(row.user_id == user_id for row in read_by_rows)
         
+        recipient_user = None
+        if m.recipient_id:
+            recipient_user = db.query(User).filter(User.id == m.recipient_id).first()
+        is_private_tagged = m.recipient_id is not None
+        can_read_content = (
+            not is_private_tagged or
+            user_id == m.sender_id or
+            user_id == m.recipient_id
+        )
         result.append({
             "id": int(m.id),
             "sender": str(getattr(sender_user, 'username', 'Unknown')),
-            "recipient": "group",
-            "content": str(m.encrypted_content),
-            "content_type": str(m.content_type),
+            "recipient": str(getattr(recipient_user, 'username', '')) if recipient_user else "group",
+            "content": str(m.encrypted_content) if can_read_content else str(getattr(m, 'decoy_content', '') or '[Private tagged message]'),
+            "content_type": str(m.content_type) if can_read_content else "private_tagged",
             "timestamp": m.timestamp,
             "delivered": bool(m.delivered),
             "read": is_read_by_me,
             "read_by": read_by_list,
             "read_receipts": read_receipts,
             "is_admin_announcement": bool(getattr(m, 'is_admin_announcement', False)),
+            "is_private_tagged": is_private_tagged,
             "decoy_content": str(getattr(m, 'decoy_content', '')),
             "group_id": int(group_id)
         })
@@ -4029,18 +4039,20 @@ async def send_group_message(
         
         addressed_to_id = None
         is_announcement = False
-        
+
         if payload.addressed_to_username:
-            if not is_admin:
-                raise HTTPException(status_code=403, detail="Only admins can address group messages to individuals")
-            
-            # Find the user
+            # Find the user — verify they are a group member
             target_user = db.query(User).filter(User.username == payload.addressed_to_username, User.is_active == True).first()
             if not target_user:
-                raise HTTPException(status_code=404, detail="Target user for announcement not found")
-            
+                raise HTTPException(status_code=404, detail="Target user not found")
+            target_member = db.query(GroupMember).filter(
+                GroupMember.group_id == payload.group_id,
+                GroupMember.user_id == target_user.id
+            ).first()
+            if not target_member:
+                raise HTTPException(status_code=400, detail="Target user is not a member of this group")
             addressed_to_id = target_user.id
-            is_announcement = True
+            is_announcement = bool(getattr(current_user, 'is_admin', False))
             
         message = MessageService.send_message_to_group(
             db, user_id, payload.group_id, payload.message, 
@@ -4101,13 +4113,20 @@ async def get_group_conversation(
             if msg.recipient_id:
                 recipient = db.query(User).filter(User.id == msg.recipient_id).first()
                 
+            is_private_tagged = msg.recipient_id is not None
+            can_read_content = (
+                not is_private_tagged or
+                user_id == msg.sender_id or
+                user_id == msg.recipient_id
+            )
             result.append({
                 "id": int(getattr(msg, 'id', 0)),
                 "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
                 "recipient": str(getattr(recipient, 'username', '')) if recipient else "group",
                 "is_admin_announcement": bool(getattr(msg, 'is_admin_announcement', False)),
-                "content": str(getattr(msg, 'encrypted_content', '')),
-                "content_type": str(getattr(msg, 'content_type', '')),
+                "is_private_tagged": is_private_tagged,
+                "content": str(getattr(msg, 'encrypted_content', '')) if can_read_content else str(getattr(msg, 'decoy_content', '') or '[Private tagged message]'),
+                "content_type": str(getattr(msg, 'content_type', '')) if can_read_content else "private_tagged",
                 "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
                 "decoy_content": getattr(msg, 'decoy_content', '')
             })
