@@ -4544,20 +4544,25 @@ async def decrypt_message(
         
         # Get the message first to check existence
         message = db.query(Message).filter(
-            and_(
-                Message.id == decrypt_data.message_id,
-                or_(
-                    Message.sender_id == user_id,
-                    Message.recipient_id == user_id
-                )
-            )
+            Message.id == decrypt_data.message_id
         ).first()
-        
+
         if not message:
-            raise HTTPException(
-                status_code=404,
-                detail="Message not found"
-            )
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        # Access check: sender, DM recipient, or group member
+        _is_sender    = getattr(message, 'sender_id', None) == user_id
+        _is_recipient = getattr(message, 'recipient_id', None) == user_id
+        _group_id     = getattr(message, 'group_id', None)
+        _is_group_member = False
+        if _group_id:
+            _is_group_member = db.query(GroupMember).filter(
+                GroupMember.group_id == _group_id,
+                GroupMember.user_id == user_id
+            ).first() is not None
+
+        if not (_is_sender or _is_recipient or _is_group_member):
+            raise HTTPException(status_code=404, detail="Message not found")
             
         # Get sender info
         sender = db.query(User).filter(User.id == message.sender_id).first()
@@ -4571,15 +4576,16 @@ async def decrypt_message(
         sender_username = str(getattr(sender, 'username', ''))
         message_timestamp = getattr(message, 'timestamp', datetime.now(timezone.utc))
 
-        # For mobile users: encrypted_content stores the plaintext directly (no server RSA keys).
+        # For mobile users and group messages: encrypted_content stores plaintext directly.
         # Mastertoken already validated above — just return the content.
         user_obj = db.query(User).filter(User.id == user_id).first()
         user_type = str(getattr(user_obj, 'user_type', '') or '')
-        if user_type == "mobile":
+        msg_group_id = getattr(message, 'group_id', None)
+        if user_type == "mobile" or msg_group_id is not None:
             actual_content = str(getattr(message, 'encrypted_content', ''))
             AuditService.log_event(
                 db, user_id, "message_decrypted",
-                f"Message {decrypt_data.message_id} from {sender_username} decrypted (mobile)",
+                f"Message {decrypt_data.message_id} from {sender_username} decrypted ({'group' if msg_group_id else 'mobile'})",
                 severity="info"
             )
             return {
