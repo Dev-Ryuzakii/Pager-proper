@@ -953,17 +953,23 @@ class DecryptService:
     def decrypt_message(db: Session, user_id: int, message_id: int, mastertoken: str) -> Optional[str]:
         """Decrypt a message using the master token"""
         # Get the message
-        message = db.query(Message).filter(
-            and_(
-                Message.id == message_id,
-                or_(
-                    Message.sender_id == user_id,
-                    Message.recipient_id == user_id
-                )
-            )
-        ).first()
-        
+        message = db.query(Message).filter(Message.id == message_id).first()
+
         if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        # Access check: sender, DM recipient, or group member
+        is_sender = getattr(message, 'sender_id', None) == user_id
+        is_recipient = getattr(message, 'recipient_id', None) == user_id
+        group_id = getattr(message, 'group_id', None)
+        is_group_member = False
+        if group_id:
+            is_group_member = db.query(GroupMember).filter(
+                GroupMember.group_id == group_id,
+                GroupMember.user_id == user_id
+            ).first() is not None
+
+        if not (is_sender or is_recipient or is_group_member):
             raise HTTPException(status_code=404, detail="Message not found")
         
         try:
