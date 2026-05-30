@@ -137,6 +137,9 @@ class MessageResponse(BaseModel):
     read_receipts: Optional[List[GroupReadReceipt]] = []
     server_hmac: bool = Field(default=True, description="Message authentication status")
     decrypt_time: float = Field(default=0.0, description="Time taken to decrypt in seconds")
+    decoy_content: Optional[str] = None
+    is_private_tagged: Optional[bool] = False
+    group_id: Optional[int] = None
 
 class UserResponse(BaseModel):
     username: str
