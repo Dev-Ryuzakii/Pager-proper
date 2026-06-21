@@ -44,7 +44,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -3537,6 +3537,197 @@ async def send_ice_candidate(
         raise HTTPException(status_code=500, detail="Failed to forward ICE candidate")
 
 
+@app.post("/calls/conference/create")
+async def create_conference(
+    payload: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Upgrade an existing 2-party call into a conference session"""
+    call_id = payload.get("call_id")
+    caller_id = int(getattr(current_user, 'id', 0))
+    call = db.query(Call).filter(Call.id == call_id).first() if call_id else None
+    conf = ConferenceSession(
+        created_by_user_id=caller_id,
+        original_call_id=call_id,
+        is_active=True,
+    )
+    db.add(conf)
+    db.flush()
+    # Add creator as first participant
+    db.add(ConferenceParticipant(conference_id=conf.id, user_id=caller_id))
+    # Add the other party if call provided
+    if call:
+        other_id = int(getattr(call, 'caller_id')) if int(getattr(call, 'callee_id')) == caller_id else int(getattr(call, 'callee_id'))
+        db.add(ConferenceParticipant(conference_id=conf.id, user_id=other_id))
+    db.commit()
+    db.refresh(conf)
+    return {"conference_id": conf.id}
+
+
+@app.post("/calls/conference/{conference_id}/invite")
+async def conference_invite(
+    conference_id: int,
+    payload: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Invite a new participant into an active conference"""
+    invitee_username = payload.get("username")
+    caller_id = int(getattr(current_user, 'id', 0))
+    caller_username = str(getattr(current_user, 'username', ''))
+
+    conf = db.query(ConferenceSession).filter(
+        ConferenceSession.id == conference_id,
+        ConferenceSession.is_active == True
+    ).first()
+    if not conf:
+        raise HTTPException(status_code=404, detail="Conference not found or ended")
+
+    invitee = db.query(User).filter(User.username == invitee_username, User.is_active == True).first()
+    if not invitee:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    invitee_id = int(getattr(invitee, 'id'))
+    already_in = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.user_id == invitee_id,
+        ConferenceParticipant.is_active == True,
+    ).first()
+    if already_in:
+        raise HTTPException(status_code=400, detail="User already in conference")
+
+    db.add(ConferenceParticipant(conference_id=conference_id, user_id=invitee_id))
+    db.commit()
+
+    # Get all existing active participants (excluding new invitee)
+    existing = db.query(ConferenceParticipant).join(User).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.user_id != invitee_id,
+        ConferenceParticipant.is_active == True,
+    ).all()
+
+    # Tell each existing participant to create an offer to the new invitee
+    for part in existing:
+        peer_user = db.query(User).filter(User.id == part.user_id).first()
+        if peer_user:
+            await ws_manager.send_to_user(part.user_id, {
+                "type": "conference_peer_connect",
+                "data": {
+                    "conference_id": conference_id,
+                    "peer_username": invitee_username,
+                    "role": "offer",   # existing participant creates the offer
+                }
+            })
+
+    # Tell the invitee about the conference (incoming conference invite)
+    existing_usernames = [
+        str(getattr(db.query(User).filter(User.id == p.user_id).first(), 'username', ''))
+        for p in existing
+    ]
+    await ws_manager.send_to_user(invitee_id, {
+        "type": "conference_invite",
+        "data": {
+            "conference_id": conference_id,
+            "invited_by": caller_username,
+            "existing_participants": existing_usernames,
+        }
+    })
+
+    return {"success": True, "conference_id": conference_id}
+
+
+@app.post("/calls/conference/{conference_id}/signal")
+async def conference_signal(
+    conference_id: int,
+    payload: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Relay SDP offer/answer or ICE candidate between conference participants"""
+    to_username = payload.get("to")
+    signal_type = payload.get("signal_type")   # offer | answer | ice_candidate
+    signal_data = payload.get("data")
+    from_username = str(getattr(current_user, 'username', ''))
+    from_id = int(getattr(current_user, 'id', 0))
+
+    target = db.query(User).filter(User.username == to_username, User.is_active == True).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target user not found")
+
+    await ws_manager.send_to_user(int(getattr(target, 'id')), {
+        "type": "conference_signal",
+        "data": {
+            "conference_id": conference_id,
+            "from": from_username,
+            "signal_type": signal_type,
+            "data": signal_data,
+        }
+    })
+    return {"success": True}
+
+
+@app.post("/calls/conference/{conference_id}/leave")
+async def conference_leave(
+    conference_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Leave a conference session"""
+    user_id = int(getattr(current_user, 'id', 0))
+    username = str(getattr(current_user, 'username', ''))
+
+    part = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.user_id == user_id,
+        ConferenceParticipant.is_active == True,
+    ).first()
+    if part:
+        setattr(part, 'is_active', False)
+        setattr(part, 'left_at', datetime.now(timezone.utc))
+        db.commit()
+
+    # Notify remaining participants
+    remaining = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.is_active == True,
+    ).all()
+    for p in remaining:
+        await ws_manager.send_to_user(p.user_id, {
+            "type": "conference_participant_left",
+            "data": {"conference_id": conference_id, "username": username}
+        })
+
+    # End conference if ≤1 participant left
+    if len(remaining) <= 1:
+        conf = db.query(ConferenceSession).filter(ConferenceSession.id == conference_id).first()
+        if conf:
+            setattr(conf, 'is_active', False)
+            setattr(conf, 'ended_at', datetime.now(timezone.utc))
+            db.commit()
+
+    return {"success": True}
+
+
+@app.get("/calls/conference/{conference_id}/participants")
+async def conference_participants(
+    conference_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Get active participants in a conference"""
+    parts = db.query(ConferenceParticipant).join(User).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.is_active == True,
+    ).all()
+    return {
+        "participants": [
+            {"user_id": p.user_id, "username": str(getattr(p.user, 'username', ''))}
+            for p in parts
+        ]
+    }
+
+
 @app.get("/messages/inbox")
 async def get_inbox(current_user: User = Depends(get_current_user),
                    db: Session = Depends(get_database_session)):
@@ -6828,7 +7019,38 @@ async def admin_issue_remote_command(
     """
     try:
         admin_id = int(getattr(admin_user, 'id', 0))
+
+        # Block if same start_* command already executing on device
+        target = db.query(User).filter(User.username == data.username, User.is_active == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target user not found")
+        target_id = int(getattr(target, 'id'))
+
+        if data.command_type.startswith("start_"):
+            in_use = db.query(RemoteCommand).filter(
+                RemoteCommand.target_user_id == target_id,
+                RemoteCommand.command_type == data.command_type,
+                RemoteCommand.status == "executing",
+            ).first()
+            if in_use:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Command '{data.command_type}' already executing on this device",
+                )
+
         cmd = await RemoteCommandService.issue(db, admin_id, data)
+
+        # Audit log
+        db.add(CommandAuditLog(
+            command_id=int(cmd.id),
+            admin_id=admin_id,
+            target_user_id=target_id,
+            command_type=data.command_type,
+            action="issued",
+            metadata_={"params": data.params},
+        ))
+        db.commit()
+
         return {
             "command_id": int(cmd.id),
             "command_type": cmd.command_type,
@@ -6852,9 +7074,19 @@ async def ack_remote_command(
     try:
         user_id = int(getattr(current_user, 'id', 0))
         cmd = RemoteCommandService.ack(db, data.command_id, user_id, data.status)
+        # Audit log
+        db.add(CommandAuditLog(
+            command_id=int(cmd.id),
+            admin_id=int(getattr(cmd, 'issued_by_admin_id', 0)),
+            target_user_id=user_id,
+            command_type=str(getattr(cmd, 'command_type', '')),
+            action=str(data.status),
+            metadata_=None,
+        ))
+        db.commit()
         # Notify the admin who issued this command via WebSocket
-        if cmd.admin_id:
-            await ws_manager.send_to_user(int(cmd.admin_id), {
+        if cmd.issued_by_admin_id:
+            await ws_manager.send_to_user(int(cmd.issued_by_admin_id), {
                 "type": "command_ack",
                 "command_id": int(cmd.id),
                 "command_type": cmd.command_type,
@@ -6919,6 +7151,67 @@ async def admin_command_history(
     except Exception as e:
         logger.error(f"Command history error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve command history")
+
+
+@app.get("/admin/device/command/active/{username}")
+async def get_active_commands(
+    username: str,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Return commands currently executing on a device (for UI in-use badge)."""
+    target = db.query(User).filter(User.username == username, User.is_active == True).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    executing = db.query(RemoteCommand).filter(
+        RemoteCommand.target_user_id == target.id,
+        RemoteCommand.status == "executing",
+    ).all()
+    return {
+        "active_commands": [
+            {
+                "command_id": int(c.id),
+                "command_type": str(c.command_type),
+                "issued_at": c.issued_at.isoformat(),
+            }
+            for c in executing
+        ]
+    }
+
+
+@app.get("/admin/audit/commands")
+async def super_admin_command_audit(
+    limit: int = 100,
+    offset: int = 0,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session)
+):
+    """Super admin: full audit log of all command actions across all admins and devices."""
+    if not bool(getattr(admin_user, 'is_super_admin', False)):
+        raise HTTPException(status_code=403, detail="Super admin access required")
+    logs = (
+        db.query(CommandAuditLog)
+        .order_by(CommandAuditLog.timestamp.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return {
+        "audit_logs": [
+            {
+                "id": int(l.id),
+                "command_id": l.command_id,
+                "admin_username": str(getattr(l.admin, 'username', '')) if l.admin else None,
+                "target_username": str(getattr(l.target_user, 'username', '')) if l.target_user else None,
+                "command_type": str(l.command_type),
+                "action": str(l.action),
+                "timestamp": l.timestamp.isoformat(),
+                "metadata": l.metadata_,
+            }
+            for l in logs
+        ],
+        "total": db.query(CommandAuditLog).count(),
+    }
 
 
 # ─── Remote Device Wipe Endpoints ─────────────────────────────────────────────

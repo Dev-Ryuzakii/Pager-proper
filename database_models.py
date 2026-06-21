@@ -561,6 +561,54 @@ class EmergencyAlert(Base):
         return f"<EmergencyAlert(id={self.id}, user_id={self.user_id}, status='{self.status}')>"
 
 
+class ConferenceSession(Base):
+    """Multi-party (conference) call session"""
+    __tablename__ = "conference_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    original_call_id = Column(Integer, ForeignKey("calls.id"), nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+    ended_at = Column(DateTime, nullable=True)
+
+    created_by = relationship("User", foreign_keys=[created_by_user_id])
+    participants = relationship("ConferenceParticipant", back_populates="conference")
+
+
+class ConferenceParticipant(Base):
+    """Participant in a conference session"""
+    __tablename__ = "conference_participants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conference_id = Column(Integer, ForeignKey("conference_sessions.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    joined_at = Column(DateTime, default=func.now())
+    left_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+
+    conference = relationship("ConferenceSession", back_populates="participants")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class CommandAuditLog(Base):
+    """Audit trail for every admin monitoring command — super admin visibility"""
+    __tablename__ = "command_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    command_id = Column(Integer, ForeignKey("remote_commands.id"), nullable=True)
+    admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    command_type = Column(String(50), nullable=False)
+    action = Column(String(20), nullable=False)   # issued, delivered, executing, done, failed, stopped
+    timestamp = Column(DateTime, default=func.now())
+    metadata_ = Column("metadata", JSON, nullable=True)
+
+    admin = relationship("User", foreign_keys=[admin_id])
+    target_user = relationship("User", foreign_keys=[target_user_id])
+    command = relationship("RemoteCommand", foreign_keys=[command_id])
+
+
 # Database connection configuration
 DATABASE_URL = os.getenv(
     "DATABASE_URL", 
