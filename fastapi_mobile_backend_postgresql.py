@@ -1500,10 +1500,18 @@ class CallService:
         
         sent = await ws_manager.send_to_user(recipient.id, notification)
         if not sent:
-            # If the user is offline, mark as missed immediately or later?
-            # For now, let's keep it initiated and let client timeout.
             logger.info(f"Recipient {recipient_username} (ID: {recipient.id}) is offline, call notification not sent via WebSocket.")
-            
+        else:
+            # Callee is online and received the notification — tell caller their device is ringing
+            await ws_manager.send_to_user(caller_id, {
+                "type": "call_status_update",
+                "data": {
+                    "call_id": int(call.id),
+                    "status": "calling",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            })
+
         return call
 
     @staticmethod
