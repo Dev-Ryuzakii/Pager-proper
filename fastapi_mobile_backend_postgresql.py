@@ -532,6 +532,28 @@ class MessageService:
             return True
         return False
 
+    @staticmethod
+    def delete_expired_messages(db: Session) -> int:
+        """Delete expired messages and return count of deleted messages"""
+        current_time = datetime.now(timezone.utc)
+        expired_messages = db.query(Message).filter(
+            and_(
+                Message.auto_delete == True,
+                Message.expires_at <= current_time
+            )
+        ).all()
+
+        deleted_count = len(expired_messages)
+
+        for message in expired_messages:
+            db.delete(message)
+
+        if deleted_count > 0:
+            db.commit()
+            logger.info(f"🗑️  Deleted {deleted_count} expired messages")
+
+        return deleted_count
+
 class GroupService:
     """Service class for group operations"""
     
@@ -706,29 +728,6 @@ class GroupService:
         """Get all groups (admin only)"""
         return db.query(Group).all()
     
-    @staticmethod
-    def delete_expired_messages(db: Session) -> int:
-        """Delete expired messages and return count of deleted messages"""
-        current_time = datetime.now(timezone.utc)
-        expired_messages = db.query(Message).filter(
-            and_(
-                Message.auto_delete == True,
-                Message.expires_at <= current_time
-            )
-        ).all()
-        
-        deleted_count = len(expired_messages)
-        
-        # Delete expired messages
-        for message in expired_messages:
-            db.delete(message)
-        
-        if deleted_count > 0:
-            db.commit()
-            logger.info(f"🗑️  Deleted {deleted_count} expired messages")
-        
-        return deleted_count
-
 class SessionService:
     """Service class for session management"""
     
