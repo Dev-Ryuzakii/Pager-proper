@@ -14,8 +14,9 @@ pypdf>=3.0.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 
-# HTTP client (for testing)
+# HTTP client (for testing) + HTTP/2 support for APNs push notifications
 httpx==0.25.2
+h2>=4.0.0
 
 # Background tasks
 celery==5.3.4  # Optional: for heavy background processing

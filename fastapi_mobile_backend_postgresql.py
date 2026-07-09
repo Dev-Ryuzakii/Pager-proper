@@ -48,6 +48,7 @@ from database_models import User, Message, UserKey, UserSession, AuditLog, Maste
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
+from push_notifications import push_to_user
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1500,6 +1501,13 @@ class CallService:
         sent = await ws_manager.send_to_user(recipient.id, notification)
         if not sent:
             logger.info(f"Recipient {recipient_username} (ID: {recipient.id}) is offline, call notification not sent via WebSocket.")
+            # Fall back to APNs push with the ringtone sound
+            await push_to_user(
+                db, int(recipient.id),
+                f"Incoming {'Video' if call_type == 'video' else 'Voice'} Call",
+                str(caller.username),
+                sound="ringingtone.caf",
+            )
         else:
             # Callee is online and received the notification — tell caller their device is ringing
             await ws_manager.send_to_user(caller_id, {
@@ -3319,6 +3327,30 @@ async def logout_user(current_user: User = Depends(get_current_user),
         logger.error(f"Logout error: {e}")
         raise HTTPException(status_code=500, detail="Logout failed")
 
+class DeviceTokenRegister(BaseModel):
+    push_token: str
+    platform: str = "ios"
+
+@app.post("/notifications/register-device")
+async def register_device_token(payload: DeviceTokenRegister,
+                                current_user: User = Depends(get_current_user),
+                                db: Session = Depends(get_database_session)):
+    """Register a device push token (APNs) for offline notification delivery"""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        user.push_token = f"{payload.platform}:{payload.push_token}"[:512]
+        db.commit()
+        return {"status": "registered"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Register device token error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to register device token")
+
 @app.post("/messages/send")
 async def send_message(message_data: MessageSend, 
                       current_user: User = Depends(get_current_user),
@@ -3331,7 +3363,7 @@ async def send_message(message_data: MessageSend,
         )
         recipient_id = int(getattr(message, 'recipient_id', 0))
         sender_username = str(getattr(current_user, 'username', ''))
-        await ws_manager.send_to_user(recipient_id, {
+        ws_sent = await ws_manager.send_to_user(recipient_id, {
             "type": "new_message",
             "data": {
                 "message_id": getattr(message, "id", None),
@@ -3340,6 +3372,9 @@ async def send_message(message_data: MessageSend,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         })
+        if not ws_sent:
+            # Recipient offline — fall back to APNs push (sound matches in-app beep)
+            await push_to_user(db, recipient_id, "New message", f"From {sender_username}", sound="beep.caf")
         response = {
             "username": message_data.username,
             "message": "sent"
@@ -4285,7 +4320,9 @@ async def send_group_message(
         
         for member in members:
             if member.user_id != user_id:
-                await ws_manager.send_to_user(member.user_id, notification)
+                ws_sent = await ws_manager.send_to_user(member.user_id, notification)
+                if not ws_sent:
+                    await push_to_user(db, member.user_id, "New message", f"From {sender_username}", sound="beep.caf")
                 
         return {
             "status": "sent",
