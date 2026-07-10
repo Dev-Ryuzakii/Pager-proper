@@ -76,6 +76,10 @@ class Message(Base):
     # Add decoy text field
     decoy_content = Column(Text, nullable=True)  # Fake text shown as placeholder
     
+    # E2EE metadata
+    encrypted_key = Column(Text, nullable=True)  # AES key encrypted with RSA (JSON for groups)
+    iv = Column(String(255), nullable=True)      # AES Initialization Vector
+    
     # Message metadata
     timestamp = Column(DateTime, default=func.now())
     delivered = Column(Boolean, default=False)

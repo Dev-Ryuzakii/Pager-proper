@@ -107,11 +107,17 @@ class GroupMessageSend(BaseModel):
     message: str = Field(..., min_length=1, description="Message content")
     addressed_to_username: Optional[str] = Field(None, description="Admin ONLY: Address message to a specific user in the group")
     disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
+    encrypted_key: Optional[str] = Field(None, description="AES key encrypted with RSA (JSON map of username to key for groups)")
+    iv: Optional[str] = Field(None, description="Initialization Vector for AES")
+    decoy_content: Optional[str] = Field(None, description="Client-generated decoy content")
 
 class MessageSend(BaseModel):
     username: str = Field(..., description="Recipient username")
     message: str = Field(..., min_length=1, description="Message content")
     disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
+    encrypted_key: Optional[str] = Field(None, description="AES key encrypted with recipient RSA public key")
+    iv: Optional[str] = Field(None, description="Initialization Vector for AES")
+    decoy_content: Optional[str] = Field(None, description="Client-generated decoy content")
 
 class MasterToken(BaseModel):
     mastertoken: str = Field(..., description="Master decryption token")
@@ -139,6 +145,8 @@ class MessageResponse(BaseModel):
     server_hmac: bool = Field(default=True, description="Message authentication status")
     decrypt_time: float = Field(default=0.0, description="Time taken to decrypt in seconds")
     decoy_content: Optional[str] = None
+    encrypted_key: Optional[str] = None
+    iv: Optional[str] = None
     is_private_tagged: Optional[bool] = False
     group_id: Optional[int] = None
 
@@ -221,11 +229,7 @@ class GroupMemberResponse(BaseModel):
     role: str
     joined_at: datetime
 
-class GroupMessageSend(BaseModel):
-    group_id: int
-    message: str
-    addressed_to_username: Optional[str] = None
-    disappear_after_hours: Optional[int] = Field(None, description="Hours after which message should disappear (default: None)")
+
 
 # Monitoring models
 class MonitoringConsentRequest(BaseModel):
@@ -340,10 +344,8 @@ class IceCandidatePayload(BaseModel):
     recipient_username: str = Field(..., description="Who to send this candidate to")
     candidate: Dict = Field(..., description="The ICE candidate object")
 
-def validate_master_token(db: Session, user_id: int, mastertoken: str) -> bool:
-    """Validate the master token for a user"""
-    # Backward-compatible wrapper: use the real DB-backed validation
-    return DecryptService.validate_master_token(db, user_id, mastertoken)
+# validate_master_token() is defined at module scope further below
+# (after AuditService), alongside the decoy-extraction helpers.
 
 # Database Services
 class UserService:
@@ -407,16 +409,13 @@ class MessageService:
     """Service class for message operations"""
     
     @staticmethod
-    def send_message_by_username(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = 12) -> Message:
+    def send_message_by_username(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = 12, encrypted_key: Optional[str] = None, iv: Optional[str] = None, decoy_content: Optional[str] = None) -> Message:
         """Send a message to a specific user by username"""
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
-        try:
-            decoy_text = FakeTextGenerator.generate_decoy_text_for_message(message_content)
-        except Exception as e:
-            decoy_text = "[ENCRYPTED MESSAGE] Tap to decrypt"
+        decoy_text = decoy_content if decoy_content else "[ENCRYPTED MESSAGE] Tap to decrypt"
         
         expires_at = None
         auto_delete = False
@@ -434,7 +433,9 @@ class MessageService:
             is_offline=True,
             expires_at=expires_at,
             auto_delete=auto_delete,
-            decoy_content=decoy_text
+            decoy_content=decoy_text,
+            encrypted_key=encrypted_key,
+            iv=iv
         )
         
         db.add(message)
@@ -446,7 +447,10 @@ class MessageService:
     def send_message_to_group(db: Session, sender_id: int, group_id: int, message_content: str,
                              disappear_after_hours: Optional[int] = 12,
                              addressed_to_id: Optional[int] = None,
-                             is_admin_announcement: bool = False) -> Message:
+                             is_admin_announcement: bool = False,
+                             encrypted_key: Optional[str] = None,
+                             iv: Optional[str] = None,
+                             decoy_content: Optional[str] = None) -> Message:
         """Send a message to a group"""
         # Verify sender is a member
         membership = db.query(GroupMember).filter(
@@ -456,10 +460,7 @@ class MessageService:
         if not membership:
             raise HTTPException(status_code=403, detail="You are not a member of this group")
             
-        try:
-            decoy_text = FakeTextGenerator.generate_decoy_text_for_message(message_content)
-        except Exception:
-            decoy_text = "[ENCRYPTED GROUP MESSAGE] Tap to decrypt"
+        decoy_text = decoy_content if decoy_content else "[ENCRYPTED GROUP MESSAGE] Tap to decrypt"
             
         expires_at = None
         auto_delete = False
@@ -478,7 +479,9 @@ class MessageService:
             read=False,
             expires_at=expires_at,
             auto_delete=auto_delete,
-            decoy_content=decoy_text
+            decoy_content=decoy_text,
+            encrypted_key=encrypted_key,
+            iv=iv
         )
         
         db.add(message)
@@ -805,284 +808,90 @@ class AuditService:
         db.add(audit_log)
         db.commit()
 
-class DecryptService:
-    """Service class for decryption operations"""
-    
-    @staticmethod
-    def validate_master_token(db: Session, user_id: int, mastertoken: str) -> bool:
-        """Validate the master token for a user"""
-        try:
-            if not mastertoken:
-                return False
+# ── Master-token validation + decoy extraction ───────────────────────────────
+# E2EE moved message decryption to the client; these helpers survive because
+# they are used by master-token gating and the hidden image/document decoys.
+# (Kept module-level after DecryptService was removed.)
 
-            # Get latest active master token record for this user
-            record = db.query(DBMasterToken).filter(
-                DBMasterToken.user_id == user_id,
-                DBMasterToken.is_active == True
-            ).order_by(DBMasterToken.created_at.desc()).first()
-
-            if not record:
-                return False
-
-            # Expiration check (if set)
-            expires_at = getattr(record, "expires_at", None)
-            if expires_at is not None:
-                # Some DBs store naive datetimes; compare safely
-                now = datetime.now(timezone.utc)
-                if getattr(expires_at, "tzinfo", None) is None:
-                    expires_at = expires_at.replace(tzinfo=timezone.utc)
-                if expires_at <= now:
-                    return False
-
-            salt = str(getattr(record, "salt", ""))
-            expected_hash = str(getattr(record, "token_hash", ""))
-            if not salt or not expected_hash:
-                return False
-
-            provided_hash = hashlib.sha256((mastertoken + salt).encode()).hexdigest()
-            return hmac.compare_digest(provided_hash, expected_hash)
-        except Exception as e:
-            logger.error(f"Master token validation error: {e}")
+def validate_master_token(db: Session, user_id: int, mastertoken: str) -> bool:
+    """Validate the master token for a user (constant-time hash compare)."""
+    try:
+        if not mastertoken:
             return False
-    
-    @staticmethod
-    def derive_master_key(mastertoken: str, salt: bytes) -> bytes:
-        """Derive encryption key using PBKDF2"""
-        try:
-            master_key = PBKDF2(
-                mastertoken, 
-                salt, 
-                32,  # 256-bit key
-                count=100000  # Iterations
-            )
-            return master_key
-        except Exception as e:
-            logger.error(f"Key derivation error: {e}")
-            raise HTTPException(status_code=500, detail="Key derivation failed")
-    
-    @staticmethod
-    def decrypt_with_aes_gcm(encrypted_data: Dict[str, str], key: bytes) -> str:
-        """Decrypt using AES-256-GCM (authenticated decryption)"""
-        try:
-            nonce = base64.b64decode(encrypted_data["nonce"])
-            ciphertext = base64.b64decode(encrypted_data["ciphertext"])
-            auth_tag = base64.b64decode(encrypted_data["auth_tag"])
-            
-            # Create AES-GCM cipher
-            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-            
-            # Decrypt and verify authentication tag
-            plaintext = cipher.decrypt_and_verify(ciphertext, auth_tag)
-            
-            return plaintext.decode()
-            
-        except ValueError as e:
-            logger.error(f"AES-GCM authentication failed: {e}")
-            raise HTTPException(status_code=400, detail="AES-GCM authentication failed")
-        except Exception as e:
-            logger.error(f"AES-GCM decryption error: {e}")
-            raise HTTPException(status_code=500, detail="AES-GCM decryption failed")
-    
-    @staticmethod
-    def extract_decoy_image(message_content: str) -> Optional[Dict]:
-        """Extract hidden image from decoy message content"""
-        try:
-            import re
-            import base64
-            import json
-            
-            # Find the image data pattern
-            match = re.search(r'\[IMAGE_DATA:([^\]]+)\]', message_content)
-            if not match:
-                return None
-            
-            encoded_image_data = match.group(1)
-            
-            # Decode the image data
-            decoded_json = base64.b64decode(encoded_image_data).decode()
-            image_payload = json.loads(decoded_json)
-            
-            # Verify this is an image payload
-            if image_payload.get("type") != "decoy_image":
-                return None
-            
-            return {
-                "image_data": image_payload.get("image_data", ""),
-                "filename": image_payload.get("filename", "image.jpg"),
-                "file_size": image_payload.get("file_size", 0),
-                "timestamp": image_payload.get("timestamp", 0)
-            }
-            
-        except Exception as e:
-            logger.error(f"Error extracting decoy image: {e}")
+
+        record = db.query(DBMasterToken).filter(
+            DBMasterToken.user_id == user_id,
+            DBMasterToken.is_active == True
+        ).order_by(DBMasterToken.created_at.desc()).first()
+
+        if not record:
+            return False
+
+        expires_at = getattr(record, "expires_at", None)
+        if expires_at is not None:
+            now = datetime.now(timezone.utc)
+            if getattr(expires_at, "tzinfo", None) is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= now:
+                return False
+
+        salt = str(getattr(record, "salt", ""))
+        expected_hash = str(getattr(record, "token_hash", ""))
+        if not salt or not expected_hash:
+            return False
+
+        provided_hash = hashlib.sha256((mastertoken + salt).encode()).hexdigest()
+        return hmac.compare_digest(provided_hash, expected_hash)
+    except Exception as e:
+        logger.error(f"Master token validation error: {e}")
+        return False
+
+
+def extract_decoy_image(message_content: str) -> Optional[Dict]:
+    """Extract a hidden image payload embedded in decoy message content."""
+    try:
+        import re
+        match = re.search(r'\[IMAGE_DATA:([^\]]+)\]', message_content)
+        if not match:
             return None
-    
-    @staticmethod
-    def extract_decoy_document(message_content: str) -> Optional[Dict]:
-        """Extract hidden document from decoy message content"""
-        try:
-            import re
-            import base64
-            import json
-            
-            # Find the document data pattern
-            match = re.search(r'\[DOCUMENT_DATA:([^\]]+)\]', message_content)
-            if not match:
-                return None
-            
-            encoded_document_data = match.group(1)
-            
-            # Decode the document data
-            decoded_json = base64.b64decode(encoded_document_data).decode()
-            document_payload = json.loads(decoded_json)
-            
-            # Verify this is a document payload
-            if document_payload.get("type") != "decoy_document":
-                return None
-            
-            return {
-                "document_data": document_payload.get("document_data", ""),
-                "filename": document_payload.get("filename", "document"),
-                "file_size": document_payload.get("file_size", 0),
-                "mime_type": document_payload.get("mime_type", "application/octet-stream"),
-                "timestamp": document_payload.get("timestamp", 0)
-            }
-            
-        except Exception as e:
-            logger.error(f"Error extracting decoy document: {e}")
+        decoded_json = base64.b64decode(match.group(1)).decode()
+        image_payload = json.loads(decoded_json)
+        if image_payload.get("type") != "decoy_image":
             return None
-    
-    @staticmethod
-    def decrypt_message(db: Session, user_id: int, message_id: int, mastertoken: str) -> Optional[str]:
-        """Decrypt a message using the master token"""
-        # Get the message
-        message = db.query(Message).filter(Message.id == message_id).first()
+        return {
+            "image_data": image_payload.get("image_data", ""),
+            "filename": image_payload.get("filename", "image.jpg"),
+            "file_size": image_payload.get("file_size", 0),
+            "timestamp": image_payload.get("timestamp", 0),
+        }
+    except Exception as e:
+        logger.error(f"Error extracting decoy image: {e}")
+        return None
 
-        if not message:
-            raise HTTPException(status_code=404, detail="Message not found")
 
-        # Access check: sender, DM recipient, or group member
-        is_sender = getattr(message, 'sender_id', None) == user_id
-        is_recipient = getattr(message, 'recipient_id', None) == user_id
-        group_id = getattr(message, 'group_id', None)
-        is_group_member = False
-        if group_id:
-            is_group_member = db.query(GroupMember).filter(
-                GroupMember.group_id == group_id,
-                GroupMember.user_id == user_id
-            ).first() is not None
+def extract_decoy_document(message_content: str) -> Optional[Dict]:
+    """Extract a hidden document payload embedded in decoy message content."""
+    try:
+        import re
+        match = re.search(r'\[DOCUMENT_DATA:([^\]]+)\]', message_content)
+        if not match:
+            return None
+        decoded_json = base64.b64decode(match.group(1)).decode()
+        document_payload = json.loads(decoded_json)
+        if document_payload.get("type") != "decoy_document":
+            return None
+        return {
+            "document_data": document_payload.get("document_data", ""),
+            "filename": document_payload.get("filename", "document"),
+            "file_size": document_payload.get("file_size", 0),
+            "mime_type": document_payload.get("mime_type", "application/octet-stream"),
+            "timestamp": document_payload.get("timestamp", 0),
+        }
+    except Exception as e:
+        logger.error(f"Error extracting decoy document: {e}")
+        return None
 
-        if not (is_sender or is_recipient or is_group_member):
-            raise HTTPException(status_code=404, detail="Message not found")
-        
-        try:
-            # For mobile users, we should not attempt server-side decryption
-            # Mobile users should decrypt messages locally using their private keys
-            user = db.query(User).filter(User.id == user_id).first()
-            user_type = getattr(user, 'user_type', '') if user else ''
-            if user and user_type == "mobile":
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Mobile users should decrypt messages locally. Private keys are not stored on the server for security."
-                )
-            
-            # Get the user's private key for decryption (only for TLS users)
-            user_key = db.query(UserKey).filter(
-                and_(
-                    UserKey.user_id == user_id,
-                    UserKey.key_type == "private_key"
-                )
-            ).first()
-            
-            if not user_key:
-                raise HTTPException(status_code=404, detail="User private key not found")
-            
-            # Get the user's master salt for key derivation
-            master_salt_record = db.query(UserKey).filter(
-                and_(
-                    UserKey.user_id == user_id,
-                    UserKey.key_type == "master_salt"
-                )
-            ).first()
-            
-            if not master_salt_record:
-                raise HTTPException(status_code=404, detail="Master salt not found")
-            
-            # Parse the encrypted content
-            try:
-                encrypted_content = getattr(message, 'encrypted_content', '')
-                encrypted_payload = json.loads(encrypted_content)
-            except json.JSONDecodeError:
-                raise HTTPException(status_code=400, detail="Invalid encrypted content format")
-            
-            # Validate payload structure
-            if "encrypted_key" not in encrypted_payload or "encrypted_message" not in encrypted_payload:
-                raise HTTPException(status_code=400, detail="Invalid encrypted payload structure")
-            
-            # Derive master key from master token and salt
-            master_salt = bytes(getattr(master_salt_record, 'key_data', b''))
-            master_key = DecryptService.derive_master_key(mastertoken, master_salt)
-            
-            # Decrypt the AES key using RSA private key
-            try:
-                # Load RSA private key
-                private_key_data = bytes(getattr(user_key, 'key_data', b''))
-                private_key = RSA.import_key(private_key_data)
-                
-                # Decode and decrypt the AES key
-                encrypted_aes_key = base64.b64decode(encrypted_payload["encrypted_key"])
-                rsa_cipher = PKCS1_OAEP.new(private_key)
-                aes_key = rsa_cipher.decrypt(encrypted_aes_key)
-            except Exception as e:
-                logger.error(f"RSA decryption error: {e}")
-                raise HTTPException(status_code=500, detail="RSA decryption failed")
-            
-            # Decrypt the message using AES key
-            try:
-                encrypted_msg_data = encrypted_payload["encrypted_message"]
-                if not isinstance(encrypted_msg_data, dict):
-                    raise HTTPException(status_code=400, detail="Invalid AES-GCM data format")
-                
-                decrypted_content = DecryptService.decrypt_with_aes_gcm(encrypted_msg_data, aes_key)
-                
-                # Parse decrypted message to extract actual content
-                try:
-                    message_data = json.loads(decrypted_content)
-                    actual_content = message_data.get("content", decrypted_content)
-                except json.JSONDecodeError:
-                    # If it's not JSON, return as is
-                    actual_content = decrypted_content
-                
-                # Log decryption attempt
-                AuditService.log_event(
-                    db, user_id, "message_decrypted",
-                    f"Message {message_id} decrypted successfully",
-                    severity="info"
-                )
-                
-                return actual_content
-                
-            except Exception as e:
-                logger.error(f"Message decryption error: {e}")
-                AuditService.log_event(
-                    db, user_id, "decryption_failed",
-                    f"Failed to decrypt message {message_id}: {str(e)}",
-                    severity="error"
-                )
-                raise HTTPException(status_code=500, detail="Message decryption failed")
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Decryption error: {e}")
-            AuditService.log_event(
-                db, user_id, "decryption_failed",
-                f"Failed to decrypt message {message_id}: {str(e)}",
-                severity="error"
-            )
-            raise HTTPException(status_code=500, detail="Decryption failed")
 
-# Add MediaService class
 class MediaService:
     """Service class for media operations"""
     
@@ -3359,7 +3168,8 @@ async def send_message(message_data: MessageSend,
     try:
         user_id = int(getattr(current_user, 'id', 0)) if hasattr(getattr(current_user, 'id', 0), '__int__') else int(getattr(current_user, 'id', 0))
         message = MessageService.send_message_by_username(
-            db, user_id, message_data.username, message_data.message, message_data.disappear_after_hours
+            db, user_id, message_data.username, message_data.message, message_data.disappear_after_hours,
+            message_data.encrypted_key, message_data.iv, message_data.decoy_content
         )
         recipient_id = int(getattr(message, 'recipient_id', 0))
         sender_username = str(getattr(current_user, 'username', ''))
@@ -3532,7 +3342,7 @@ async def call_action(
         if action_data.action == "accept":
             if not action_data.mastertoken:
                 raise HTTPException(status_code=401, detail="Master token required to accept call")
-            if not DecryptService.validate_master_token(db, user_id, action_data.mastertoken):
+            if not validate_master_token(db, user_id, action_data.mastertoken):
                 raise HTTPException(status_code=401, detail="Invalid master token")
 
         call = await CallService.update_call_status(
@@ -3782,6 +3592,9 @@ async def get_inbox(current_user: User = Depends(get_current_user),
                 "is_admin_announcement": bool(getattr(msg, 'is_admin_announcement', False)),
                 "content": str(getattr(msg, 'encrypted_content', '')),
                 "content_type": str(getattr(msg, 'content_type', '')),
+                "encrypted_key": getattr(msg, 'encrypted_key', None),
+                "iv": getattr(msg, 'iv', None),
+                "decoy_content": str(getattr(msg, 'decoy_content', '') or ''),
                 "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
                 "delivered": bool(getattr(msg, 'delivered', False)),
                 "read": bool(getattr(msg, 'read', False))
@@ -3829,6 +3642,8 @@ async def get_conversation(
                 "content": str(getattr(msg, 'encrypted_content', '')),
                 "decoy_content": str(getattr(msg, 'decoy_content', '') or ''),
                 "content_type": str(getattr(msg, 'content_type', '')),
+                "encrypted_key": getattr(msg, 'encrypted_key', None),
+                "iv": getattr(msg, 'iv', None),
                 "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
                 "delivered": bool(getattr(msg, 'delivered', False)),
                 "read": bool(getattr(msg, 'read', False)),
@@ -4222,6 +4037,8 @@ async def get_group_messages(
             "recipient": str(getattr(recipient_user, 'username', '')) if recipient_user else "group",
             "content": str(m.encrypted_content) if can_read_content else str(getattr(m, 'decoy_content', '') or '[Private tagged message]'),
             "content_type": str(m.content_type) if can_read_content else "private_tagged",
+            "encrypted_key": getattr(m, 'encrypted_key', None) if can_read_content else None,
+            "iv": getattr(m, 'iv', None) if can_read_content else None,
             "timestamp": m.timestamp,
             "delivered": bool(m.delivered),
             "read": is_read_by_me,
@@ -4298,7 +4115,8 @@ async def send_group_message(
             
         message = MessageService.send_message_to_group(
             db, user_id, payload.group_id, payload.message, 
-            payload.disappear_after_hours, addressed_to_id, is_announcement
+            payload.disappear_after_hours, addressed_to_id, is_announcement,
+            payload.encrypted_key, payload.iv, payload.decoy_content
         )
         
         # Notify all group members via WebSocket
@@ -4699,7 +4517,7 @@ async def confirm_mastertoken(token_data: MasterToken,
         username = str(getattr(current_user, 'username', ''))
         mastertoken = str(getattr(token_data, "mastertoken", "")).strip()
 
-        if not DecryptService.validate_master_token(db, user_id, mastertoken):
+        if not validate_master_token(db, user_id, mastertoken):
             raise HTTPException(status_code=401, detail="Invalid master token")
 
         AuditService.log_event(
@@ -4762,131 +4580,6 @@ async def delete_user_account(
         logger.error(f"Delete user error: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete user account")
 
-@app.post("/decrypt")
-async def decrypt_message(
-    decrypt_data: DecryptRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_database_session)
-):
-    """Decrypt message using master token - TLS system format"""
-    try:
-        start_time = time.time()
-        
-        user_id = int(getattr(current_user, 'id', 0))
-        # Always require fresh master token for decryption
-        if not DecryptService.validate_master_token(db, user_id, decrypt_data.mastertoken):
-            raise HTTPException(
-                status_code=401, 
-                detail="Invalid master token. Master token is required for message decryption."
-            )
-        
-        # Get the message first to check existence
-        message = db.query(Message).filter(
-            Message.id == decrypt_data.message_id
-        ).first()
-
-        if not message:
-            raise HTTPException(status_code=404, detail="Message not found")
-
-        # Access check: sender, DM recipient, or group member
-        _is_sender    = getattr(message, 'sender_id', None) == user_id
-        _is_recipient = getattr(message, 'recipient_id', None) == user_id
-        _group_id     = getattr(message, 'group_id', None)
-        _is_group_member = False
-        if _group_id:
-            _is_group_member = db.query(GroupMember).filter(
-                GroupMember.group_id == _group_id,
-                GroupMember.user_id == user_id
-            ).first() is not None
-
-        if not (_is_sender or _is_recipient or _is_group_member):
-            raise HTTPException(status_code=404, detail="Message not found")
-            
-        # Get sender info
-        sender = db.query(User).filter(User.id == message.sender_id).first()
-        if not sender:
-            raise HTTPException(
-                status_code=404,
-                detail="Message sender not found"
-            )
-        
-        decrypt_time = time.time() - start_time
-        sender_username = str(getattr(sender, 'username', ''))
-        message_timestamp = getattr(message, 'timestamp', datetime.now(timezone.utc))
-
-        # For mobile users and group messages: encrypted_content stores plaintext directly.
-        # Mastertoken already validated above — just return the content.
-        user_obj = db.query(User).filter(User.id == user_id).first()
-        user_type = str(getattr(user_obj, 'user_type', '') or '')
-        msg_group_id = getattr(message, 'group_id', None)
-        if user_type == "mobile" or msg_group_id is not None:
-            actual_content = str(getattr(message, 'encrypted_content', ''))
-            AuditService.log_event(
-                db, user_id, "message_decrypted",
-                f"Message {decrypt_data.message_id} from {sender_username} decrypted ({'group' if msg_group_id else 'mobile'})",
-                severity="info"
-            )
-            return {
-                "id": int(getattr(message, 'id', 0)),
-                "sender": sender_username,
-                "sender_verified": True,
-                "timestamp": message_timestamp.strftime("%H:%M") if hasattr(message_timestamp, 'strftime') else str(message_timestamp),
-                "security": "mastertoken",
-                "server_hmac": True,
-                "decrypt_time": round(decrypt_time, 3),
-                "content": actual_content,
-                "auto_clear": True,
-                "clear_seconds": 30,
-            }
-
-        # Non-mobile users: RSA+AES server-side decryption
-        decrypted_content = DecryptService.decrypt_message(
-            db,
-            user_id,
-            decrypt_data.message_id,
-            decrypt_data.mastertoken
-        )
-
-        # Log successful decryption
-        AuditService.log_event(
-            db,
-            user_id,
-            "message_decrypted",
-            f"Message {decrypt_data.message_id} from {sender_username} decrypted successfully",
-            severity="info"
-        )
-
-        return {
-            "id": int(getattr(message, 'id', 0)),
-            "sender": sender_username,
-            "sender_verified": True,
-            "timestamp": message_timestamp.strftime("%H:%M") if hasattr(message_timestamp, 'strftime') else str(message_timestamp),
-            "security": "TLS 1.3 + AES-256-GCM + RSA-4096",
-            "server_hmac": True,
-            "decrypt_time": round(decrypt_time, 3),
-            "content": str(decrypted_content),
-            "auto_clear": True,
-            "clear_seconds": 30,
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Log the error
-        logger.error(f"Decrypt error: {e}")
-        user_id_for_log = int(getattr(current_user, 'id', 0)) if current_user else None
-        AuditService.log_event(
-            db,
-            user_id_for_log,
-            "decrypt_error",
-            f"Failed to decrypt message {decrypt_data.message_id}: {str(e)}",
-            severity="error"
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to decrypt message: {str(e)}"
-        )
-
 @app.post("/messages/extract_decoy_image")
 async def extract_decoy_image(
     decrypt_data: DecryptRequest,
@@ -4898,7 +4591,7 @@ async def extract_decoy_image(
         user_id = int(getattr(current_user, 'id', 0))
         
         # Validate master token
-        if not DecryptService.validate_master_token(db, user_id, decrypt_data.mastertoken):
+        if not validate_master_token(db, user_id, decrypt_data.mastertoken):
             raise HTTPException(
                 status_code=401, 
                 detail="Invalid master token. Master token is required to extract hidden images."
@@ -4920,7 +4613,7 @@ async def extract_decoy_image(
         
         # Check if this is a decoy image message and extract the image
         message_content = str(getattr(message, 'encrypted_content', ''))
-        image_data = DecryptService.extract_decoy_image(message_content)
+        image_data = extract_decoy_image(message_content)
         
         if not image_data:
             raise HTTPException(status_code=400, detail="This message does not contain a hidden image or extraction failed")
@@ -4960,7 +4653,7 @@ async def extract_decoy_document(
         user_id = int(getattr(current_user, 'id', 0))
         
         # Validate master token
-        if not DecryptService.validate_master_token(db, user_id, decrypt_data.mastertoken):
+        if not validate_master_token(db, user_id, decrypt_data.mastertoken):
             raise HTTPException(
                 status_code=401, 
                 detail="Invalid master token. Master token is required to extract hidden documents."
@@ -4982,7 +4675,7 @@ async def extract_decoy_document(
         
         # Check if this is a decoy document message and extract the document
         message_content = str(getattr(message, 'encrypted_content', ''))
-        document_data = DecryptService.extract_decoy_document(message_content)
+        document_data = extract_decoy_document(message_content)
         
         if not document_data:
             raise HTTPException(status_code=400, detail="This message does not contain a hidden document or extraction failed")
