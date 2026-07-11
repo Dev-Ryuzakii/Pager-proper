@@ -5249,6 +5249,7 @@ async def list_operators(
     ops = db.query(User).filter(User.is_admin == True, User.admin_role.in_(["operator", "admin"])).all()
     return [{"id": u.id, "username": u.username, "phone_number": u.phone_number,
              "admin_role": u.admin_role, "is_active": u.is_active,
+             "can_approve_duress_wipe": bool(u.can_approve_duress_wipe),
              "last_login": str(u.last_login) if u.last_login else None} for u in ops]
 
 class UpdateOperatorRequest(BaseModel):
