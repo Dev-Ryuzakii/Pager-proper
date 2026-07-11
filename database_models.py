@@ -56,6 +56,7 @@ class User(Base):
     sessions = relationship("UserSession", back_populates="user")
     master_tokens = relationship("MasterToken", back_populates="user")
     group_memberships = relationship("GroupMember", back_populates="user")
+    mdm_profile = relationship("MDMDeviceProfile", back_populates="user", uselist=False)
     
     def __repr__(self):
         return f"<User(phone='{self.phone_number}', username='{self.username}', type='{self.user_type}', admin={self.is_admin})>"
@@ -248,6 +249,33 @@ class Media(Base):
     # Message relationship
     message_id = Column(Integer, ForeignKey("messages.id"), nullable=False)
     message = relationship("Message", back_populates="media_files")
+
+class MDMDeviceProfile(Base):
+    """MDM Profile linking a User to their Headwind MDM Device"""
+    __tablename__ = "mdm_device_profiles"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    
+    # Headwind MDM Identifiers
+    headwind_device_id = Column(String(255), unique=True, nullable=False)
+    imei = Column(String(100), nullable=True)
+    enrollment_status = Column(String(50), default="pending")  # pending, enrolled, wiped
+    
+    # MDM Timestamps
+    enrolled_at = Column(DateTime, default=func.now())
+    last_sync = Column(DateTime, nullable=True)
+    last_forensic_sync = Column(DateTime, nullable=True)
+    
+    # Security Triggers
+    wipe_requested = Column(Boolean, default=False)
+    wipe_reason = Column(String(255), nullable=True)
+    
+    # Relationships
+    user = relationship("User", back_populates="mdm_profile")
+    
+    def __repr__(self):
+        return f"<MDMDeviceProfile(user_id={self.user_id}, hw_id='{self.headwind_device_id}', status='{self.enrollment_status}')>"
     
     # Ownership
     sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -473,6 +501,12 @@ class DeviceWipeCommand(Base):
     issued_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     reason = Column(Text, nullable=True)
     status = Column(String(20), default="pending")  # pending, delivered, confirmed, failed
+    # app_data: soft wipe, app's own local DB only (existing behavior)
+    # duress_selective: Device Owner clears named 3rd-party apps' data + contacts/SMS/media, no reset screen
+    # factory_reset: full MDM wipe via Headwind, device reboots to setup screen
+    wipe_mode = Column(String(20), default="app_data")
+    target_packages = Column(JSON, nullable=True)  # package names to clear for duress_selective; None = server default list
+    batch_id = Column(String(64), nullable=True, index=True)  # groups commands issued together (e.g. mass wipe)
     issued_at = Column(DateTime, default=func.now())
     delivered_at = Column(DateTime, nullable=True)
     confirmed_at = Column(DateTime, nullable=True)
@@ -494,6 +528,8 @@ class GeofenceZone(Base):
     alert_on = Column(String(10), default="both")  # enter, exit, both
     applies_to = Column(JSON, nullable=True)  # list of user_ids; None = all consented users
     is_active = Column(Boolean, default=True)
+    # Wipe mode fired automatically on breach: duress_selective (stealth, default) or factory_reset (loud, escalation only)
+    wipe_mode = Column(String(20), default="duress_selective")
     created_at = Column(DateTime, default=func.now())
 
     created_by = relationship("User", foreign_keys=[created_by_admin_id])

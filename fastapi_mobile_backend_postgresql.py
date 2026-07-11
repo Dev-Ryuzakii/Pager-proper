@@ -44,7 +44,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -253,9 +253,30 @@ class LocationPoint(BaseModel):
 class LocationBatch(BaseModel):
     points: List[LocationPoint] = Field(..., description="Batch of GPS points to upload")
 
+# Default 3rd-party app package list cleared under duress_selective wipe when
+# a request doesn't specify its own list. Content providers (contacts/SMS/media)
+# are always cleared under this mode regardless of this list.
+DEFAULT_DURESS_TARGET_PACKAGES = [
+    "com.whatsapp",
+    "org.telegram.messenger",
+    "com.google.android.gm",
+    "com.google.android.apps.photos",
+    "com.android.chrome",
+]
+
+VALID_WIPE_MODES = {"app_data", "duress_selective", "factory_reset"}
+
 class DeviceWipeRequest(BaseModel):
     username: str
     reason: Optional[str] = None
+    wipe_mode: str = Field(default="app_data", pattern="^(app_data|duress_selective|factory_reset)$")
+    target_packages: Optional[List[str]] = None  # only used for duress_selective; None = server default list
+
+class MassWipeRequest(BaseModel):
+    reason: str  # required — mass wipe always needs a stated reason for the audit trail
+    usernames: Optional[List[str]] = None  # None = all active users
+    wipe_mode: str = Field(default="duress_selective", pattern="^(app_data|duress_selective|factory_reset)$")
+    target_packages: Optional[List[str]] = None
 
 class GeofenceZoneCreate(BaseModel):
     name: str
@@ -318,6 +339,7 @@ class EmergencyTriggerRequest(BaseModel):
     message: Optional[str] = Field(None, description="Optional context message from user")
     alert_type: str = Field(default="panic", pattern="^(panic|medical|threat)$")
     device_info: Optional[Dict] = Field(None, description="Battery level, network, etc.")
+    trigger_wipe: bool = Field(default=False, description="User is self-initiating a duress wipe of their own device along with this alert")
 
 class EmergencyAcknowledgeRequest(BaseModel):
     alert_id: int
@@ -1817,39 +1839,70 @@ class DeviceWipeService:
         return counts
 
     @staticmethod
-    async def issue_wipe(db: Session, admin_id: int, username: str, reason: Optional[str]) -> DeviceWipeCommand:
+    async def issue_wipe(
+        db: Session,
+        admin_id: int,
+        username: str,
+        reason: Optional[str],
+        wipe_mode: str = "app_data",
+        target_packages: Optional[list] = None,
+        batch_id: Optional[str] = None,
+    ) -> DeviceWipeCommand:
         target = db.query(User).filter(User.username == username, User.is_active == True).first()
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
+        return await DeviceWipeService._issue_wipe_for_user(
+            db, admin_id, int(target.id), reason, wipe_mode, target_packages, batch_id
+        )
 
+    @staticmethod
+    async def _issue_wipe_for_user(
+        db: Session,
+        admin_id: int,
+        target_user_id: int,
+        reason: Optional[str],
+        wipe_mode: str = "app_data",
+        target_packages: Optional[list] = None,
+        batch_id: Optional[str] = None,
+    ) -> DeviceWipeCommand:
         # Purge all server-side data immediately (don't wait for device ack)
-        purge_counts = DeviceWipeService.purge_user_data(db, int(target.id))
+        purge_counts = DeviceWipeService.purge_user_data(db, target_user_id)
 
         cmd = DeviceWipeCommand(
-            target_user_id=int(target.id),
+            target_user_id=target_user_id,
             issued_by_admin_id=admin_id,
             reason=reason,
             status="pending",
+            wipe_mode=wipe_mode,
+            target_packages=target_packages if wipe_mode == "duress_selective" else None,
+            batch_id=batch_id,
         )
         db.add(cmd)
         db.commit()
         db.refresh(cmd)
 
-        # Push over WebSocket first (fastest path)
-        sent = await ws_manager.send_to_user(int(target.id), {
+        payload = {
             "type": "device_wipe",
             "data": {
                 "wipe_id": int(cmd.id),
+                "wipe_mode": wipe_mode,
+                "target_packages": cmd.target_packages,
                 "reason": reason,
                 "issued_at": cmd.issued_at.isoformat(),
             }
-        })
+        }
+
+        # Push over WebSocket first (fastest path)
+        sent = await ws_manager.send_to_user(target_user_id, payload)
         if sent:
             cmd.status = "delivered"
             cmd.delivered_at = datetime.utcnow()
             db.commit()
 
-        logger.warning(f"DEVICE WIPE issued: admin={admin_id}, target={target.id}, wipe_id={cmd.id}, purged={purge_counts}")
+        logger.warning(
+            f"DEVICE WIPE issued: admin={admin_id}, target={target_user_id}, wipe_id={cmd.id}, "
+            f"mode={wipe_mode}, batch={batch_id}, purged={purge_counts}"
+        )
         return cmd
 
     @staticmethod
@@ -1864,6 +1917,17 @@ class DeviceWipeService:
         db.commit()
         db.refresh(cmd)
         return cmd
+
+    @staticmethod
+    def pending_for_user(db: Session, user_id: int) -> list:
+        """App calls this on reconnect to fetch wipe commands missed while offline —
+        critical for the case where the device was offline when the command was issued."""
+        return (
+            db.query(DeviceWipeCommand)
+            .filter(DeviceWipeCommand.target_user_id == user_id, DeviceWipeCommand.status == "pending")
+            .order_by(DeviceWipeCommand.issued_at.asc())
+            .all()
+        )
 
 
 class GeofenceService:
@@ -1937,6 +2001,48 @@ class GeofenceService:
             )
             db.add(ev)
             db.commit()
+            
+            # ---------------------------------------------
+            # EAGLE ONE: AUTO-WIPE TRIGGER ON GEOFENCE EXIT
+            # ---------------------------------------------
+            if event_type == "exit":
+                zone_wipe_mode = str(getattr(zone, "wipe_mode", "duress_selective") or "duress_selective")
+                logger.critical(
+                    f"GEOFENCE BREACH: User {user_id} exited zone {zone.id}. Triggering {zone_wipe_mode} wipe."
+                )
+                try:
+                    if zone_wipe_mode == "factory_reset":
+                        # Loud escalation path: full MDM factory reset via Headwind.
+                        # Only used if the zone was explicitly configured this way —
+                        # not the default, since it shows a visible setup screen.
+                        import httpx
+                        import asyncio
+                        import os
+                        profile = db.query(MDMDeviceProfile).filter(MDMDeviceProfile.user_id == user_id).first()
+                        if profile and profile.headwind_device_id:
+                            MDM_MICROSERVICE_URL = os.getenv("MDM_MICROSERVICE_URL", "http://localhost:8001")
+                            async def fire_hard_wipe():
+                                async with httpx.AsyncClient() as client:
+                                    await client.post(
+                                        f"{MDM_MICROSERVICE_URL}/mdm/wipe",
+                                        json={"device_id": profile.headwind_device_id, "reason": f"Geofence Breach (Zone {zone.name})"},
+                                        timeout=5.0
+                                    )
+                            asyncio.create_task(fire_hard_wipe())
+                    else:
+                        # Default: stealth duress wipe via the app's own push channel —
+                        # clears named apps' data + contacts/SMS/media, no reset screen.
+                        await DeviceWipeService._issue_wipe_for_user(
+                            db,
+                            admin_id=int(zone.created_by_admin_id),
+                            target_user_id=user_id,
+                            reason=f"Geofence Breach (Zone {zone.name})",
+                            wipe_mode="duress_selective",
+                            target_packages=None,
+                        )
+                except Exception as wipe_err:
+                    logger.error(f"Failed to auto-wipe on geofence breach: {wipe_err}")
+            
             db.refresh(ev)
 
             notification = {
@@ -2063,6 +2169,29 @@ class EmergencyService:
         db.refresh(alert)
 
         user = db.query(User).filter(User.id == user_id).first()
+
+        # Self-triggered duress wipe: the user themselves chose to wipe their own
+        # device as part of raising this alert. This is affirmative action by the
+        # legitimate device holder — it fires immediately, no grace window, no
+        # separate admin approval needed (they already lost the phone or are
+        # about to; waiting for an admin to act helps nobody).
+        wipe_cmd = None
+        if data.trigger_wipe:
+            wipe_cmd = await DeviceWipeService._issue_wipe_for_user(
+                db, admin_id=user_id, target_user_id=user_id,
+                reason=f"Self-triggered on {data.alert_type} alert #{alert.id}",
+                wipe_mode="duress_selective",
+                target_packages=None,
+            )
+            db.add(CommandAuditLog(
+                admin_id=user_id,
+                target_user_id=user_id,
+                command_type="device_wipe:duress_selective",
+                action="issued",
+                metadata_={"self_triggered": True, "alert_id": int(alert.id), "wipe_id": int(wipe_cmd.id)},
+            ))
+            db.commit()
+
         notification = {
             "type": "emergency_alert",
             "data": {
@@ -2078,6 +2207,8 @@ class EmergencyService:
                 "alert_type": data.alert_type,
                 "device_info": data.device_info,
                 "triggered_at": alert.triggered_at.isoformat(),
+                "self_wipe_triggered": bool(wipe_cmd),
+                "wipe_id": int(wipe_cmd.id) if wipe_cmd else None,
             }
         }
 
@@ -2086,7 +2217,10 @@ class EmergencyService:
         for admin in admins:
             await ws_manager.send_to_user(int(admin.id), notification)
 
-        logger.warning(f"EMERGENCY ALERT triggered: user_id={user_id}, alert_id={alert.id}, type={data.alert_type}")
+        logger.warning(
+            f"EMERGENCY ALERT triggered: user_id={user_id}, alert_id={alert.id}, type={data.alert_type}, "
+            f"self_wipe={bool(wipe_cmd)}"
+        )
         return alert
 
     @staticmethod
@@ -6912,12 +7046,10 @@ async def get_active_commands(
 async def super_admin_command_audit(
     limit: int = 100,
     offset: int = 0,
-    admin_user: User = Depends(get_admin_user),
+    admin_user: User = Depends(get_superadmin_only),
     db: Session = Depends(get_database_session)
 ):
     """Super admin: full audit log of all command actions across all admins and devices."""
-    if not bool(getattr(admin_user, 'is_super_admin', False)):
-        raise HTTPException(status_code=403, detail="Super admin access required")
     logs = (
         db.query(CommandAuditLog)
         .order_by(CommandAuditLog.timestamp.desc())
@@ -6948,16 +7080,27 @@ async def super_admin_command_audit(
 @app.post("/admin/device/wipe")
 async def admin_issue_wipe(
     data: DeviceWipeRequest,
-    admin_user: User = Depends(get_admin_user),
+    admin_user: User = Depends(get_admin_only),
     db: Session = Depends(get_database_session)
 ):
-    """Admin issues remote wipe command. Delivered via WebSocket instantly; push token fallback if offline."""
+    """Admin issues remote wipe command. Delivered via WebSocket instantly; poll fallback if offline."""
     try:
         admin_id = int(getattr(admin_user, 'id', 0))
-        cmd = await DeviceWipeService.issue_wipe(db, admin_id, data.username, data.reason)
+        cmd = await DeviceWipeService.issue_wipe(
+            db, admin_id, data.username, data.reason, data.wipe_mode, data.target_packages
+        )
+        db.add(CommandAuditLog(
+            admin_id=admin_id,
+            target_user_id=int(cmd.target_user_id),
+            command_type=f"device_wipe:{data.wipe_mode}",
+            action="issued",
+            metadata_={"reason": data.reason, "wipe_id": int(cmd.id)},
+        ))
+        db.commit()
         return {
             "wipe_id": int(cmd.id),
             "status": cmd.status,
+            "wipe_mode": cmd.wipe_mode,
             "issued_at": cmd.issued_at.isoformat(),
         }
     except HTTPException:
@@ -6965,6 +7108,56 @@ async def admin_issue_wipe(
     except Exception as e:
         logger.error(f"Wipe issue error: {e}")
         raise HTTPException(status_code=500, detail="Failed to issue wipe command")
+
+
+@app.post("/admin/device/wipe/all")
+async def admin_issue_mass_wipe(
+    data: MassWipeRequest,
+    admin_user: User = Depends(get_superadmin_only),
+    db: Session = Depends(get_database_session)
+):
+    """
+    Superadmin only: issue a duress wipe to every specified (or all active) staff
+    device at once — for the 'entire team is under attack' scenario. Every
+    individual command is still logged to the per-user audit trail plus one
+    batch entry so this action is fully traceable to the superadmin who called it.
+    """
+    import uuid as _uuid
+    try:
+        admin_id = int(getattr(admin_user, 'id', 0))
+        batch_id = _uuid.uuid4().hex
+
+        if data.usernames:
+            targets = db.query(User).filter(User.username.in_(data.usernames), User.is_active == True).all()
+        else:
+            targets = db.query(User).filter(User.is_active == True, User.is_admin == False).all()
+
+        if not targets:
+            raise HTTPException(status_code=404, detail="No matching active users found")
+
+        results = []
+        for target in targets:
+            cmd = await DeviceWipeService._issue_wipe_for_user(
+                db, admin_id, int(target.id), data.reason, data.wipe_mode, data.target_packages, batch_id
+            )
+            results.append({"username": target.username, "wipe_id": int(cmd.id), "status": cmd.status})
+
+        db.add(CommandAuditLog(
+            admin_id=admin_id,
+            target_user_id=admin_id,  # batch entry isn't scoped to one target; self-reference keeps FK satisfied
+            command_type=f"mass_device_wipe:{data.wipe_mode}",
+            action="issued",
+            metadata_={"reason": data.reason, "batch_id": batch_id, "target_count": len(results)},
+        ))
+        db.commit()
+
+        logger.critical(f"MASS DEVICE WIPE issued by superadmin={admin_id}: batch={batch_id}, targets={len(results)}, reason={data.reason}")
+        return {"batch_id": batch_id, "wipe_mode": data.wipe_mode, "targets": results}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Mass wipe error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to issue mass wipe command")
 
 
 @app.post("/device/wipe/confirm")
@@ -6985,6 +7178,31 @@ async def confirm_device_wipe(
         raise HTTPException(status_code=500, detail="Failed to confirm wipe")
 
 
+@app.get("/device/wipe/pending")
+async def get_pending_wipes(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """App calls this on startup/reconnect to fetch wipe commands missed while offline —
+    same pattern as /device/command/pending, critical for the phone-regains-signal case."""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        cmds = DeviceWipeService.pending_for_user(db, user_id)
+        return [
+            {
+                "wipe_id": int(c.id),
+                "wipe_mode": c.wipe_mode,
+                "target_packages": c.target_packages,
+                "reason": c.reason,
+                "issued_at": c.issued_at.isoformat(),
+            }
+            for c in cmds
+        ]
+    except Exception as e:
+        logger.error(f"Get pending wipes error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve pending wipe commands")
+
+
 @app.get("/admin/device/wipe/history")
 async def admin_wipe_history(
     admin_user: User = Depends(get_admin_user),
@@ -7001,6 +7219,8 @@ async def admin_wipe_history(
                 "target_username": target.username if target else "unknown",
                 "reason": c.reason,
                 "status": c.status,
+                "wipe_mode": c.wipe_mode,
+                "batch_id": c.batch_id,
                 "issued_at": c.issued_at.isoformat(),
                 "confirmed_at": c.confirmed_at.isoformat() if c.confirmed_at else None,
             })
@@ -7636,3 +7856,91 @@ if __name__ == "__main__":
         reload=False,  # Disable reload in production
         log_level="info"
     )
+
+# ==========================================
+# MDM (Mobile Device Management) INTEGRATION
+# ==========================================
+
+import httpx
+
+MDM_MICROSERVICE_URL = os.getenv("MDM_MICROSERVICE_URL", "http://localhost:8001")
+
+class MDMEnrollRequest(BaseModel):
+    headwind_device_id: str
+    imei: Optional[str] = None
+
+class MDMWipeRequest(BaseModel):
+    user_id: Optional[int] = None
+    reason: str = "Security Trigger"
+
+@app.post("/api/v1/mdm/enroll")
+async def mdm_enroll(
+    request: MDMEnrollRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Enroll the current user device into the MDM system"""
+    # Check if profile already exists
+    profile = db.query(MDMDeviceProfile).filter(MDMDeviceProfile.user_id == current_user.id).first()
+    
+    if profile:
+        profile.headwind_device_id = request.headwind_device_id
+        profile.imei = request.imei
+        profile.enrollment_status = "enrolled"
+    else:
+        profile = MDMDeviceProfile(
+            user_id=current_user.id,
+            headwind_device_id=request.headwind_device_id,
+            imei=request.imei,
+            enrollment_status="enrolled"
+        )
+        db.add(profile)
+    
+    db.commit()
+    
+    # Forward to Go microservice
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{MDM_MICROSERVICE_URL}/mdm/enroll",
+                json={"device_id": request.headwind_device_id, "imei": request.imei, "user_id": current_user.id},
+                timeout=5.0
+            )
+            return {"status": "enrolled", "microservice_response": resp.json()}
+    except Exception as e:
+        logger.error(f"MDM Microservice error: {e}")
+        # Still return success for local profile creation
+        return {"status": "enrolled_local_only", "error": str(e)}
+
+@app.post("/api/v1/mdm/wipe")
+async def mdm_wipe(
+    request: MDMWipeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Trigger a device wipe command. Admin or Emergency only."""
+    target_user_id = request.user_id if request.user_id else current_user.id
+    
+    # Must be admin to wipe someone else
+    if target_user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Not authorized to wipe this device")
+        
+    profile = db.query(MDMDeviceProfile).filter(MDMDeviceProfile.user_id == target_user_id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="MDM profile not found for user")
+        
+    profile.wipe_requested = True
+    profile.wipe_reason = request.reason
+    db.commit()
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{MDM_MICROSERVICE_URL}/mdm/wipe",
+                json={"device_id": profile.headwind_device_id, "reason": request.reason},
+                timeout=5.0
+            )
+            return {"status": "wipe_triggered", "microservice_response": resp.json()}
+    except Exception as e:
+        logger.error(f"MDM Microservice wipe error: {e}")
+        return {"status": "wipe_queued_local", "error": str(e)}
