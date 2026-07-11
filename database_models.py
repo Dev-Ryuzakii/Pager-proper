@@ -47,6 +47,9 @@ class User(Base):
     user_type = Column(String(20), default="tls")  # "tls", "mobile", "both"
     is_admin = Column(Boolean, default=False)  # Admin account flag
     admin_role = Column(String(20), nullable=True)  # "superadmin", "admin", "operator" — null for regular users
+    # Superadmin-granted: lets this admin approve/reject SOS- and geofence-triggered
+    # duress wipe requests. Superadmin can always approve regardless of this flag.
+    can_approve_duress_wipe = Column(Boolean, default=False)
     voice_identity_path = Column(String(512), nullable=True)  # Path to voice identity file
     
     # Relationships
@@ -498,21 +501,35 @@ class DeviceWipeCommand(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    issued_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    # Null while status='awaiting_approval' — set to the approving admin's id on approval.
+    issued_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     reason = Column(Text, nullable=True)
-    status = Column(String(20), default="pending")  # pending, delivered, confirmed, failed
+    # awaiting_approval, pending, delivered, confirmed, rejected, failed
+    status = Column(String(20), default="pending")
     # app_data: soft wipe, app's own local DB only (existing behavior)
     # duress_selective: Device Owner clears named 3rd-party apps' data + contacts/SMS/media, no reset screen
     # factory_reset: full MDM wipe via Headwind, device reboots to setup screen
     wipe_mode = Column(String(20), default="app_data")
     target_packages = Column(JSON, nullable=True)  # package names to clear for duress_selective; None = server default list
     batch_id = Column(String(64), nullable=True, index=True)  # groups commands issued together (e.g. mass wipe)
+    # admin: direct admin-issued (immediate); mass: superadmin fleet wipe (immediate);
+    # sos: user's own panic trigger (requires approval); geofence: auto zone breach (requires approval)
+    trigger_source = Column(String(20), default="admin")
+    requested_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # who/what triggered an auto request
+    approved_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    approved_at = Column(DateTime, nullable=True)
+    rejected_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    rejected_at = Column(DateTime, nullable=True)
+    rejection_note = Column(Text, nullable=True)
     issued_at = Column(DateTime, default=func.now())
     delivered_at = Column(DateTime, nullable=True)
     confirmed_at = Column(DateTime, nullable=True)
 
     target_user = relationship("User", foreign_keys=[target_user_id])
     issued_by = relationship("User", foreign_keys=[issued_by_admin_id])
+    requested_by = relationship("User", foreign_keys=[requested_by_user_id])
+    approved_by = relationship("User", foreign_keys=[approved_by_admin_id])
+    rejected_by = relationship("User", foreign_keys=[rejected_by_admin_id])
 
 
 class GeofenceZone(Base):

@@ -278,6 +278,13 @@ class MassWipeRequest(BaseModel):
     wipe_mode: str = Field(default="duress_selective", pattern="^(app_data|duress_selective|factory_reset)$")
     target_packages: Optional[List[str]] = None
 
+class WipeRejectRequest(BaseModel):
+    note: Optional[str] = None
+
+class SetWipeApproverRequest(BaseModel):
+    username: str
+    can_approve: bool
+
 class GeofenceZoneCreate(BaseModel):
     name: str
     center_lat: float
@@ -1839,6 +1846,68 @@ class DeviceWipeService:
         return counts
 
     @staticmethod
+    def _create_command(
+        db: Session,
+        target_user_id: int,
+        reason: Optional[str],
+        wipe_mode: str,
+        target_packages: Optional[list],
+        batch_id: Optional[str],
+        trigger_source: str,
+        requested_by_user_id: Optional[int],
+        issued_by_admin_id: Optional[int],
+        status: str,
+    ) -> DeviceWipeCommand:
+        cmd = DeviceWipeCommand(
+            target_user_id=target_user_id,
+            issued_by_admin_id=issued_by_admin_id,
+            reason=reason,
+            status=status,
+            wipe_mode=wipe_mode,
+            target_packages=target_packages if wipe_mode == "duress_selective" else None,
+            batch_id=batch_id,
+            trigger_source=trigger_source,
+            requested_by_user_id=requested_by_user_id,
+        )
+        db.add(cmd)
+        db.commit()
+        db.refresh(cmd)
+        return cmd
+
+    @staticmethod
+    async def _deliver(db: Session, cmd: DeviceWipeCommand) -> DeviceWipeCommand:
+        """Purges server-side data and pushes the wipe payload to the device. Only
+        call this once a command is authorized to actually execute — i.e. it was
+        either issued directly by an admin/superadmin, or an awaiting_approval
+        request has just been approved."""
+        target_user_id = int(cmd.target_user_id)
+        purge_counts = DeviceWipeService.purge_user_data(db, target_user_id)
+
+        payload = {
+            "type": "device_wipe",
+            "data": {
+                "wipe_id": int(cmd.id),
+                "wipe_mode": cmd.wipe_mode,
+                "target_packages": cmd.target_packages,
+                "reason": cmd.reason,
+                "issued_at": cmd.issued_at.isoformat(),
+            }
+        }
+
+        sent = await ws_manager.send_to_user(target_user_id, payload)
+        if sent:
+            cmd.status = "delivered"
+            cmd.delivered_at = datetime.utcnow()
+            db.commit()
+            db.refresh(cmd)
+
+        logger.warning(
+            f"DEVICE WIPE delivered: target={target_user_id}, wipe_id={cmd.id}, "
+            f"mode={cmd.wipe_mode}, source={cmd.trigger_source}, batch={cmd.batch_id}, purged={purge_counts}"
+        )
+        return cmd
+
+    @staticmethod
     async def issue_wipe(
         db: Session,
         admin_id: int,
@@ -1848,6 +1917,8 @@ class DeviceWipeService:
         target_packages: Optional[list] = None,
         batch_id: Optional[str] = None,
     ) -> DeviceWipeCommand:
+        """Direct admin-issued wipe — immediate, no approval step. The admin role
+        gate on the calling endpoint IS the authorization here."""
         target = db.query(User).filter(User.username == username, User.is_active == True).first()
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
@@ -1864,46 +1935,107 @@ class DeviceWipeService:
         wipe_mode: str = "app_data",
         target_packages: Optional[list] = None,
         batch_id: Optional[str] = None,
+        trigger_source: str = "admin",
     ) -> DeviceWipeCommand:
-        # Purge all server-side data immediately (don't wait for device ack)
-        purge_counts = DeviceWipeService.purge_user_data(db, target_user_id)
-
-        cmd = DeviceWipeCommand(
-            target_user_id=target_user_id,
-            issued_by_admin_id=admin_id,
-            reason=reason,
-            status="pending",
-            wipe_mode=wipe_mode,
-            target_packages=target_packages if wipe_mode == "duress_selective" else None,
-            batch_id=batch_id,
+        """Immediate path — used for direct admin wipes and superadmin mass wipes,
+        both of which are already a deliberate human decision by an authorized role."""
+        cmd = DeviceWipeService._create_command(
+            db, target_user_id, reason, wipe_mode, target_packages, batch_id,
+            trigger_source=trigger_source, requested_by_user_id=None,
+            issued_by_admin_id=admin_id, status="pending",
         )
-        db.add(cmd)
+        return await DeviceWipeService._deliver(db, cmd)
+
+    @staticmethod
+    def request_approval(
+        db: Session,
+        target_user_id: int,
+        reason: Optional[str],
+        wipe_mode: str,
+        target_packages: Optional[list],
+        trigger_source: str,
+        requested_by_user_id: int,
+    ) -> DeviceWipeCommand:
+        """SOS and geofence-exit both land here instead of wiping directly — no
+        server purge, no device push, until an authorized approver acts on it.
+        This exists specifically so a missed off-duty geofence removal, a false
+        alarm, or a coerced/malicious SOS press doesn't destroy real data on its
+        own; an admin sees WHY before anything is touched."""
+        return DeviceWipeService._create_command(
+            db, target_user_id, reason, wipe_mode, target_packages, batch_id=None,
+            trigger_source=trigger_source, requested_by_user_id=requested_by_user_id,
+            issued_by_admin_id=None, status="awaiting_approval",
+        )
+
+    @staticmethod
+    async def approve_wipe(db: Session, wipe_id: int, approving_admin_id: int) -> DeviceWipeCommand:
+        cmd = db.query(DeviceWipeCommand).filter(DeviceWipeCommand.id == wipe_id).first()
+        if not cmd:
+            raise HTTPException(status_code=404, detail="Wipe request not found")
+        if str(cmd.status) != "awaiting_approval":
+            raise HTTPException(status_code=400, detail=f"Request is '{cmd.status}', not awaiting approval")
+
+        cmd.approved_by_admin_id = approving_admin_id
+        cmd.approved_at = datetime.utcnow()
+        cmd.issued_by_admin_id = approving_admin_id
+
+        if str(cmd.wipe_mode) == "factory_reset":
+            # Loud escalation path: dispatched via the Headwind MDM connector,
+            # not the app's own push channel.
+            profile = db.query(MDMDeviceProfile).filter(MDMDeviceProfile.user_id == cmd.target_user_id).first()
+            if profile and profile.headwind_device_id:
+                try:
+                    import httpx, os
+                    MDM_MICROSERVICE_URL = os.getenv("MDM_MICROSERVICE_URL", "http://localhost:8001")
+                    async with httpx.AsyncClient() as client:
+                        await client.post(
+                            f"{MDM_MICROSERVICE_URL}/mdm/wipe",
+                            json={"device_id": profile.headwind_device_id, "reason": cmd.reason},
+                            timeout=5.0,
+                        )
+                    cmd.status = "delivered"
+                    cmd.delivered_at = datetime.utcnow()
+                except Exception as e:
+                    logger.error(f"factory_reset dispatch failed for wipe_id={wipe_id}: {e}")
+                    cmd.status = "failed"
+            else:
+                logger.error(f"factory_reset approved but no MDM profile for user_id={cmd.target_user_id}")
+                cmd.status = "failed"
+            db.commit()
+            db.refresh(cmd)
+            logger.warning(f"WIPE APPROVED (factory_reset): wipe_id={wipe_id}, approver={approving_admin_id}")
+            return cmd
+
+        cmd.status = "pending"
         db.commit()
         db.refresh(cmd)
+        logger.warning(f"WIPE APPROVED: wipe_id={wipe_id}, approver={approving_admin_id}, mode={cmd.wipe_mode}")
+        return await DeviceWipeService._deliver(db, cmd)
 
-        payload = {
-            "type": "device_wipe",
-            "data": {
-                "wipe_id": int(cmd.id),
-                "wipe_mode": wipe_mode,
-                "target_packages": cmd.target_packages,
-                "reason": reason,
-                "issued_at": cmd.issued_at.isoformat(),
-            }
-        }
-
-        # Push over WebSocket first (fastest path)
-        sent = await ws_manager.send_to_user(target_user_id, payload)
-        if sent:
-            cmd.status = "delivered"
-            cmd.delivered_at = datetime.utcnow()
-            db.commit()
-
-        logger.warning(
-            f"DEVICE WIPE issued: admin={admin_id}, target={target_user_id}, wipe_id={cmd.id}, "
-            f"mode={wipe_mode}, batch={batch_id}, purged={purge_counts}"
-        )
+    @staticmethod
+    def reject_wipe(db: Session, wipe_id: int, rejecting_admin_id: int, note: Optional[str]) -> DeviceWipeCommand:
+        cmd = db.query(DeviceWipeCommand).filter(DeviceWipeCommand.id == wipe_id).first()
+        if not cmd:
+            raise HTTPException(status_code=404, detail="Wipe request not found")
+        if str(cmd.status) != "awaiting_approval":
+            raise HTTPException(status_code=400, detail=f"Request is '{cmd.status}', not awaiting approval")
+        cmd.status = "rejected"
+        cmd.rejected_by_admin_id = rejecting_admin_id
+        cmd.rejected_at = datetime.utcnow()
+        cmd.rejection_note = note
+        db.commit()
+        db.refresh(cmd)
+        logger.warning(f"WIPE REJECTED: wipe_id={wipe_id}, rejected_by={rejecting_admin_id}, note={note}")
         return cmd
+
+    @staticmethod
+    def pending_approval(db: Session) -> list:
+        return (
+            db.query(DeviceWipeCommand)
+            .filter(DeviceWipeCommand.status == "awaiting_approval")
+            .order_by(DeviceWipeCommand.issued_at.asc())
+            .all()
+        )
 
     @staticmethod
     def confirm_wipe(db: Session, wipe_id: int, user_id: int) -> DeviceWipeCommand:
@@ -2003,46 +2135,30 @@ class GeofenceService:
             db.commit()
             
             # ---------------------------------------------
-            # EAGLE ONE: AUTO-WIPE TRIGGER ON GEOFENCE EXIT
+            # EAGLE ONE: WIPE APPROVAL REQUEST ON GEOFENCE EXIT
             # ---------------------------------------------
+            # Does not wipe on its own — a zone the user simply forgot to be
+            # removed from off-duty shouldn't nuke their device. This only raises
+            # a request; an authorized approver decides after seeing the breach.
+            wipe_cmd = None
             if event_type == "exit":
                 zone_wipe_mode = str(getattr(zone, "wipe_mode", "duress_selective") or "duress_selective")
-                logger.critical(
-                    f"GEOFENCE BREACH: User {user_id} exited zone {zone.id}. Triggering {zone_wipe_mode} wipe."
+                logger.warning(
+                    f"GEOFENCE BREACH: User {user_id} exited zone {zone.id}. Requesting {zone_wipe_mode} wipe approval."
                 )
                 try:
-                    if zone_wipe_mode == "factory_reset":
-                        # Loud escalation path: full MDM factory reset via Headwind.
-                        # Only used if the zone was explicitly configured this way —
-                        # not the default, since it shows a visible setup screen.
-                        import httpx
-                        import asyncio
-                        import os
-                        profile = db.query(MDMDeviceProfile).filter(MDMDeviceProfile.user_id == user_id).first()
-                        if profile and profile.headwind_device_id:
-                            MDM_MICROSERVICE_URL = os.getenv("MDM_MICROSERVICE_URL", "http://localhost:8001")
-                            async def fire_hard_wipe():
-                                async with httpx.AsyncClient() as client:
-                                    await client.post(
-                                        f"{MDM_MICROSERVICE_URL}/mdm/wipe",
-                                        json={"device_id": profile.headwind_device_id, "reason": f"Geofence Breach (Zone {zone.name})"},
-                                        timeout=5.0
-                                    )
-                            asyncio.create_task(fire_hard_wipe())
-                    else:
-                        # Default: stealth duress wipe via the app's own push channel —
-                        # clears named apps' data + contacts/SMS/media, no reset screen.
-                        await DeviceWipeService._issue_wipe_for_user(
-                            db,
-                            admin_id=int(zone.created_by_admin_id),
-                            target_user_id=user_id,
-                            reason=f"Geofence Breach (Zone {zone.name})",
-                            wipe_mode="duress_selective",
-                            target_packages=None,
-                        )
+                    wipe_cmd = DeviceWipeService.request_approval(
+                        db,
+                        target_user_id=user_id,
+                        reason=f"Geofence Breach (Zone {zone.name})",
+                        wipe_mode=zone_wipe_mode,
+                        target_packages=None,
+                        trigger_source="geofence",
+                        requested_by_user_id=user_id,
+                    )
                 except Exception as wipe_err:
-                    logger.error(f"Failed to auto-wipe on geofence breach: {wipe_err}")
-            
+                    logger.error(f"Failed to raise wipe request on geofence breach: {wipe_err}")
+
             db.refresh(ev)
 
             notification = {
@@ -2057,6 +2173,9 @@ class GeofenceService:
                     "latitude": lat,
                     "longitude": lon,
                     "triggered_at": recorded_at.isoformat(),
+                    "wipe_requested": bool(wipe_cmd),
+                    "wipe_id": int(wipe_cmd.id) if wipe_cmd else None,
+                    "wipe_mode": wipe_cmd.wipe_mode if wipe_cmd else None,
                 }
             }
             admins = db.query(User).filter(User.is_admin == True, User.is_active == True).all()
@@ -2170,27 +2289,21 @@ class EmergencyService:
 
         user = db.query(User).filter(User.id == user_id).first()
 
-        # Self-triggered duress wipe: the user themselves chose to wipe their own
-        # device as part of raising this alert. This is affirmative action by the
-        # legitimate device holder — it fires immediately, no grace window, no
-        # separate admin approval needed (they already lost the phone or are
-        # about to; waiting for an admin to act helps nobody).
+        # SOS-requested wipe: the user is asking for their device to be wiped as
+        # part of this alert, but it does NOT fire on its own — a false alarm, or
+        # a coerced/malicious SOS press, would otherwise destroy real data with
+        # nobody able to stop it. It becomes an awaiting_approval request; an
+        # authorized approver sees the alert context and decides.
         wipe_cmd = None
         if data.trigger_wipe:
-            wipe_cmd = await DeviceWipeService._issue_wipe_for_user(
-                db, admin_id=user_id, target_user_id=user_id,
-                reason=f"Self-triggered on {data.alert_type} alert #{alert.id}",
+            wipe_cmd = DeviceWipeService.request_approval(
+                db, target_user_id=user_id,
+                reason=f"SOS requested on {data.alert_type} alert #{alert.id}",
                 wipe_mode="duress_selective",
                 target_packages=None,
+                trigger_source="sos",
+                requested_by_user_id=user_id,
             )
-            db.add(CommandAuditLog(
-                admin_id=user_id,
-                target_user_id=user_id,
-                command_type="device_wipe:duress_selective",
-                action="issued",
-                metadata_={"self_triggered": True, "alert_id": int(alert.id), "wipe_id": int(wipe_cmd.id)},
-            ))
-            db.commit()
 
         notification = {
             "type": "emergency_alert",
@@ -2207,19 +2320,21 @@ class EmergencyService:
                 "alert_type": data.alert_type,
                 "device_info": data.device_info,
                 "triggered_at": alert.triggered_at.isoformat(),
-                "self_wipe_triggered": bool(wipe_cmd),
+                "wipe_requested": bool(wipe_cmd),
                 "wipe_id": int(wipe_cmd.id) if wipe_cmd else None,
+                "wipe_status": wipe_cmd.status if wipe_cmd else None,
             }
         }
 
-        # Push to ALL admin users who are online
+        # Push to ALL admin users who are online (visibility); approval action
+        # itself is gated separately to admins with can_approve_duress_wipe.
         admins = db.query(User).filter(User.is_admin == True, User.is_active == True).all()
         for admin in admins:
             await ws_manager.send_to_user(int(admin.id), notification)
 
         logger.warning(
             f"EMERGENCY ALERT triggered: user_id={user_id}, alert_id={alert.id}, type={data.alert_type}, "
-            f"self_wipe={bool(wipe_cmd)}"
+            f"wipe_requested={bool(wipe_cmd)}"
         )
         return alert
 
@@ -5075,6 +5190,18 @@ async def get_superadmin_only(credentials: HTTPAuthorizationCredentials = Depend
         raise HTTPException(status_code=403, detail="Superadmin role required")
     return user
 
+async def get_wipe_approver(credentials: HTTPAuthorizationCredentials = Depends(security),
+                            db: Session = Depends(get_database_session)) -> User:
+    """Require superadmin, or an admin superadmin has explicitly granted
+    can_approve_duress_wipe — this is the gate on SOS/geofence wipe approval,
+    kept separate from ordinary admin access on purpose."""
+    user = await get_admin_user(credentials, db)
+    if getattr(user, 'admin_role', None) == 'superadmin':
+        return user
+    if not bool(getattr(user, 'can_approve_duress_wipe', False)):
+        raise HTTPException(status_code=403, detail="Not authorized to approve duress wipe requests")
+    return user
+
 # ── Operator management endpoints ─────────────────────────────────────────────
 
 class CreateOperatorRequest(BaseModel):
@@ -7158,6 +7285,113 @@ async def admin_issue_mass_wipe(
     except Exception as e:
         logger.error(f"Mass wipe error: {e}")
         raise HTTPException(status_code=500, detail="Failed to issue mass wipe command")
+
+
+# ─── Wipe Approval Endpoints (SOS + geofence requests land here first) ───────
+
+@app.get("/admin/device/wipe/pending-approval")
+async def admin_pending_wipe_approvals(
+    approver: User = Depends(get_wipe_approver),
+    db: Session = Depends(get_database_session)
+):
+    """Approver views all wipe requests awaiting a decision."""
+    try:
+        cmds = DeviceWipeService.pending_approval(db)
+        result = []
+        for c in cmds:
+            target = db.query(User).filter(User.id == c.target_user_id).first()
+            requester = db.query(User).filter(User.id == c.requested_by_user_id).first() if c.requested_by_user_id else None
+            result.append({
+                "wipe_id": int(c.id),
+                "target_username": target.username if target else "unknown",
+                "trigger_source": c.trigger_source,
+                "requested_by_username": requester.username if requester else None,
+                "reason": c.reason,
+                "wipe_mode": c.wipe_mode,
+                "issued_at": c.issued_at.isoformat(),
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Pending wipe approvals error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve pending wipe approvals")
+
+
+@app.post("/admin/device/wipe/{wipe_id}/approve")
+async def admin_approve_wipe(
+    wipe_id: int,
+    approver: User = Depends(get_wipe_approver),
+    db: Session = Depends(get_database_session)
+):
+    """Approver authorizes a pending SOS/geofence wipe request — this is the only
+    point at which those requests actually purge data and push to the device."""
+    try:
+        approver_id = int(getattr(approver, 'id', 0))
+        cmd = await DeviceWipeService.approve_wipe(db, wipe_id, approver_id)
+        db.add(CommandAuditLog(
+            admin_id=approver_id,
+            target_user_id=int(cmd.target_user_id),
+            command_type=f"device_wipe:{cmd.wipe_mode}",
+            action="approved",
+            metadata_={"wipe_id": int(cmd.id), "trigger_source": cmd.trigger_source},
+        ))
+        db.commit()
+        return {"wipe_id": int(cmd.id), "status": cmd.status, "wipe_mode": cmd.wipe_mode}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Approve wipe error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to approve wipe request")
+
+
+@app.post("/admin/device/wipe/{wipe_id}/reject")
+async def admin_reject_wipe(
+    wipe_id: int,
+    data: WipeRejectRequest,
+    approver: User = Depends(get_wipe_approver),
+    db: Session = Depends(get_database_session)
+):
+    """Approver dismisses a pending SOS/geofence wipe request — e.g. a known
+    off-duty geofence exit or a confirmed false alarm. Nothing is touched."""
+    try:
+        approver_id = int(getattr(approver, 'id', 0))
+        cmd = DeviceWipeService.reject_wipe(db, wipe_id, approver_id, data.note)
+        db.add(CommandAuditLog(
+            admin_id=approver_id,
+            target_user_id=int(cmd.target_user_id),
+            command_type=f"device_wipe:{cmd.wipe_mode}",
+            action="rejected",
+            metadata_={"wipe_id": int(cmd.id), "trigger_source": cmd.trigger_source, "note": data.note},
+        ))
+        db.commit()
+        return {"wipe_id": int(cmd.id), "status": cmd.status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Reject wipe error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to reject wipe request")
+
+
+@app.post("/admin/users/wipe-approver")
+async def set_wipe_approver(
+    data: SetWipeApproverRequest,
+    admin_user: User = Depends(get_superadmin_only),
+    db: Session = Depends(get_database_session)
+):
+    """Superadmin only: grant or revoke an admin's ability to approve/reject
+    SOS- and geofence-triggered wipe requests. Superadmin can always approve
+    regardless of this flag."""
+    try:
+        target = db.query(User).filter(User.username == data.username, User.is_admin == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Admin user not found")
+        target.can_approve_duress_wipe = data.can_approve
+        db.commit()
+        return {"username": target.username, "can_approve_duress_wipe": target.can_approve_duress_wipe}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Set wipe approver error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update wipe approver status")
 
 
 @app.post("/device/wipe/confirm")
