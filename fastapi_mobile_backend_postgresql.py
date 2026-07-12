@@ -444,8 +444,8 @@ class MessageService:
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
         
-        decoy_text = decoy_content if decoy_content else "[ENCRYPTED MESSAGE] Tap to decrypt"
-        
+        decoy_text = decoy_content if decoy_content else FakeTextGenerator.generate_decoy_text_for_message(message_content)
+
         expires_at = None
         auto_delete = False
         if disappear_after_hours is not None and disappear_after_hours > 0:
@@ -489,8 +489,8 @@ class MessageService:
         if not membership:
             raise HTTPException(status_code=403, detail="You are not a member of this group")
             
-        decoy_text = decoy_content if decoy_content else "[ENCRYPTED GROUP MESSAGE] Tap to decrypt"
-            
+        decoy_text = decoy_content if decoy_content else FakeTextGenerator.generate_decoy_text_for_message(message_content)
+
         expires_at = None
         auto_delete = False
         if disappear_after_hours and disappear_after_hours > 0:
