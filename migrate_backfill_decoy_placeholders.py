@@ -11,7 +11,7 @@ natural-looking decoy from FakeTextGenerator.
 import os
 import sys
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -47,7 +47,8 @@ def backfill_decoy_placeholders():
                 WHERE decoy_content IN :placeholders
                    OR decoy_content IS NULL
                    OR decoy_content = ''
-            """).bindparams(placeholders=tuple(PLACEHOLDERS))
+            """).bindparams(bindparam("placeholders", expanding=True)),
+            {"placeholders": PLACEHOLDERS},
         ).fetchall()
 
         if not rows:
