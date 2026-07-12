@@ -300,6 +300,54 @@ class MDMDeviceProfile(Base):
     def __repr__(self):
         return f"<MDMDeviceProfile(user_id={self.user_id}, hw_id='{self.headwind_device_id}', status='{self.enrollment_status}')>"
 
+class LinkedDevice(Base):
+    """A device linked to a user account, each with its own E2E identity key.
+
+    Multi-device model: every device (phone, desktop, etc.) holds its own private
+    key and publishes only its public key here. Senders encrypt each message's AES
+    key once per active device. Revoking a device (revoked_at set) drops it from
+    future encryption without touching the others.
+    """
+    __tablename__ = "linked_devices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    device_uuid = Column(String(64), unique=True, nullable=False, index=True)
+    platform = Column(String(20), nullable=False)  # ios | android | desktop
+    device_name = Column(String(120), nullable=True)
+    public_key = Column(Text, nullable=False)
+    # Null for the migrated primary device, which still authenticates via its
+    # legacy login session; linked devices get their own token here.
+    session_token = Column(String(512), unique=True, nullable=True, index=True)
+    created_at = Column(DateTime, default=func.now())
+    last_seen = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+
+    user = relationship("User")
+
+    def __repr__(self):
+        return f"<LinkedDevice(user_id={self.user_id}, uuid='{self.device_uuid}', platform='{self.platform}')>"
+
+class DeviceLinkRequest(Base):
+    """A pending QR link: the new device posts its public key and shows the nonce;
+    an already-authenticated device scans and approves it."""
+    __tablename__ = "device_link_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    nonce = Column(String(64), unique=True, nullable=False, index=True)
+    public_key = Column(Text, nullable=False)
+    platform = Column(String(20), nullable=False)
+    device_name = Column(String(120), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    expires_at = Column(DateTime, nullable=False)
+    approved_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    device_uuid = Column(String(64), nullable=True)
+    session_token = Column(String(512), nullable=True)
+    consumed = Column(Boolean, default=False)
+
+    def __repr__(self):
+        return f"<DeviceLinkRequest(nonce='{self.nonce}', platform='{self.platform}', consumed={self.consumed})>"
+
 class Group(Base):
     """Group chat table"""
     __tablename__ = "groups"

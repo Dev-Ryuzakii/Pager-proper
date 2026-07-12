@@ -44,7 +44,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -2924,18 +2924,31 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     """Get current authenticated user"""
     try:
         token = credentials.credentials
-        
+
         # Validate session
         session = SessionService.validate_session(db, token)
-        if not session:
+        user_id = session.user_id if session else None
+
+        # Fall back to a linked-device session token (multi-device login).
+        if not user_id:
+            device = db.query(LinkedDevice).filter(
+                LinkedDevice.session_token == token,
+                LinkedDevice.revoked_at.is_(None),
+            ).first()
+            if device:
+                user_id = device.user_id
+                setattr(device, 'last_seen', datetime.now(timezone.utc))
+                db.commit()
+
+        if not user_id:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or expired session",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        
+
         # Get user
-        user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+        user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -3384,6 +3397,226 @@ async def logout_user(current_user: User = Depends(get_current_user),
     except Exception as e:
         logger.error(f"Logout error: {e}")
         raise HTTPException(status_code=500, detail="Logout failed")
+
+# ── Multi-device linking ────────────────────────────────────────────────────────
+
+VALID_PLATFORMS = {"ios", "android", "desktop"}
+LINK_REQUEST_TTL_MINUTES = 5
+
+class DeviceRegister(BaseModel):
+    public_key: str = Field(..., description="This device's RSA public key (base64 SPKI)")
+    platform: str = Field(..., description="ios | android | desktop")
+    device_name: Optional[str] = Field(None, description="Human-readable device name")
+
+class DeviceLinkStart(BaseModel):
+    public_key: str
+    platform: str
+    device_name: Optional[str] = None
+
+class DeviceLinkApprove(BaseModel):
+    nonce: str
+
+def _new_session_token(user_id: int) -> str:
+    raw = f"{user_id}:{uuid.uuid4().hex}:{datetime.now(timezone.utc).isoformat()}"
+    return base64.b64encode(raw.encode()).decode()
+
+@app.post("/devices/register")
+async def register_device(payload: DeviceRegister,
+                          current_user: User = Depends(get_current_user),
+                          db: Session = Depends(get_database_session)):
+    """Register/refresh the calling device's identity key. Upserts by public key so
+    the phone's migrated 'legacy' row is claimed with its real platform, and returns
+    the device_uuid the client uses to find its own entry in a message key map."""
+    platform = payload.platform.lower().strip()
+    if platform not in VALID_PLATFORMS:
+        raise HTTPException(status_code=400, detail="Invalid platform")
+    pub = payload.public_key.strip()
+    if not pub:
+        raise HTTPException(status_code=400, detail="public_key required")
+
+    user_id = int(getattr(current_user, 'id', 0))
+    device = db.query(LinkedDevice).filter(
+        LinkedDevice.user_id == user_id,
+        LinkedDevice.public_key == pub,
+    ).first()
+
+    if device:
+        setattr(device, 'platform', platform)
+        if payload.device_name:
+            setattr(device, 'device_name', payload.device_name)
+        setattr(device, 'revoked_at', None)
+        setattr(device, 'last_seen', datetime.now(timezone.utc))
+    else:
+        device = LinkedDevice(
+            user_id=user_id,
+            device_uuid=uuid.uuid4().hex,
+            platform=platform,
+            device_name=payload.device_name or platform,
+            public_key=pub,
+            last_seen=datetime.now(timezone.utc),
+        )
+        db.add(device)
+
+    # Keep the user's canonical public_key pointing at their primary device so
+    # older single-key clients still resolve a usable key.
+    if not getattr(current_user, 'public_key', None):
+        setattr(current_user, 'public_key', pub)
+
+    db.commit()
+    db.refresh(device)
+    return {"device_uuid": device.device_uuid, "platform": device.platform}
+
+@app.post("/devices/link/start")
+async def device_link_start(payload: DeviceLinkStart,
+                            db: Session = Depends(get_database_session)):
+    """Unauthenticated: a new device posts its public key and gets a nonce to show
+    as a QR code. An already-authenticated device approves it."""
+    platform = payload.platform.lower().strip()
+    if platform not in VALID_PLATFORMS:
+        raise HTTPException(status_code=400, detail="Invalid platform")
+    if not payload.public_key.strip():
+        raise HTTPException(status_code=400, detail="public_key required")
+
+    nonce = uuid.uuid4().hex
+    req = DeviceLinkRequest(
+        nonce=nonce,
+        public_key=payload.public_key.strip(),
+        platform=platform,
+        device_name=payload.device_name,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=LINK_REQUEST_TTL_MINUTES),
+        consumed=False,
+    )
+    db.add(req)
+    db.commit()
+    return {"nonce": nonce, "expires_in": LINK_REQUEST_TTL_MINUTES * 60}
+
+@app.post("/devices/link/approve")
+async def device_link_approve(payload: DeviceLinkApprove,
+                              current_user: User = Depends(get_current_user),
+                              db: Session = Depends(get_database_session)):
+    """Authenticated device scans a QR and approves the pending link. Enforces one
+    device per platform by revoking any existing device of the same platform."""
+    req = db.query(DeviceLinkRequest).filter(DeviceLinkRequest.nonce == payload.nonce).first()
+    if not req or bool(getattr(req, 'consumed', False)):
+        raise HTTPException(status_code=404, detail="Link request not found or already used")
+    if getattr(req, 'expires_at') < datetime.now(timezone.utc):
+        raise HTTPException(status_code=410, detail="Link request expired")
+
+    user_id = int(getattr(current_user, 'id', 0))
+    platform = str(getattr(req, 'platform'))
+
+    # One device per platform: revoke existing active devices of this platform.
+    existing = db.query(LinkedDevice).filter(
+        LinkedDevice.user_id == user_id,
+        LinkedDevice.platform == platform,
+        LinkedDevice.revoked_at.is_(None),
+    ).all()
+    now = datetime.now(timezone.utc)
+    for d in existing:
+        setattr(d, 'revoked_at', now)
+
+    device_uuid = uuid.uuid4().hex
+    session_token = _new_session_token(user_id)
+    device = LinkedDevice(
+        user_id=user_id,
+        device_uuid=device_uuid,
+        platform=platform,
+        device_name=getattr(req, 'device_name', None) or platform,
+        public_key=str(getattr(req, 'public_key')),
+        session_token=session_token,
+        last_seen=now,
+    )
+    db.add(device)
+
+    setattr(req, 'consumed', True)
+    setattr(req, 'approved_user_id', user_id)
+    setattr(req, 'device_uuid', device_uuid)
+    setattr(req, 'session_token', session_token)
+
+    db.commit()
+    AuditService.log_event(db, user_id, "device_linked",
+                           f"Linked new {platform} device '{device.device_name}'")
+    return {"device_uuid": device_uuid, "platform": platform, "device_name": device.device_name}
+
+@app.get("/devices/link/status/{nonce}")
+async def device_link_status(nonce: str, db: Session = Depends(get_database_session)):
+    """Unauthenticated: the pending device polls this until approved, then receives
+    its session token and username and is logged in."""
+    req = db.query(DeviceLinkRequest).filter(DeviceLinkRequest.nonce == nonce).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Link request not found")
+    if bool(getattr(req, 'consumed', False)) and getattr(req, 'session_token', None):
+        user = db.query(User).filter(User.id == getattr(req, 'approved_user_id')).first()
+        return {
+            "status": "approved",
+            "session_token": getattr(req, 'session_token'),
+            "device_uuid": getattr(req, 'device_uuid'),
+            "username": str(getattr(user, 'username', '')) if user else "",
+        }
+    if getattr(req, 'expires_at') < datetime.now(timezone.utc):
+        return {"status": "expired"}
+    return {"status": "pending"}
+
+@app.get("/users/{username}/devices")
+async def get_user_devices(username: str,
+                           current_user: User = Depends(get_current_user),
+                           db: Session = Depends(get_database_session)):
+    """Active device public keys for a user — senders wrap the message AES key once
+    per entry so every one of the recipient's devices can decrypt."""
+    user = db.query(User).filter(User.username == username, User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    devices = db.query(LinkedDevice).filter(
+        LinkedDevice.user_id == user.id,
+        LinkedDevice.revoked_at.is_(None),
+    ).all()
+    return {
+        "devices": [
+            {"device_uuid": d.device_uuid, "public_key": d.public_key, "platform": d.platform}
+            for d in devices
+        ]
+    }
+
+@app.get("/devices")
+async def list_my_devices(current_user: User = Depends(get_current_user),
+                          db: Session = Depends(get_database_session)):
+    """This user's own devices, for the device-management screen."""
+    user_id = int(getattr(current_user, 'id', 0))
+    devices = db.query(LinkedDevice).filter(
+        LinkedDevice.user_id == user_id,
+        LinkedDevice.revoked_at.is_(None),
+    ).order_by(LinkedDevice.created_at.asc()).all()
+    return {
+        "devices": [
+            {
+                "device_uuid": d.device_uuid,
+                "platform": d.platform,
+                "device_name": d.device_name,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+                "last_seen": d.last_seen.isoformat() if d.last_seen else None,
+            }
+            for d in devices
+        ]
+    }
+
+@app.post("/devices/{device_uuid}/revoke")
+async def revoke_device(device_uuid: str,
+                        current_user: User = Depends(get_current_user),
+                        db: Session = Depends(get_database_session)):
+    """Revoke (unlink) one of the user's devices."""
+    user_id = int(getattr(current_user, 'id', 0))
+    device = db.query(LinkedDevice).filter(
+        LinkedDevice.device_uuid == device_uuid,
+        LinkedDevice.user_id == user_id,
+    ).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    setattr(device, 'revoked_at', datetime.now(timezone.utc))
+    setattr(device, 'session_token', None)
+    db.commit()
+    AuditService.log_event(db, user_id, "device_revoked",
+                           f"Revoked {device.platform} device '{device.device_name}'")
+    return {"message": "Device revoked"}
 
 class DeviceTokenRegister(BaseModel):
     push_token: str
