@@ -205,6 +205,10 @@ class DatabaseConfig:
 # Global database configuration instance
 db_config = DatabaseConfig()
 
+def get_database_url() -> str:
+    """Return the resolved, normalized database URL. Used by migration scripts."""
+    return db_config.DATABASE_URL
+
 def get_database_session():
     """Dependency function for FastAPI to get database session"""
     session = db_config.get_session()
