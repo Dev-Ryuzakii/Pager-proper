@@ -253,6 +253,26 @@ class Media(Base):
     message_id = Column(Integer, ForeignKey("messages.id"), nullable=False)
     message = relationship("Message", back_populates="media_files")
 
+    # Ownership
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
+    
+    # Disappearing media
+    expires_at = Column(DateTime, nullable=True)  # When the media should be deleted
+    auto_delete = Column(Boolean, default=False)  # Whether the media should auto-delete
+    
+    # Timestamps
+    uploaded_at = Column(DateTime, default=func.now())
+    downloaded_at = Column(DateTime, nullable=True)
+    
+    # Relationships
+    sender = relationship("User", foreign_keys=[sender_id])
+    recipient = relationship("User", foreign_keys=[recipient_id])
+    
+    def __repr__(self):
+        return f"<Media(media_id='{self.media_id}', filename='{self.filename}', type='{self.media_type}')>"
+
 class MDMDeviceProfile(Base):
     """MDM Profile linking a User to their Headwind MDM Device"""
     __tablename__ = "mdm_device_profiles"
@@ -279,26 +299,6 @@ class MDMDeviceProfile(Base):
     
     def __repr__(self):
         return f"<MDMDeviceProfile(user_id={self.user_id}, hw_id='{self.headwind_device_id}', status='{self.enrollment_status}')>"
-    
-    # Ownership
-    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
-    
-    # Disappearing media
-    expires_at = Column(DateTime, nullable=True)  # When the media should be deleted
-    auto_delete = Column(Boolean, default=False)  # Whether the media should auto-delete
-    
-    # Timestamps
-    uploaded_at = Column(DateTime, default=func.now())
-    downloaded_at = Column(DateTime, nullable=True)
-    
-    # Relationships
-    sender = relationship("User", foreign_keys=[sender_id])
-    recipient = relationship("User", foreign_keys=[recipient_id])
-    
-    def __repr__(self):
-        return f"<Media(media_id='{self.media_id}', filename='{self.filename}', type='{self.media_type}')>"
 
 class Group(Base):
     """Group chat table"""
