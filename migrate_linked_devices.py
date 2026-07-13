@@ -63,6 +63,28 @@ CREATE_STATEMENTS = [
 def migrate():
     engine = create_engine(get_database_url())
 
+    # A previously interrupted run can leave a transaction holding a catalog lock
+    # on the half-created table, which blocks every retry. Clear those stuck
+    # sessions first: idle-in-transaction, or anything still stuck creating our
+    # tables, older than 30s. Active app connections (short transactions) are not
+    # touched.
+    logger.info("Clearing any stuck transactions from a previous run...")
+    with engine.begin() as conn:
+        killed = conn.execute(text("""
+            SELECT pg_terminate_backend(pid), pid, state, left(query, 60) AS q
+            FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND pid <> pg_backend_pid()
+              AND xact_start < now() - interval '30 seconds'
+              AND (
+                    state = 'idle in transaction'
+                 OR (state = 'active' AND query ILIKE '%linked_devices%')
+                 OR (state = 'active' AND query ILIKE '%device_link_requests%')
+              )
+        """)).fetchall()
+        for row in killed:
+            logger.info(f"  terminated pid {row.pid} ({row.state}): {row.q}")
+
     logger.info("Creating linked_devices / device_link_requests tables...")
     with engine.begin() as conn:
         # Fail fast instead of blocking forever if something holds a lock.
