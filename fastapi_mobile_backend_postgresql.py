@@ -3403,6 +3403,15 @@ async def logout_user(current_user: User = Depends(get_current_user),
 VALID_PLATFORMS = {"ios", "android", "desktop"}
 LINK_REQUEST_TTL_MINUTES = 5
 
+def _link_request_expired(req) -> bool:
+    """expires_at is stored timezone-naive (UTC); make it aware before comparing."""
+    exp = getattr(req, 'expires_at')
+    if exp is None:
+        return True
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return exp < datetime.now(timezone.utc)
+
 class DeviceRegister(BaseModel):
     public_key: str = Field(..., description="This device's RSA public key (base64 SPKI)")
     platform: str = Field(..., description="ios | android | desktop")
@@ -3499,7 +3508,7 @@ async def device_link_approve(payload: DeviceLinkApprove,
     req = db.query(DeviceLinkRequest).filter(DeviceLinkRequest.nonce == payload.nonce).first()
     if not req or bool(getattr(req, 'consumed', False)):
         raise HTTPException(status_code=404, detail="Link request not found or already used")
-    if getattr(req, 'expires_at') < datetime.now(timezone.utc):
+    if _link_request_expired(req):
         raise HTTPException(status_code=410, detail="Link request expired")
 
     user_id = int(getattr(current_user, 'id', 0))
@@ -3553,7 +3562,7 @@ async def device_link_status(nonce: str, db: Session = Depends(get_database_sess
             "device_uuid": getattr(req, 'device_uuid'),
             "username": str(getattr(user, 'username', '')) if user else "",
         }
-    if getattr(req, 'expires_at') < datetime.now(timezone.utc):
+    if _link_request_expired(req):
         return {"status": "expired"}
     return {"status": "pending"}
 
