@@ -15,17 +15,60 @@ from sqlalchemy.orm import sessionmaker
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from database_config import get_database_url
-from database_models import Base
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Create the two new tables directly, WITHOUT database-level FOREIGN KEY
+# constraints. A FK to users(id) would need a lock on the busy `users` table and
+# hang behind the live backend's open transactions. SQLAlchemy relationships still
+# work — they join on the model's declared keys, not on DB constraints.
+CREATE_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS linked_devices (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        device_uuid VARCHAR(64) UNIQUE NOT NULL,
+        platform VARCHAR(20) NOT NULL,
+        device_name VARCHAR(120),
+        public_key TEXT NOT NULL,
+        session_token VARCHAR(512) UNIQUE,
+        created_at TIMESTAMP DEFAULT NOW(),
+        last_seen TIMESTAMP,
+        revoked_at TIMESTAMP
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_linked_devices_user_id ON linked_devices (user_id)",
+    "CREATE INDEX IF NOT EXISTS ix_linked_devices_device_uuid ON linked_devices (device_uuid)",
+    "CREATE INDEX IF NOT EXISTS ix_linked_devices_session_token ON linked_devices (session_token)",
+    """
+    CREATE TABLE IF NOT EXISTS device_link_requests (
+        id SERIAL PRIMARY KEY,
+        nonce VARCHAR(64) UNIQUE NOT NULL,
+        public_key TEXT NOT NULL,
+        platform VARCHAR(20) NOT NULL,
+        device_name VARCHAR(120),
+        created_at TIMESTAMP DEFAULT NOW(),
+        expires_at TIMESTAMP NOT NULL,
+        approved_user_id INTEGER,
+        device_uuid VARCHAR(64),
+        session_token VARCHAR(512),
+        consumed BOOLEAN DEFAULT FALSE
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_device_link_requests_nonce ON device_link_requests (nonce)",
+]
 
 
 def migrate():
     engine = create_engine(get_database_url())
 
     logger.info("Creating linked_devices / device_link_requests tables...")
-    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        # Fail fast instead of blocking forever if something holds a lock.
+        conn.execute(text("SET lock_timeout = '10s'"))
+        for stmt in CREATE_STATEMENTS:
+            conn.execute(text(stmt))
 
     Session = sessionmaker(bind=engine)
     db = Session()
