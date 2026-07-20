@@ -28,6 +28,17 @@ if [ -n "$DNS_IP" ] && [ "$DNS_IP" != "$EXTERNAL_IP" ]; then
   echo "!! WARNING: $REALM resolves to $DNS_IP but external-ip is $EXTERNAL_IP" >&2
   echo "!! Relay candidates will be unreachable. Re-run with EXTERNAL_IP=$DNS_IP" >&2
 fi
+# Behind NAT coturn must be told both addresses as PUBLIC/PRIVATE: it binds the
+# private one but has to advertise the public one in relay candidates. Detect it
+# rather than making the operator remember.
+PRIVATE_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || true)"
+if [ -n "$PRIVATE_IP" ] && [ "$PRIVATE_IP" != "$EXTERNAL_IP" ]; then
+  echo "==> NAT detected: private=$PRIVATE_IP public=$EXTERNAL_IP"
+  echo "    Forward UDP 3478, 3479 and 49160-49500 to $PRIVATE_IP on the router,"
+  echo "    otherwise media will never reach this host."
+  EXTERNAL_IP="${EXTERNAL_IP}/${PRIVATE_IP}"
+fi
+
 AUTH_SECRET="${AUTH_SECRET:-$(openssl rand -hex 32)}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

@@ -48,6 +48,40 @@ their built-in list.
 Cloudflare proxying OFF** (grey cloud). A proxied record breaks both UDP relay and
 the certificate issuance below.
 
+## Behind NAT
+
+This VPS has no public address of its own — it holds `172.16.100.43` and the
+public `41.242.60.238` lives on an upstream router. Two consequences:
+
+1. The router must forward **UDP** `3478`, `3479` and `49160-49500` to the VM.
+   Forwarding only TCP looks fine to `nc` and to a browser, and still fails every
+   call: WebRTC media is UDP.
+2. `external-ip` must use the `PUBLIC/PRIVATE` form
+   (`external-ip=41.242.60.238/172.16.100.43`). With only the public address,
+   coturn cannot bind; with only the private one, it hands peers an unroutable
+   relay candidate. `install-coturn.sh` detects this and writes it automatically.
+
+Diagnosing a suspected block — send probes from an outside machine:
+
+```bash
+python3 - <<'EOF'
+import socket, struct, os, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for _ in range(30):
+    for p in (3478, 3479):
+        s.sendto(struct.pack('!HHI', 1, 0, 0x2112A442) + os.urandom(12), ('41.242.60.238', p))
+    time.sleep(1)
+EOF
+```
+
+and watch on the VPS:
+
+```bash
+sudo tcpdump -ni any 'udp port 3478 or udp port 3479' -c 10
+```
+
+Nothing captured = blocked upstream, not on this host.
+
 ## Verify
 
 From a machine that is *not* the VPS:
