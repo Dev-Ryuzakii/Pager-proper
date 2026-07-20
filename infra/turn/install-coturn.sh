@@ -73,10 +73,23 @@ systemctl daemon-reload
 
 if [ "${SKIP_TLS:-0}" != "1" ]; then
   echo "==> TLS certificate for $REALM"
-  # Needs :80 free and $REALM resolving to this host (grey-cloud the DNS record —
-  # a proxied Cloudflare record will not work for TURN).
-  if certbot certonly --standalone --non-interactive --agree-tos \
-      --register-unsafely-without-email -d "$REALM"; then
+  # Needs $REALM resolving to this host (grey-cloud the DNS record — a proxied
+  # Cloudflare record will not work for TURN). If nginx already owns :80 we go
+  # through its plugin instead of --standalone, which would fail to bind.
+  CERTBOT_ARGS=(certonly --non-interactive --agree-tos
+                --register-unsafely-without-email -d "$REALM")
+  if ss -lnt 2>/dev/null | grep -q ':80 '; then
+    if certbot plugins 2>/dev/null | grep -q nginx; then
+      echo "   :80 in use by nginx — using the nginx plugin"
+      CERTBOT_ARGS+=(--nginx)
+    else
+      echo "   :80 in use and no nginx plugin — install python3-certbot-nginx, then re-run"
+      CERTBOT_ARGS+=(--standalone)
+    fi
+  else
+    CERTBOT_ARGS+=(--standalone)
+  fi
+  if certbot "${CERTBOT_ARGS[@]}"; then
     install -o turnserver -g turnserver -m 644 \
       "/etc/letsencrypt/live/$REALM/fullchain.pem" /etc/coturn/certs/fullchain.pem
     install -o turnserver -g turnserver -m 640 \
