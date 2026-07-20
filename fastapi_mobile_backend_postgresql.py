@@ -3805,6 +3805,25 @@ TURN_REST_PORT = int(os.getenv("TURN_REST_PORT", "3479"))
 TURN_TLS_PORT = int(os.getenv("TURN_REST_TLS_PORT", "5350"))
 TURN_CRED_TTL = int(os.getenv("TURN_CRED_TTL_SECONDS", str(12 * 3600)))
 
+# Public relays, appended last so ICE only falls back to them when our own TURN
+# cannot be reached. They are shared, rate-limited and operated by third parties:
+# call audio stays end-to-end encrypted (DTLS-SRTP), but whoever runs them sees
+# who relays with whom and from which IP. Turn this off once inbound UDP reaches
+# our own TURN — set TURN_PUBLIC_FALLBACK=0.
+TURN_PUBLIC_FALLBACK = os.getenv("TURN_PUBLIC_FALLBACK", "1") not in ("0", "false", "False")
+PUBLIC_FALLBACK_ICE = [
+    {
+        "urls": [
+            "turn:openrelay.metered.ca:80",
+            "turn:openrelay.metered.ca:443?transport=tcp",
+            "turn:a.relay.metered.ca:80",
+            "turn:a.relay.metered.ca:443?transport=tcp",
+        ],
+        "username": "openrelayproject",
+        "credential": "openrelayproject",
+    },
+]
+
 
 @app.get("/webrtc/ice-servers")
 async def get_ice_servers(current_user: User = Depends(get_current_user)):
@@ -3844,6 +3863,9 @@ async def get_ice_servers(current_user: User = Depends(get_current_user)):
         # No secret configured — clients fall back to their built-in servers.
         logger.warning("TURN_AUTH_SECRET not set; serving STUN-only ICE config")
         ttl = 0
+
+    if TURN_PUBLIC_FALLBACK:
+        ice_servers.extend(PUBLIC_FALLBACK_ICE)
 
     return {"ice_servers": ice_servers, "ttl": ttl}
 
