@@ -3796,6 +3796,58 @@ async def send_decoy_document(
 
 # --- Call Endpoints ---
 
+# TURN configuration. TURN_AUTH_SECRET is the shared secret configured in
+# /etc/coturn/turnserver-rest.conf (static-auth-secret) and must never be shipped
+# in a client build — clients ask this endpoint for short-lived credentials.
+TURN_REALM = os.getenv("TURN_REALM", "turn.dilarion.eibstratoc.com")
+TURN_AUTH_SECRET = os.getenv("TURN_AUTH_SECRET", "")
+TURN_REST_PORT = int(os.getenv("TURN_REST_PORT", "3479"))
+TURN_TLS_PORT = int(os.getenv("TURN_REST_TLS_PORT", "5350"))
+TURN_CRED_TTL = int(os.getenv("TURN_CRED_TTL_SECONDS", str(12 * 3600)))
+
+
+@app.get("/webrtc/ice-servers")
+async def get_ice_servers(current_user: User = Depends(get_current_user)):
+    """
+    ICE servers for a call, with time-limited TURN credentials (TURN REST API).
+
+    username = "<unix-expiry>:<username>", password = base64(HMAC-SHA1(username, secret)).
+    coturn derives the same key from its static-auth-secret, so no per-user state
+    is stored anywhere and a leaked credential dies at expiry.
+    """
+    # "urls" is always a list so clients can parse one shape.
+    ice_servers = [
+        {"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]},
+    ]
+
+    if TURN_AUTH_SECRET:
+        expiry = int(datetime.now(timezone.utc).timestamp()) + TURN_CRED_TTL
+        username = f"{expiry}:{getattr(current_user, 'username', 'user')}"
+        credential = base64.b64encode(
+            hmac.new(
+                TURN_AUTH_SECRET.encode("utf-8"),
+                username.encode("utf-8"),
+                hashlib.sha1,
+            ).digest()
+        ).decode("utf-8")
+        ice_servers.append({
+            "urls": [
+                f"turn:{TURN_REALM}:{TURN_REST_PORT}",
+                f"turn:{TURN_REALM}:{TURN_REST_PORT}?transport=tcp",
+                f"turns:{TURN_REALM}:{TURN_TLS_PORT}?transport=tcp",
+            ],
+            "username": username,
+            "credential": credential,
+        })
+        ttl = TURN_CRED_TTL
+    else:
+        # No secret configured — clients fall back to their built-in servers.
+        logger.warning("TURN_AUTH_SECRET not set; serving STUN-only ICE config")
+        ttl = 0
+
+    return {"ice_servers": ice_servers, "ttl": ttl}
+
+
 @app.post("/calls/initiate")
 async def initiate_call(
     call_data: CallRequest,
