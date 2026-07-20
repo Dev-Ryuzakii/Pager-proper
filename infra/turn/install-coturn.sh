@@ -16,7 +16,16 @@
 set -euo pipefail
 
 REALM="${REALM:?set REALM, e.g. REALM=turn.dilarion.eibstratoc.com}"
+# The address CLIENTS reach, which is not always the address the box egresses
+# from — on a NAT'd/multi-homed host ipify returns the wrong one and coturn then
+# advertises relay candidates nobody can connect to. Pass EXTERNAL_IP explicitly
+# whenever the autodetected value is not the public A record's target.
 EXTERNAL_IP="${EXTERNAL_IP:-$(curl -fsS --max-time 10 https://api.ipify.org)}"
+DNS_IP="$(getent hosts "${REALM:-}" 2>/dev/null | awk '{print $1; exit}')"
+if [ -n "$DNS_IP" ] && [ "$DNS_IP" != "$EXTERNAL_IP" ]; then
+  echo "!! WARNING: $REALM resolves to $DNS_IP but external-ip is $EXTERNAL_IP" >&2
+  echo "!! Relay candidates will be unreachable. Re-run with EXTERNAL_IP=$DNS_IP" >&2
+fi
 AUTH_SECRET="${AUTH_SECRET:-$(openssl rand -hex 32)}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
