@@ -128,7 +128,10 @@ if command -v ufw >/dev/null; then
 fi
 
 echo "==> starting"
-systemctl enable --now coturn-legacy coturn-rest
+# restart, not `enable --now`: on a re-run the units are already active and
+# would keep serving the previous realm / external-ip / certs.
+systemctl enable coturn-legacy coturn-rest
+systemctl restart coturn-legacy coturn-rest
 sleep 2
 systemctl --no-pager --lines=5 status coturn-legacy coturn-rest || true
 
