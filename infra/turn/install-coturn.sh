@@ -21,7 +21,9 @@ REALM="${REALM:?set REALM, e.g. REALM=turndilarion.eibstratoc.com}"
 # advertises relay candidates nobody can connect to. Pass EXTERNAL_IP explicitly
 # whenever the autodetected value is not the public A record's target.
 EXTERNAL_IP="${EXTERNAL_IP:-$(curl -fsS --max-time 10 https://api.ipify.org)}"
-DNS_IP="$(getent hosts "${REALM:-}" 2>/dev/null | awk '{print $1; exit}')"
+# `|| true`: getent exits non-zero when the name does not resolve, and under
+# `set -e` a bare assignment inherits that status and kills the script.
+DNS_IP="$(getent hosts "${REALM:-}" 2>/dev/null | awk '{print $1; exit}' || true)"
 if [ -n "$DNS_IP" ] && [ "$DNS_IP" != "$EXTERNAL_IP" ]; then
   echo "!! WARNING: $REALM resolves to $DNS_IP but external-ip is $EXTERNAL_IP" >&2
   echo "!! Relay candidates will be unreachable. Re-run with EXTERNAL_IP=$DNS_IP" >&2
