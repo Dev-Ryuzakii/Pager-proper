@@ -3799,7 +3799,7 @@ async def send_decoy_document(
 # TURN configuration. TURN_AUTH_SECRET is the shared secret configured in
 # /etc/coturn/turnserver-rest.conf (static-auth-secret) and must never be shipped
 # in a client build — clients ask this endpoint for short-lived credentials.
-TURN_REALM = os.getenv("TURN_REALM", "turn.dilarion.eibstratoc.com")
+TURN_REALM = os.getenv("TURN_REALM", "turndilarion.eibstratoc.com")
 TURN_AUTH_SECRET = os.getenv("TURN_AUTH_SECRET", "")
 TURN_REST_PORT = int(os.getenv("TURN_REST_PORT", "3479"))
 TURN_TLS_PORT = int(os.getenv("TURN_REST_TLS_PORT", "5350"))

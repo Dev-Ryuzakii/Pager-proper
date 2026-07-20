@@ -6,7 +6,7 @@
 #   rest   (3479/5350)  ephemeral HMAC credentials        — new builds
 #
 # Usage (on the VPS, as root):
-#   REALM=turn.dilarion.eibstratoc.com ./install-coturn.sh
+#   REALM=turndilarion.eibstratoc.com ./install-coturn.sh
 #
 # Optional env:
 #   EXTERNAL_IP   public IP (default: autodetected)
@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-REALM="${REALM:?set REALM, e.g. REALM=turn.dilarion.eibstratoc.com}"
+REALM="${REALM:?set REALM, e.g. REALM=turndilarion.eibstratoc.com}"
 # The address CLIENTS reach, which is not always the address the box egresses
 # from — on a NAT'd/multi-homed host ipify returns the wrong one and coturn then
 # advertises relay candidates nobody can connect to. Pass EXTERNAL_IP explicitly

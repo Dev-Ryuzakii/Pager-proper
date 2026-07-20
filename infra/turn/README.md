@@ -26,13 +26,13 @@ the damage until then.
 On the VPS, as root:
 
 ```bash
-REALM=turn.dilarion.eibstratoc.com ./install-coturn.sh
+REALM=turndilarion.eibstratoc.com ./install-coturn.sh
 ```
 
 It prints a generated `TURN_AUTH_SECRET`. Put it in the backend environment:
 
 ```
-TURN_REALM=turn.dilarion.eibstratoc.com
+TURN_REALM=turndilarion.eibstratoc.com
 TURN_AUTH_SECRET=<printed secret>
 TURN_REST_PORT=3479
 TURN_REST_TLS_PORT=5350
@@ -44,7 +44,7 @@ their built-in list.
 
 ## DNS
 
-`turn.dilarion.eibstratoc.com` must be an **A record straight to the VPS IP with
+`turndilarion.eibstratoc.com` must be an **A record straight to the VPS IP with
 Cloudflare proxying OFF** (grey cloud). A proxied record breaks both UDP relay and
 the certificate issuance below.
 
@@ -53,7 +53,7 @@ the certificate issuance below.
 From a machine that is *not* the VPS:
 
 ```bash
-./verify-turn.sh turn.dilarion.eibstratoc.com "$TURN_AUTH_SECRET"
+./verify-turn.sh turndilarion.eibstratoc.com "$TURN_AUTH_SECRET"
 ```
 
 Both sections must print `PASS` — that means a relay allocation succeeded, which
