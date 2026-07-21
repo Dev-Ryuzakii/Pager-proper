@@ -1297,6 +1297,11 @@ class MediaService:
         
         return deleted_count
 
+# Answer SDPs waiting to be collected by a caller whose WebSocket missed the
+# push. call_id -> sdp, dropped as soon as the call ends or the caller reads it.
+_pending_answer_sdp: Dict[int, str] = {}
+
+
 class CallService:
     """Service class for managing voice and video calls"""
     
@@ -1382,7 +1387,16 @@ class CallService:
                 call.duration = int(duration)
         
         db.commit()
-        
+
+        # Keep the answer where the caller can poll for it. The WebSocket push
+        # below is the fast path, but if that socket dropped the caller would sit
+        # on "Ringing" forever with no way to recover — the callee already thinks
+        # the call is up. Memory-only and short-lived; nothing to migrate.
+        if action in ("accept", "accepted") and answer_sdp:
+            _pending_answer_sdp[int(call_id)] = answer_sdp
+        elif action in ("end", "decline", "declined", "busy"):
+            _pending_answer_sdp.pop(int(call_id), None)
+
         # Notify the other party
         other_party_id = call.recipient_id if user_id == call.caller_id else call.caller_id
         notification = {
@@ -1395,7 +1409,7 @@ class CallService:
             }
         }
         await ws_manager.send_to_user(other_party_id, notification)
-        
+
         return call
 
     @staticmethod
@@ -3892,6 +3906,39 @@ async def initiate_call(
     except Exception as e:
         logger.error(f"Initiate call error: {e}")
         raise HTTPException(status_code=500, detail="Failed to initiate call")
+
+@app.get("/calls/{call_id}/status")
+async def get_call_status(
+    call_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """
+    Current state of a call, plus the answer SDP if the callee has accepted.
+
+    Exists so a caller whose WebSocket dropped can still connect: it would
+    otherwise ring forever while the callee sits in an established call.
+    """
+    call = db.query(Call).filter(Call.id == call_id).first()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    user_id = int(getattr(current_user, 'id', 0))
+    if call.caller_id != user_id and call.recipient_id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to view this call")
+
+    # Only the caller needs the answer, and only once.
+    answer_sdp = None
+    if user_id == call.caller_id:
+        answer_sdp = _pending_answer_sdp.get(int(call_id))
+
+    return {
+        "call_id": int(call.id),
+        "status": str(call.status),
+        "call_type": str(call.call_type),
+        "answer_sdp": answer_sdp,
+    }
+
 
 @app.post("/calls/action")
 async def call_action(
