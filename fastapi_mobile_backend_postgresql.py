@@ -4056,6 +4056,41 @@ async def call_action(
         logger.error(f"Call action error: {e}")
         raise HTTPException(status_code=500, detail="Failed to perform call action")
 
+@app.post("/calls/{call_id}/media-state")
+async def set_call_media_state(
+    call_id: int,
+    payload: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """
+    Tell the other party whether our microphone is muted.
+
+    WebRTC gives no signal for this: a muted track simply carries silence, which
+    is indistinguishable from someone not talking. Without it the UI cannot show
+    who is muted.
+    """
+    user_id = int(getattr(current_user, 'id', 0))
+    username = str(getattr(current_user, 'username', ''))
+
+    call = db.query(Call).filter(Call.id == call_id).first()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    if call.caller_id != user_id and call.recipient_id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized for this call")
+
+    other_party_id = call.recipient_id if user_id == call.caller_id else call.caller_id
+    await ws_manager.send_to_user(other_party_id, {
+        "type": "call_media_state",
+        "data": {
+            "call_id": int(call_id),
+            "username": username,
+            "muted": bool(payload.get("muted", False)),
+        }
+    })
+    return {"success": True}
+
+
 @app.post("/calls/ice_candidate")
 async def send_ice_candidate(
     payload: IceCandidatePayload,
