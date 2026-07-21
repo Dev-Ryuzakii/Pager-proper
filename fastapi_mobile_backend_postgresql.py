@@ -3820,6 +3820,11 @@ TURN_REST_PORT = int(os.getenv("TURN_REST_PORT", "3479"))
 TURN_TLS_PORT = int(os.getenv("TURN_REST_TLS_PORT", "5350"))
 TURN_CRED_TTL = int(os.getenv("TURN_CRED_TTL_SECONDS", str(12 * 3600)))
 
+# Whether answering a call requires the master token. See /calls/action.
+REQUIRE_MASTER_TOKEN_FOR_CALLS = os.getenv(
+    "REQUIRE_MASTER_TOKEN_FOR_CALLS", "0"
+) in ("1", "true", "True")
+
 # Public relays, appended last so ICE only falls back to them when our own TURN
 # cannot be reached. They are shared, rate-limited and operated by third parties:
 # call audio stays end-to-end encrypted (DTLS-SRTP), but whoever runs them sees
@@ -3951,11 +3956,21 @@ async def call_action(
     try:
         user_id = int(getattr(current_user, 'id', 0))
         
-        # Require mastertoken for accepting calls
+        # Master token on accept.
+        #
+        # Off by default: call media is already end-to-end encrypted (DTLS-SRTP),
+        # and the token's real job is gating message decryption. Demanding a typed
+        # secret to answer a ringing phone mostly produced failed calls — a single
+        # typo left the caller ringing with no audio. A wrong token is still
+        # rejected when one is supplied.
+        #
+        # Set REQUIRE_MASTER_TOKEN_FOR_CALLS=1 to require it again. The trade-off
+        # is that whoever holds an unlocked phone can answer calls; they still
+        # cannot read any message without the token.
         if action_data.action == "accept":
-            if not action_data.mastertoken:
+            if REQUIRE_MASTER_TOKEN_FOR_CALLS and not action_data.mastertoken:
                 raise HTTPException(status_code=401, detail="Master token required to accept call")
-            if not validate_master_token(db, user_id, action_data.mastertoken):
+            if action_data.mastertoken and not validate_master_token(db, user_id, action_data.mastertoken):
                 raise HTTPException(status_code=401, detail="Invalid master token")
 
         call = await CallService.update_call_status(
