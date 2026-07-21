@@ -12,9 +12,15 @@ entries once `use-auth-secret` is on:
 | Instance | Ports            | Auth                        | Used by |
 |----------|------------------|-----------------------------|---------|
 | legacy   | 3478, 5349 (TLS) | static `dilarion:dilarion2026` | already-released Android/desktop builds |
-| rest     | 3479, 5350 (TLS) | ephemeral HMAC (TURN REST)  | new builds via `GET /webrtc/ice-servers` |
+| rest     | 49160, 5350 (TLS) | ephemeral HMAC (TURN REST)  | new builds via `GET /webrtc/ice-servers` |
 
-Relay port ranges are disjoint: legacy `49160-49300`, rest `49301-49500`.
+Relay port ranges are disjoint: rest `49161-49500`, legacy `49600-49700`.
+
+The rest instance listens on 49160 rather than 3479 because the router in front
+of this host allows exactly one port-forward rule, so control and media must sit
+in one contiguous block: `49160-49500 -> 172.16.100.43`. Do not widen that rule
+to `0-65535` — it captures 22, 80 and 443 as well and takes SSH and the API
+offline.
 
 Retire the legacy instance once released builds with the old hardcoded credential
 are out of circulation — that password is extractable from any APK, so anyone can
@@ -34,7 +40,7 @@ It prints a generated `TURN_AUTH_SECRET`. Put it in the backend environment:
 ```
 TURN_REALM=turndilarion.eibstratoc.com
 TURN_AUTH_SECRET=<printed secret>
-TURN_REST_PORT=3479
+TURN_REST_PORT=49160
 TURN_REST_TLS_PORT=5350
 ```
 
@@ -53,9 +59,10 @@ the certificate issuance below.
 This VPS has no public address of its own — it holds `172.16.100.43` and the
 public `41.242.60.238` lives on an upstream router. Two consequences:
 
-1. The router must forward **UDP** `3478`, `3479` and `49160-49500` to the VM.
-   Forwarding only TCP looks fine to `nc` and to a browser, and still fails every
-   call: WebRTC media is UDP.
+1. The router must forward **`49160-49500` to `172.16.100.43`**. Forwarding only
+   TCP looks fine to `nc` and to a browser, and still fails every call: WebRTC
+   media is UDP. Keep the range narrow — a `0-65535` rule also swallows 22, 80
+   and 443, which takes SSH and the API down.
 2. `external-ip` must use the `PUBLIC/PRIVATE` form
    (`external-ip=41.242.60.238/172.16.100.43`). With only the public address,
    coturn cannot bind; with only the private one, it hands peers an unroutable
@@ -68,7 +75,7 @@ python3 - <<'EOF'
 import socket, struct, os, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 for _ in range(30):
-    for p in (3478, 3479):
+    for p in (3478, 49160):
         s.sendto(struct.pack('!HHI', 1, 0, 0x2112A442) + os.urandom(12), ('41.242.60.238', p))
     time.sleep(1)
 EOF
@@ -77,7 +84,7 @@ EOF
 and watch on the VPS:
 
 ```bash
-sudo tcpdump -ni any 'udp port 3478 or udp port 3479' -c 10
+sudo tcpdump -ni any 'udp port 3478 or udp port 49160' -c 10
 ```
 
 Nothing captured = blocked upstream, not on this host.
@@ -112,13 +119,11 @@ Common failures:
 - **Allocation succeeds, no audio** — the relay UDP range is blocked upstream.
   Open `49160-49500/udp` in the provider's firewall too, not just `ufw`.
 - **TLS listener dead** — certs missing at `/etc/coturn/certs/`. The plain 3478 /
-  3479 listeners still work; `turns:` does not.
+  49160 listeners still work; `turns:` does not.
 
 ## Firewall
 
 ```
-3478/udp 3478/tcp      legacy
-3479/udp 3479/tcp      rest
-5349/tcp 5350/tcp      TLS
-49160-49500/udp        relay range
+49160-49500/udp        rest instance: control (49160) + relay media
+3478/tcp 5349/tcp      legacy instance, already forwarded
 ```
