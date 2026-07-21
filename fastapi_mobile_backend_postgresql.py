@@ -3820,10 +3820,12 @@ TURN_REST_PORT = int(os.getenv("TURN_REST_PORT", "3479"))
 TURN_TLS_PORT = int(os.getenv("TURN_REST_TLS_PORT", "5350"))
 TURN_CRED_TTL = int(os.getenv("TURN_CRED_TTL_SECONDS", str(12 * 3600)))
 
-# Whether answering a call requires the master token. See /calls/action.
+# Answering a call requires the master token: it proves the owner is the one
+# picking up, so someone holding the unlocked handset cannot take their calls.
+# Deliberately on by default; set REQUIRE_MASTER_TOKEN_FOR_CALLS=0 to disable.
 REQUIRE_MASTER_TOKEN_FOR_CALLS = os.getenv(
-    "REQUIRE_MASTER_TOKEN_FOR_CALLS", "0"
-) in ("1", "true", "True")
+    "REQUIRE_MASTER_TOKEN_FOR_CALLS", "1"
+) not in ("0", "false", "False")
 
 # Public relays, appended last so ICE only falls back to them when our own TURN
 # cannot be reached. They are shared, rate-limited and operated by third parties:
@@ -3956,17 +3958,9 @@ async def call_action(
     try:
         user_id = int(getattr(current_user, 'id', 0))
         
-        # Master token on accept.
-        #
-        # Off by default: call media is already end-to-end encrypted (DTLS-SRTP),
-        # and the token's real job is gating message decryption. Demanding a typed
-        # secret to answer a ringing phone mostly produced failed calls — a single
-        # typo left the caller ringing with no audio. A wrong token is still
-        # rejected when one is supplied.
-        #
-        # Set REQUIRE_MASTER_TOKEN_FOR_CALLS=1 to require it again. The trade-off
-        # is that whoever holds an unlocked phone can answer calls; they still
-        # cannot read any message without the token.
+        # Master token on accept — the owner authenticating themselves before the
+        # line opens. A wrong token must not end the call: the client keeps it
+        # ringing and prompts again.
         if action_data.action == "accept":
             if REQUIRE_MASTER_TOKEN_FOR_CALLS and not action_data.mastertoken:
                 raise HTTPException(status_code=401, detail="Master token required to accept call")
