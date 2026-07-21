@@ -48,6 +48,7 @@ from database_models import User, Message, UserKey, UserSession, AuditLog, Maste
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
+from decoy_document import generate_decoy_document
 from push_notifications import push_to_user
 
 # Configure logging
@@ -5037,6 +5038,44 @@ async def get_user_voice_identity(
         raise HTTPException(status_code=404, detail="Voice file missing")
         
     return FileResponse(user.voice_identity_path)
+@app.get("/media/decoy-file/{media_id}")
+async def get_decoy_file(
+    media_id: str,
+    db: Session = Depends(get_database_session),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    A stand-in document for a locked attachment.
+
+    Generated from the media_id, so the same attachment always yields the same
+    decoy, and padded towards the real file's size so the listing does not give
+    it away. Contents are internally consistent — an invoice that adds up, dates
+    in order — because a decoy is only tested when somebody opens it.
+    """
+    clean_media_id = media_id.split('.')[0]
+    media = db.query(Media).filter(Media.media_id == clean_media_id).first()
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    user_id = int(getattr(current_user, 'id', 0))
+    if media.sender_id != user_id and media.recipient_id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized for this media")
+
+    os.makedirs(DECOY_CACHE_DIR, exist_ok=True)
+    cached = os.path.join(DECOY_CACHE_DIR, f"{clean_media_id}.pdf")
+    if not os.path.exists(cached):
+        pdf, _name = generate_decoy_document(
+            seed=clean_media_id,
+            target_size=int(getattr(media, 'file_size', 0) or 0) or None,
+        )
+        tmp = os.path.join(DECOY_CACHE_DIR, f".tmp_{uuid.uuid4().hex}.pdf")
+        with open(tmp, "wb") as f:
+            f.write(pdf)
+        os.replace(tmp, cached)
+
+    return FileResponse(cached, media_type="application/pdf")
+
+
 @app.get("/media/decoy-voice/{media_id}")
 async def get_decoy_voice(
     media_id: str,
@@ -5052,26 +5091,32 @@ async def get_decoy_voice(
     if not media:
         raise HTTPException(status_code=404, detail="Media not found")
         
-    # 2. Get the sender
-    # Use relationship or query explicitly by sender ID
+    # 2. Pick the voice to imitate: the sender's identity sample when they have
+    # recorded one, otherwise the note itself — a decoy in roughly the right
+    # voice beats no decoy at all, which is what the old 404 produced.
     sender = media.sender
-    if not sender or not sender.voice_identity_path:
-        # Fallback if sender has no identity: 404 (frontend will use synthetic noise)
-        raise HTTPException(status_code=404, detail="Sender has no voice identity")
-        
-    # 3. Generate a fresh decoy
-    temp_decoy = f"temp_decoy_{uuid.uuid4().hex}.m4a"
-    success = generate_voice_decoy(sender.voice_identity_path, temp_decoy)
-    
-    if not success:
-        if os.path.exists(temp_decoy): os.remove(temp_decoy)
-        raise HTTPException(status_code=500, detail="Failed to scramble voice")
-        
-    def cleanup():
-        if os.path.exists(temp_decoy):
-            os.remove(temp_decoy)
-            
-    return FileResponse(temp_decoy, media_type="audio/m4a", background=BackgroundTasks().add_task(cleanup))
+    source = None
+    if sender and sender.voice_identity_path and os.path.exists(sender.voice_identity_path):
+        source = sender.voice_identity_path
+    elif media.encrypted_file_path and os.path.exists(media.encrypted_file_path):
+        source = media.encrypted_file_path
+    if not source:
+        raise HTTPException(status_code=404, detail="No audio available to build a decoy from")
+
+    # 3. Serve a cached decoy when we already built one. The same note must
+    # always play back the same words — a decoy that changes between replays
+    # tells the listener it is fake.
+    os.makedirs(DECOY_CACHE_DIR, exist_ok=True)
+    cached = os.path.join(DECOY_CACHE_DIR, f"{clean_media_id}.m4a")
+    if not os.path.exists(cached):
+        tmp = os.path.join(DECOY_CACHE_DIR, f".tmp_{uuid.uuid4().hex}.m4a")
+        if not generate_voice_decoy(source, tmp, seed=clean_media_id):
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise HTTPException(status_code=500, detail="Failed to build voice decoy")
+        os.replace(tmp, cached)
+
+    return FileResponse(cached, media_type="audio/m4a")
 
 @app.post("/mastertoken/create")
 async def create_mastertoken(token_data: MasterToken, 
@@ -5989,6 +6034,10 @@ async def admin_get_all_users(current_user: User = Depends(get_admin_user),
 # Directory to temporarily store uploaded files
 UPLOAD_DIR = "media_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Built decoys are cached so a given voice note always plays back the same words.
+DECOY_CACHE_DIR = "decoy_cache"
+os.makedirs(DECOY_CACHE_DIR, exist_ok=True)
 
 @app.post("/media/upload_raw")
 async def upload_raw_media(
