@@ -1302,6 +1302,18 @@ class MediaService:
 # push. call_id -> sdp, dropped as soon as the call ends or the caller reads it.
 _pending_answer_sdp: Dict[int, str] = {}
 
+# States a call can be in before anyone has answered it.
+UNANSWERED_STATUSES = ("initiated", "calling", "ringing")
+
+# How long a call rings before it is recorded as missed. 45s matches what users
+# expect from messaging apps; the PSTN convention of 30s feels abrupt here.
+CALL_RING_TIMEOUT_SECONDS = int(os.getenv("CALL_RING_TIMEOUT_SECONDS", "45"))
+
+# Mesh WebRTC has every participant sending to every other, so bandwidth and CPU
+# grow quadratically. Four is the practical ceiling on mobile hardware; going
+# beyond needs an SFU, which is separate infrastructure.
+CONFERENCE_MAX_PARTICIPANTS = int(os.getenv("CONFERENCE_MAX_PARTICIPANTS", "4"))
+
 
 class CallService:
     """Service class for managing voice and video calls"""
@@ -1363,6 +1375,12 @@ class CallService:
                 }
             })
 
+        # Ring for a bounded time, then record it as missed. Fire-and-forget: the
+        # task checks the call's state when it wakes and does nothing if it was
+        # answered, declined or ended in the meantime.
+        import asyncio
+        asyncio.create_task(CallService.expire_unanswered_call(int(call.id)))
+
         return call
 
     @staticmethod
@@ -1377,9 +1395,18 @@ class CallService:
             raise HTTPException(status_code=403, detail="Not authorized to update this call")
             
         old_status = call.status
+
+        # A call the callee never answered is "missed", not "ended" — the caller
+        # hanging up mid-ring is exactly how a missed call happens, and history
+        # would otherwise show it as a normal completed call.
+        if (action == "end"
+                and str(old_status) in UNANSWERED_STATUSES
+                and user_id == call.caller_id):
+            action = "missed"
+
         call.status = action
-        
-        if action == "end" or action == "decline":
+
+        if action in ("end", "decline", "missed"):
             call.ended_at = datetime.utcnow()
             if call.started_at and action == "end":
                 ended = call.ended_at.replace(tzinfo=timezone.utc)
@@ -1395,7 +1422,7 @@ class CallService:
         # the call is up. Memory-only and short-lived; nothing to migrate.
         if action in ("accept", "accepted") and answer_sdp:
             _pending_answer_sdp[int(call_id)] = answer_sdp
-        elif action in ("end", "decline", "declined", "busy"):
+        elif action in ("end", "decline", "declined", "busy", "missed"):
             _pending_answer_sdp.pop(int(call_id), None)
 
         # Notify the other party
@@ -1411,7 +1438,55 @@ class CallService:
         }
         await ws_manager.send_to_user(other_party_id, notification)
 
+        # A missed call must survive the callee's app being closed or offline,
+        # so it also goes out as a push. The WS message above only reaches a
+        # live socket.
+        if action == "missed":
+            caller = db.query(User).filter(User.id == call.caller_id).first()
+            caller_name = str(getattr(caller, 'username', 'someone'))
+            await ws_manager.send_to_user(int(call.recipient_id), {
+                "type": "missed_call",
+                "data": {
+                    "call_id": int(call_id),
+                    "caller_username": caller_name,
+                    "call_type": str(call.call_type),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            })
+            try:
+                await push_to_user(
+                    db, int(call.recipient_id),
+                    "Missed call", f"From {caller_name}", sound="beep.caf",
+                )
+            except Exception as e:
+                logger.warning(f"Missed-call push failed: {e}")
+
         return call
+
+    @staticmethod
+    async def expire_unanswered_call(call_id: int, delay: int = CALL_RING_TIMEOUT_SECONDS) -> None:
+        """
+        Mark a call missed if nobody answers within the ring timeout.
+
+        Without this a call nobody picks up stays "ringing" forever: the caller
+        sees an endless ring and history never records the miss.
+        """
+        import asyncio
+        from database_models import SessionLocal
+        await asyncio.sleep(delay)
+        db = SessionLocal()
+        try:
+            call = db.query(Call).filter(Call.id == call_id).first()
+            if not call or str(call.status) not in UNANSWERED_STATUSES:
+                return  # answered, declined or already ended
+            await CallService.update_call_status(
+                db, int(call.id), int(call.caller_id), "end"
+            )  # caller-side "end" while unanswered is recorded as missed
+            logger.info(f"Call {call_id} timed out after {delay}s — marked missed")
+        except Exception as e:
+            logger.error(f"Ring timeout for call {call_id} failed: {e}")
+        finally:
+            db.close()
 
     @staticmethod
     async def forward_ice_candidate(db: Session, sender_id: int, call_id: int, recipient_username: str, candidate: Dict) -> bool:
@@ -4022,9 +4097,12 @@ async def create_conference(
     db.flush()
     # Add creator as first participant
     db.add(ConferenceParticipant(conference_id=conf.id, user_id=caller_id))
-    # Add the other party if call provided
+    # Add the other party if call provided. The column is recipient_id — reading
+    # callee_id raised AttributeError here, so creating a conference from a live
+    # call always failed with a 500 and "add participant" never worked.
     if call:
-        other_id = int(getattr(call, 'caller_id')) if int(getattr(call, 'callee_id')) == caller_id else int(getattr(call, 'callee_id'))
+        other_id = (int(call.caller_id) if int(call.recipient_id) == caller_id
+                    else int(call.recipient_id))
         db.add(ConferenceParticipant(conference_id=conf.id, user_id=other_id))
     db.commit()
     db.refresh(conf)
@@ -4063,35 +4141,34 @@ async def conference_invite(
     if already_in:
         raise HTTPException(status_code=400, detail="User already in conference")
 
-    db.add(ConferenceParticipant(conference_id=conference_id, user_id=invitee_id))
+    active_count = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.is_active == True,
+    ).count()
+    if active_count >= CONFERENCE_MAX_PARTICIPANTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Call is full ({CONFERENCE_MAX_PARTICIPANTS} participants maximum)",
+        )
+
+    # The invitee is recorded as pending (is_active False) and only becomes a
+    # participant once they accept. Joining someone to a live call without their
+    # consent would open their microphone to it.
+    db.add(ConferenceParticipant(conference_id=conference_id, user_id=invitee_id, is_active=False))
     db.commit()
 
-    # Get all existing active participants (excluding new invitee)
-    existing = db.query(ConferenceParticipant).join(User).filter(
+    existing = db.query(ConferenceParticipant).filter(
         ConferenceParticipant.conference_id == conference_id,
         ConferenceParticipant.user_id != invitee_id,
         ConferenceParticipant.is_active == True,
     ).all()
-
-    # Tell each existing participant to create an offer to the new invitee
-    for part in existing:
-        peer_user = db.query(User).filter(User.id == part.user_id).first()
-        if peer_user:
-            await ws_manager.send_to_user(part.user_id, {
-                "type": "conference_peer_connect",
-                "data": {
-                    "conference_id": conference_id,
-                    "peer_username": invitee_username,
-                    "role": "offer",   # existing participant creates the offer
-                }
-            })
-
-    # Tell the invitee about the conference (incoming conference invite)
     existing_usernames = [
         str(getattr(db.query(User).filter(User.id == p.user_id).first(), 'username', ''))
         for p in existing
     ]
-    await ws_manager.send_to_user(invitee_id, {
+
+    # Ring the invitee. Peer connections are set up in /accept, not here.
+    sent = await ws_manager.send_to_user(invitee_id, {
         "type": "conference_invite",
         "data": {
             "conference_id": conference_id,
@@ -4099,8 +4176,116 @@ async def conference_invite(
             "existing_participants": existing_usernames,
         }
     })
+    if not sent:
+        try:
+            await push_to_user(
+                db, invitee_id, "Group call",
+                f"{caller_username} is adding you to a call", sound="ringingtone.caf",
+            )
+        except Exception as e:
+            logger.warning(f"Conference invite push failed: {e}")
 
     return {"success": True, "conference_id": conference_id}
+
+
+@app.post("/calls/conference/{conference_id}/accept")
+async def conference_accept(
+    conference_id: int,
+    payload: dict = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """
+    Join a conference you were invited to.
+
+    Requires the master token for the same reason a direct call does: it proves
+    the owner is the one answering. Only after this do the existing participants
+    build peer connections to the newcomer.
+    """
+    user_id = int(getattr(current_user, 'id', 0))
+    username = str(getattr(current_user, 'username', ''))
+    payload = payload or {}
+
+    if REQUIRE_MASTER_TOKEN_FOR_CALLS and not payload.get("mastertoken"):
+        raise HTTPException(status_code=401, detail="Master token required to join call")
+    if payload.get("mastertoken") and not validate_master_token(db, user_id, payload["mastertoken"]):
+        raise HTTPException(status_code=401, detail="Invalid master token")
+
+    conf = db.query(ConferenceSession).filter(
+        ConferenceSession.id == conference_id,
+        ConferenceSession.is_active == True
+    ).first()
+    if not conf:
+        raise HTTPException(status_code=404, detail="Conference not found or ended")
+
+    part = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.user_id == user_id,
+    ).first()
+    if not part:
+        raise HTTPException(status_code=403, detail="You were not invited to this call")
+
+    part.is_active = True
+    part.joined_at = datetime.utcnow()
+    db.commit()
+
+    existing = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.user_id != user_id,
+        ConferenceParticipant.is_active == True,
+    ).all()
+
+    # Existing participants create the offers; the newcomer answers.
+    for p in existing:
+        await ws_manager.send_to_user(p.user_id, {
+            "type": "conference_peer_connect",
+            "data": {
+                "conference_id": conference_id,
+                "peer_username": username,
+                "role": "offer",
+            }
+        })
+
+    return {
+        "success": True,
+        "conference_id": conference_id,
+        "participants": [
+            str(getattr(db.query(User).filter(User.id == p.user_id).first(), 'username', ''))
+            for p in existing
+        ],
+    }
+
+
+@app.post("/calls/conference/{conference_id}/decline")
+async def conference_decline(
+    conference_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Turn down a conference invite."""
+    user_id = int(getattr(current_user, 'id', 0))
+    username = str(getattr(current_user, 'username', ''))
+
+    part = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.user_id == user_id,
+        ConferenceParticipant.is_active == False,
+    ).first()
+    if part:
+        db.delete(part)
+        db.commit()
+
+    others = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.is_active == True,
+    ).all()
+    for p in others:
+        await ws_manager.send_to_user(p.user_id, {
+            "type": "conference_invite_declined",
+            "data": {"conference_id": conference_id, "username": username},
+        })
+
+    return {"success": True}
 
 
 @app.post("/calls/conference/{conference_id}/signal")
