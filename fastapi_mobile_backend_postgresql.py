@@ -2760,6 +2760,26 @@ class AdminService:
             ).delete()
 
             # ── 10. Calls ─────────────────────────────────────────────────────
+            # conference_sessions.original_call_id references calls.id, and a
+            # conference created by SOMEONE ELSE can point at this user's call —
+            # so clear those references (the column is nullable) before deleting
+            # the calls, or the delete violates that FK.
+            call_ids = [
+                c.id for c in db.query(Call.id).filter(
+                    or_(Call.caller_id == user_id, Call.recipient_id == user_id)
+                ).all()
+            ]
+            if call_ids:
+                confs_on_calls = db.query(ConferenceSession).filter(
+                    ConferenceSession.original_call_id.in_(call_ids)
+                ).all()
+                for conf in confs_on_calls:
+                    db.query(ConferenceParticipant).filter(
+                        ConferenceParticipant.conference_id == conf.id
+                    ).delete(synchronize_session=False)
+                    db.delete(conf)
+                db.flush()
+
             db.query(Call).filter(
                 or_(Call.caller_id == user_id, Call.recipient_id == user_id)
             ).delete()
