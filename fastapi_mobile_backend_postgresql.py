@@ -2767,6 +2767,50 @@ class AdminService:
             # ── 11. Audit logs ────────────────────────────────────────────────
             db.query(AuditLog).filter(AuditLog.user_id == user_id).delete()
 
+            # ── 11b. Remaining rows that reference this user ──────────────────
+            # Any FK still pointing at the user row makes the final DELETE fail
+            # with a foreign-key violation — which is the 500 the admin panel hit.
+            db.query(LinkedDevice).filter(LinkedDevice.user_id == user_id).delete()
+            db.query(DeviceLinkRequest).filter(
+                DeviceLinkRequest.approved_user_id == user_id
+            ).delete()
+            db.query(MDMDeviceProfile).filter(MDMDeviceProfile.user_id == user_id).delete()
+            db.query(ConferenceParticipant).filter(
+                ConferenceParticipant.user_id == user_id
+            ).delete()
+            db.query(ConferenceSession).filter(
+                ConferenceSession.created_by_user_id == user_id
+            ).delete()
+            db.query(CommandAuditLog).filter(
+                or_(CommandAuditLog.admin_id == user_id,
+                    CommandAuditLog.target_user_id == user_id)
+            ).delete()
+            db.query(GeofenceZone).filter(
+                GeofenceZone.created_by_admin_id == user_id
+            ).delete()
+
+            # DeviceWipeCommand has four user columns; steps 4 only cleared two.
+            db.query(DeviceWipeCommand).filter(
+                or_(DeviceWipeCommand.requested_by_user_id == user_id,
+                    DeviceWipeCommand.approved_by_admin_id == user_id,
+                    DeviceWipeCommand.rejected_by_admin_id == user_id)
+            ).delete()
+
+            # Groups this user created. Drop each group's memberships first so we
+            # do not strand other members on a dangling group.
+            owned_group_ids = [
+                g.id for g in db.query(Group.id).filter(Group.created_by == user_id).all()
+            ]
+            if owned_group_ids:
+                db.query(GroupMember).filter(
+                    GroupMember.group_id.in_(owned_group_ids)
+                ).delete(synchronize_session=False)
+                db.query(Group).filter(Group.id.in_(owned_group_ids)).delete(
+                    synchronize_session=False
+                )
+
+            db.flush()
+
             # ── 12. Delete user row ───────────────────────────────────────────
             db.delete(user)
             db.commit()
