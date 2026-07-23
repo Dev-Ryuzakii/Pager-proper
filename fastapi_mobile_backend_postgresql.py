@@ -3195,6 +3195,18 @@ async def websocket_chat(
             device_name=(device_name or "Unknown").strip(),
         )
         await websocket.send_text(json.dumps({"type": "connected", "user_id": user_id, "device_id": resolved_device_id}))
+
+        # Release the DB connection now. A WebSocket stays open for as long as the
+        # user is online, and holding a pooled connection that whole time drained
+        # the pool (30 connections) once ~30 users were online — new sockets and
+        # HTTP requests then timed out. Below, each message that needs the DB
+        # opens a short-lived session and closes it immediately.
+        try:
+            db.close()
+        except Exception:
+            pass
+        db = None
+
         while True:
             raw = await websocket.receive_text()
             try:
@@ -3205,15 +3217,25 @@ async def websocket_chat(
                     recipient_username = msg.get("recipient")
                     is_typing = msg.get("is_typing", False)
                     if recipient_username:
-                        await ws_manager.handle_typing(user_id, recipient_username, is_typing, db)
+                        op_db = db_config.get_session()
+                        try:
+                            await ws_manager.handle_typing(user_id, recipient_username, is_typing, op_db)
+                        finally:
+                            if op_db:
+                                op_db.close()
                 elif msg.get("type") in ("call_invite", "call_accept", "call_reject",
                                               "call_end", "call_offer", "call_answer", "call_ice"):
                     # Forward call-signaling messages to the recipient
                     recipient_username = msg.get("recipient")
                     if recipient_username:
-                        recipient = db.query(User).filter(
-                            User.username == recipient_username, User.is_active == True
-                        ).first()
+                        op_db = db_config.get_session()
+                        try:
+                            recipient = op_db.query(User).filter(
+                                User.username == recipient_username, User.is_active == True
+                            ).first()
+                        finally:
+                            if op_db:
+                                op_db.close()
                         if recipient:
                             payload_out = dict(msg)
                             payload_out["sender"] = username

@@ -24,8 +24,8 @@ class DatabaseConfig:
     
     def __init__(self):
         # Connection pool settings (set these first)
-        self.POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
-        self.MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+        self.POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "20"))
+        self.MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "30"))
         self.POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
         self.POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "3600"))
         
@@ -123,6 +123,7 @@ class DatabaseConfig:
                     max_overflow=self.MAX_OVERFLOW,
                     pool_timeout=self.POOL_TIMEOUT,
                     pool_recycle=self.POOL_RECYCLE,
+                    pool_pre_ping=True,  # drop dead connections before handing them out
                     echo=False  # Set to True for SQL debugging
                 )
                 
