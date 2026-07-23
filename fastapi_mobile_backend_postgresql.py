@@ -1305,6 +1305,37 @@ _pending_answer_sdp: Dict[int, str] = {}
 # States a call can be in before anyone has answered it.
 UNANSWERED_STATUSES = ("initiated", "calling", "ringing")
 
+# Per-token WebSocket auth-failure cooldown. A token that fails repeatedly (an
+# expired session an old client keeps retrying) is rejected without a DB lookup
+# for a short window, so the reconnect storm cannot load the DB or flood logs.
+import time as _time
+_ws_auth_fails: "Dict[str, list]" = {}   # token -> [fail_count, blocked_until_epoch]
+_WS_AUTH_MAX_FAILS = 3
+_WS_AUTH_BLOCK_SECS = 60
+
+
+def _ws_auth_blocked(token: str) -> bool:
+    rec = _ws_auth_fails.get(token)
+    return bool(rec and rec[1] > _time.time())
+
+
+def _ws_auth_fail(token: str) -> None:
+    rec = _ws_auth_fails.get(token) or [0, 0.0]
+    rec[0] += 1
+    if rec[0] >= _WS_AUTH_MAX_FAILS:
+        rec[1] = _time.time() + _WS_AUTH_BLOCK_SECS  # block window
+        rec[0] = 0
+    _ws_auth_fails[token] = rec
+    if len(_ws_auth_fails) > 5000:  # bound the map
+        now = _time.time()
+        for k in [k for k, v in _ws_auth_fails.items() if v[1] < now]:
+            _ws_auth_fails.pop(k, None)
+
+
+def _ws_auth_ok(token: str) -> None:
+    _ws_auth_fails.pop(token, None)
+
+
 # ICE candidates for a recipient whose WebSocket was momentarily down. Delivered
 # on their next connect. Capped per user so a permanently-offline peer can't grow
 # it without bound. recipient_user_id -> list[notification]
@@ -3201,14 +3232,25 @@ async def websocket_chat(
         if not token:
             await websocket.close(code=4001)
             return
+
+        # Cooldown for tokens that keep failing auth. Old clients with an expired
+        # token reconnect every second forever; without this each attempt runs a
+        # DB query and floods the log. After a few failures we reject instantly
+        # for a short window, no DB touched.
+        if _ws_auth_blocked(token):
+            await websocket.close(code=4001)
+            return
+
         db = db_config.get_session()
         if not db:
             await websocket.close(code=4010)
             return
         session = SessionService.validate_session(db, token)
         if not session:
+            _ws_auth_fail(token)
             await websocket.close(code=4001)
             return
+        _ws_auth_ok(token)
         user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
         if not user:
             await websocket.close(code=4001)
