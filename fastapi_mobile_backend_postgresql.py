@@ -3033,17 +3033,18 @@ class ConnectionManager:
         await self.broadcast_online_status()
 
     async def disconnect(self, websocket: "WebSocket", user_id: int) -> None:
-        if user_id in self._connections:
+        conns = self._connections.get(user_id)
+        if conns:
             # Find and remove the specific ws
             device_id_to_remove = None
-            for did, ws in list(self._connections[user_id].items()):
+            for did, ws in list(conns.items()):
                 if ws is websocket:
                     device_id_to_remove = did
                     break
             if device_id_to_remove:
-                self._connections[user_id].pop(device_id_to_remove, None)
+                conns.pop(device_id_to_remove, None)
                 self._devices.pop(device_id_to_remove, None)
-            if not self._connections[user_id]:
+            if not conns:
                 self._connections.pop(user_id, None)
                 self._usernames.pop(user_id, None)
         logger.info(f"WS disconnected: user_id={user_id}")
@@ -3051,21 +3052,25 @@ class ConnectionManager:
 
     async def send_to_user(self, user_id: int, data: dict) -> bool:
         """Send to ALL devices of a user. Returns True if at least one sent."""
-        if user_id not in self._connections:
+        # Hold the dict reference: a concurrent disconnect() can pop user_id
+        # while we await a send, and re-indexing self._connections[user_id]
+        # afterwards would KeyError (the "WebSocket error: <id>" warnings).
+        conns = self._connections.get(user_id)
+        if not conns:
             return False
         payload = json.dumps(data, default=str)
         dead = []
         sent = False
-        for device_id, ws in list(self._connections[user_id].items()):
+        for device_id, ws in list(conns.items()):
             try:
                 await ws.send_text(payload)
                 sent = True
             except Exception:
                 dead.append(device_id)
         for did in dead:
-            self._connections[user_id].pop(did, None)
+            conns.pop(did, None)
             self._devices.pop(did, None)
-        if not self._connections[user_id]:
+        if not conns:
             self._connections.pop(user_id, None)
             self._usernames.pop(user_id, None)
         return sent
