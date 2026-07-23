@@ -1305,6 +1305,28 @@ _pending_answer_sdp: Dict[int, str] = {}
 # States a call can be in before anyone has answered it.
 UNANSWERED_STATUSES = ("initiated", "calling", "ringing")
 
+# ICE candidates for a recipient whose WebSocket was momentarily down. Delivered
+# on their next connect. Capped per user so a permanently-offline peer can't grow
+# it without bound. recipient_user_id -> list[notification]
+_pending_ice: "Dict[int, list]" = {}
+_PENDING_ICE_MAX = 300
+
+
+def _buffer_ice(recipient_id: int, notification: dict) -> None:
+    q = _pending_ice.setdefault(recipient_id, [])
+    q.append(notification)
+    if len(q) > _PENDING_ICE_MAX:
+        del q[: len(q) - _PENDING_ICE_MAX]  # keep the newest
+
+
+async def flush_pending_ice(recipient_id: int) -> None:
+    """Send any buffered ICE candidates once the recipient is back online."""
+    q = _pending_ice.pop(int(recipient_id), None)
+    if not q:
+        return
+    for notification in q:
+        await ws_manager.send_to_user(int(recipient_id), notification)
+
 # How long a call rings before it is recorded as missed. 45s matches what users
 # expect from messaging apps; the PSTN convention of 30s feels abrupt here.
 CALL_RING_TIMEOUT_SECONDS = int(os.getenv("CALL_RING_TIMEOUT_SECONDS", "45"))
@@ -1509,8 +1531,15 @@ class CallService:
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
         }
-        
-        return await ws_manager.send_to_user(recipient.id, notification)
+
+        delivered = await ws_manager.send_to_user(recipient.id, notification)
+        if not delivered:
+            # Recipient's WebSocket is momentarily down (it reconnects often).
+            # Buffer the candidate and deliver on their next connect instead of
+            # dropping it — a lost candidate leaves the call stuck "connecting".
+            _buffer_ice(int(recipient.id), notification)
+        # Always report success: the candidate is either delivered or queued.
+        return True
 
 class MonitoringService:
     """Admin audio monitoring — requires explicit user consent stored in monitoring_consents"""
@@ -3195,6 +3224,10 @@ async def websocket_chat(
             device_name=(device_name or "Unknown").strip(),
         )
         await websocket.send_text(json.dumps({"type": "connected", "user_id": user_id, "device_id": resolved_device_id}))
+
+        # Deliver any ICE candidates that arrived while this user's socket was
+        # down — otherwise those calls stay stuck "connecting".
+        await flush_pending_ice(user_id)
 
         # Release the DB connection now. A WebSocket stays open for as long as the
         # user is online, and holding a pooled connection that whole time drained
