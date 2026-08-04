@@ -290,12 +290,12 @@ def _model() -> _MarkovChain:
 # the host. Generation happens on a daemon thread; the send path only ever pops
 # an already-finished string, so the LLM's ~10 tok/s cannot slow a message down.
 
-_LLM_ENABLED = os.getenv("DECOY_LLM", "0") == "1"
-_LLM_URL = os.getenv("DECOY_LLM_URL", "http://127.0.0.1:11434/api/generate")
-_LLM_MODEL = os.getenv("DECOY_LLM_MODEL", "llama3.2:3b")
-_LLM_TIMEOUT = float(os.getenv("DECOY_LLM_TIMEOUT", "20"))
-_LLM_THREADS = int(os.getenv("DECOY_LLM_THREADS", "6"))
-_POOL_TARGET = int(os.getenv("DECOY_LLM_POOL", "64"))
+# Read on first use, not at import: this module gets imported alongside others
+# that call load_dotenv(), and reading at import time would silently depend on
+# which one lands first.
+
+def _cfg(name: str, default: str) -> str:
+    return os.getenv(name, default)
 
 _PROMPT = (
     "Write one short casual text message between friends, 5 to 13 words. "
@@ -330,22 +330,23 @@ def _llm_once(timeout: float) -> Optional[str]:
         return None
 
     payload = {
-        "model": _LLM_MODEL,
+        "model": _cfg("DECOY_LLM_MODEL", "llama3.2:3b"),
         "prompt": _PROMPT,
         "stream": True,  # required: lets us drop the connection to free the slot
         "think": False,
         "options": {
             "num_predict": 48,   # token ceiling - the real bound on how long this runs
-            "num_thread": _LLM_THREADS,
+            "num_thread": int(_cfg("DECOY_LLM_THREADS", "6")),
             "num_ctx": 1024,
             "temperature": 1.0,  # decoys need variety more than coherence
         },
     }
     chunks: List[str] = []
     try:
+        url = _cfg("DECOY_LLM_URL", "http://127.0.0.1:11434/api/generate")
         limits = httpx.Timeout(connect=2.0, read=timeout, write=2.0, pool=2.0)
         with httpx.Client(timeout=limits) as client:
-            with client.stream("POST", _LLM_URL, json=payload) as response:
+            with client.stream("POST", url, json=payload) as response:
                 response.raise_for_status()
                 for line in response.iter_lines():
                     if not line:
@@ -394,7 +395,7 @@ class _DecoyPool:
                 self._wake.clear()
                 continue
 
-            text = _llm_once(_LLM_TIMEOUT)
+            text = _llm_once(float(_cfg("DECOY_LLM_TIMEOUT", "20")))
             if text is None:
                 # Ollama down or model missing: back off so a dead service does
                 # not spin this thread. The send path is unaffected regardless.
@@ -413,10 +414,10 @@ _POOL: Optional[_DecoyPool] = None
 
 def _pool() -> Optional[_DecoyPool]:
     global _POOL
-    if not _LLM_ENABLED:
+    if _cfg("DECOY_LLM", "0") != "1":
         return None
     if _POOL is None:
-        _POOL = _DecoyPool(_POOL_TARGET)
+        _POOL = _DecoyPool(int(_cfg("DECOY_LLM_POOL", "64")))
         _POOL.start()
     return _POOL
 
