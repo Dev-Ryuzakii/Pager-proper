@@ -2932,6 +2932,13 @@ async def lifespan(app: FastAPI):
             else:
                 logger.error("❌ Failed to create/verify database tables")
 
+    # Warm the LLM decoy pool so it fills while idle instead of after the first
+    # message. No-op unless DECOY_LLM=1; falls back to Markov either way.
+    if FakeTextGenerator.warm():
+        logger.info("✅ LLM decoy pool warming in background")
+    else:
+        logger.info("ℹ️  LLM decoys disabled, using Markov generator")
+
     # Start periodic online status broadcast task
     import asyncio
     async def periodic_status_broadcast():

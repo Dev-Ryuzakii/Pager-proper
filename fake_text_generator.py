@@ -441,6 +441,15 @@ class FakeTextGenerator:
     """
 
     @staticmethod
+    def warm() -> bool:
+        """
+        Start the LLM decoy pool ahead of first use. Safe to call always: a
+        no-op returning False when DECOY_LLM is unset. Call at app startup so
+        the pool fills while idle rather than after the first message.
+        """
+        return _pool() is not None
+
+    @staticmethod
     def generate_sentence() -> str:
         return _decoy(min_words=4, max_words=10)
 
