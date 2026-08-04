@@ -1,12 +1,21 @@
 """
 Markov chain language model for realistic casual chat decoy text.
-Self-contained - no external APIs or model files needed.
-Replaces template-based generator with a trained statistical model.
+Self-contained by default - no external APIs or model files needed.
+
+Optionally backed by a local LLM (Ollama on 127.0.0.1) for more varied decoys.
+Enable with DECOY_LLM=1. The LLM never runs on the message send path: a
+background thread pre-generates into a pool, and callers pop from it. If the
+pool is empty or the LLM is unreachable, generation silently falls back to the
+Markov chain, so send latency is unchanged either way.
 """
 
+import json
+import os
 import random
-from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+import re
+import threading
+from collections import defaultdict, deque
+from typing import Deque, Dict, List, Tuple, Optional
 
 # ── Training corpus ────────────────────────────────────────────────────────────
 # ~185 casual everyday English phrases across varied topics.
@@ -276,6 +285,152 @@ def _model() -> _MarkovChain:
     return _MODEL
 
 
+# ── Optional local LLM decoy pool ──────────────────────────────────────────────
+# Off unless DECOY_LLM=1. Runs entirely on 127.0.0.1 - no decoy text ever leaves
+# the host. Generation happens on a daemon thread; the send path only ever pops
+# an already-finished string, so the LLM's ~10 tok/s cannot slow a message down.
+
+_LLM_ENABLED = os.getenv("DECOY_LLM", "0") == "1"
+_LLM_URL = os.getenv("DECOY_LLM_URL", "http://127.0.0.1:11434/api/generate")
+_LLM_MODEL = os.getenv("DECOY_LLM_MODEL", "llama3.2:3b")
+_LLM_TIMEOUT = float(os.getenv("DECOY_LLM_TIMEOUT", "20"))
+_LLM_THREADS = int(os.getenv("DECOY_LLM_THREADS", "6"))
+_POOL_TARGET = int(os.getenv("DECOY_LLM_POOL", "64"))
+
+_PROMPT = (
+    "Write one short casual text message between friends, 5 to 13 words. "
+    "Everyday small talk - plans, food, work, weather, checking in. "
+    "Output only the message. No quotes, no emoji, no explanation."
+)
+
+# The reasoning-model guard: qwen3 and friends emit <think> blocks that leak
+# into plain output when Ollama's think parsing is off. Strip them defensively
+# so a model swap can never put "</think>" in a user-visible decoy.
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_STRAY = re.compile(r"</?think>", re.IGNORECASE)
+
+
+def _clean(raw: str) -> Optional[str]:
+    """Normalise raw model output into a decoy, or None if it is unusable."""
+    text = _THINK_STRAY.sub(" ", _THINK_BLOCK.sub(" ", raw))
+    text = text.replace("\n", " ").strip().strip('"').strip("'").strip()
+    text = re.sub(r"\s+", " ", text)
+    if not (10 <= len(text) <= 120):
+        return None
+    if len(text.split()) < 4:
+        return None
+    return text[0].upper() + text[1:]
+
+
+def _llm_once(timeout: float) -> Optional[str]:
+    """One streamed generation. Returns None on any failure - never raises."""
+    try:
+        import httpx  # lazy: the module stays importable without httpx installed
+    except ImportError:
+        return None
+
+    payload = {
+        "model": _LLM_MODEL,
+        "prompt": _PROMPT,
+        "stream": True,  # required: lets us drop the connection to free the slot
+        "think": False,
+        "options": {
+            "num_predict": 48,   # token ceiling - the real bound on how long this runs
+            "num_thread": _LLM_THREADS,
+            "num_ctx": 1024,
+            "temperature": 1.0,  # decoys need variety more than coherence
+        },
+    }
+    chunks: List[str] = []
+    try:
+        limits = httpx.Timeout(connect=2.0, read=timeout, write=2.0, pool=2.0)
+        with httpx.Client(timeout=limits) as client:
+            with client.stream("POST", _LLM_URL, json=payload) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    chunk = json.loads(line)
+                    chunks.append(chunk.get("response", ""))
+                    if chunk.get("done"):
+                        break
+    except Exception:
+        # Exiting the context closes the socket, which makes Ollama release the
+        # slot instead of burning CPU on a generation nobody is waiting for.
+        return None
+    return _clean("".join(chunks))
+
+
+class _DecoyPool:
+    """Bounded pool of pre-generated LLM decoys, refilled by a daemon thread."""
+
+    def __init__(self, target: int):
+        self._target = target
+        self._items: Deque[str] = deque(maxlen=target)
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._started = False
+        self._backoff = 1.0
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        threading.Thread(target=self._run, name="decoy-llm-pool", daemon=True).start()
+
+    def pop(self) -> Optional[str]:
+        with self._lock:
+            item = self._items.popleft() if self._items else None
+        if item is None or len(self._items) < self._target // 2:
+            self._wake.set()
+        return item
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                need = self._target - len(self._items)
+            if need <= 0:
+                self._wake.wait(timeout=60.0)
+                self._wake.clear()
+                continue
+
+            text = _llm_once(_LLM_TIMEOUT)
+            if text is None:
+                # Ollama down or model missing: back off so a dead service does
+                # not spin this thread. The send path is unaffected regardless.
+                self._wake.wait(timeout=self._backoff)
+                self._wake.clear()
+                self._backoff = min(self._backoff * 2, 300.0)
+                continue
+
+            self._backoff = 1.0
+            with self._lock:
+                self._items.append(text)
+
+
+_POOL: Optional[_DecoyPool] = None
+
+
+def _pool() -> Optional[_DecoyPool]:
+    global _POOL
+    if not _LLM_ENABLED:
+        return None
+    if _POOL is None:
+        _POOL = _DecoyPool(_POOL_TARGET)
+        _POOL.start()
+    return _POOL
+
+
+def _decoy(min_words: int, max_words: int) -> str:
+    """Pooled LLM decoy if one is ready, otherwise the Markov chain."""
+    pool = _pool()
+    if pool is not None:
+        text = pool.pop()
+        if text is not None:
+            return text
+    return _model().generate(min_words=min_words, max_words=max_words)
+
+
 # ── Public interface (backward-compatible) ─────────────────────────────────────
 
 class FakeTextGenerator:
@@ -286,16 +441,16 @@ class FakeTextGenerator:
 
     @staticmethod
     def generate_sentence() -> str:
-        return _model().generate(min_words=4, max_words=10)
+        return _decoy(min_words=4, max_words=10)
 
     @staticmethod
     def generate_paragraph(sentence_count: int = 3) -> str:
-        sentences = [_model().generate(min_words=5, max_words=12) for _ in range(sentence_count)]
+        sentences = [_decoy(min_words=5, max_words=12) for _ in range(sentence_count)]
         return " ".join(sentences)
 
     @staticmethod
     def generate_message_preview(length: int = 50) -> str:
-        text = _model().generate(min_words=4, max_words=10)
+        text = _decoy(min_words=4, max_words=10)
         if len(text) <= length:
             return text
         cut = text[:length - 3].rsplit(" ", 1)[0]
@@ -304,4 +459,4 @@ class FakeTextGenerator:
     @staticmethod
     def generate_decoy_text_for_message(encrypted_content: str) -> str:
         """Generate a unique, natural-sounding decoy for any message."""
-        return _model().generate(min_words=5, max_words=13)
+        return _decoy(min_words=5, max_words=13)
