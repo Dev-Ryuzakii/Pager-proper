@@ -6562,6 +6562,120 @@ async def upload_raw_media(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
 
+@app.post("/media/upload_raw_group")
+async def upload_raw_group_media(
+    group_id: int = Form(...),
+    file: UploadFile = File(...),
+    disappear_after_hours: Optional[int] = Form(None),
+    content_type: Optional[str] = Form(None),
+    current_user: User = Depends(get_current_user),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_database_session)
+):
+    """Raw media upload to a group, mirroring /media/upload_raw for 1:1."""
+    try:
+        sender_id = int(getattr(current_user, 'id', 0))
+        membership = db.query(GroupMember).filter(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == sender_id
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="You are not a member of this group")
+
+        file_extension = os.path.splitext(file.filename)[1] if file.filename else ".bin"
+        unique_filename = f"{uuid.uuid4()}{file_extension}"
+        file_path = os.path.join(UPLOAD_DIR, unique_filename)
+
+        content = await file.read()
+
+        is_voice = content_type == "media/voice" or bool(content_type and content_type.startswith("audio/"))
+        if not is_voice and not (content_type and "encrypted" in content_type):
+            content = apply_watermark(
+                content,
+                file.content_type or "application/octet-stream",
+                file.filename or "media",
+                str(getattr(current_user, "username", "") or "User"),
+            )
+
+        with open(file_path, "wb") as buffer:
+            buffer.write(content)
+
+        expires_at = None
+        auto_delete = False
+        if disappear_after_hours is not None and disappear_after_hours > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=disappear_after_hours)
+            auto_delete = True
+
+        message = Message(
+            sender_id=sender_id,
+            group_id=group_id,
+            encrypted_content=unique_filename,
+            content_type=content_type or "media/raw",
+            delivered=True,
+            read=False,
+            is_offline=False,
+            expires_at=expires_at,
+            auto_delete=auto_delete
+        )
+        db.add(message)
+        db.commit()
+        db.refresh(message)
+
+        media = Media(
+            media_id=unique_filename,
+            filename=file.filename or unique_filename,
+            file_size=len(content),
+            media_type="voice" if is_voice else "raw",
+            content_type=content_type or file.content_type or "application/octet-stream",
+            encrypted_file_path=file_path,
+            message_id=message.id,
+            sender_id=sender_id,
+            group_id=group_id,
+            expires_at=expires_at,
+            auto_delete=auto_delete
+        )
+        db.add(media)
+        db.commit()
+        db.refresh(media)
+
+        logger.info(f"📤 Raw group media uploaded: {sender_id} → group {group_id} ({unique_filename})")
+
+        # Notify all group members via WebSocket, same shape as send_group_message
+        members = db.query(GroupMember).filter(GroupMember.group_id == group_id).all()
+        sender_username = str(getattr(current_user, 'username', ''))
+        notification = {
+            "type": "new_group_message",
+            "data": {
+                "message_id": int(message.id),
+                "group_id": int(group_id),
+                "sender_username": sender_username,
+                "recipient_username": "group",
+                "is_admin_announcement": False,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "decoy_content": ""
+            }
+        }
+        for member in members:
+            if member.user_id != sender_id:
+                ws_sent = await ws_manager.send_to_user(member.user_id, notification)
+                if not ws_sent:
+                    await push_to_user(db, member.user_id, "New message", f"From {sender_username}", sound="beep.caf")
+
+        return {
+            "media_id": unique_filename,
+            "filename": file.filename,
+            "file_size": len(content),
+            "content_type": file.content_type,
+            "message": "File uploaded successfully",
+            "uploaded_for": f"group:{group_id}",
+            "disappear_after_hours": disappear_after_hours
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
+
 @app.get("/media/download/{media_id}")
 async def download_raw_media(
     media_id: str, 
@@ -6578,11 +6692,17 @@ async def download_raw_media(
         if not media:
             raise HTTPException(status_code=404, detail="Media not found")
         
-        # Check if user is sender or recipient
+        # Check if user is sender, recipient, or (for group media) a group member
         user_id = int(getattr(current_user, 'id', 0))
-        if media.sender_id != user_id and media.recipient_id != user_id:
+        authorized = media.sender_id == user_id or media.recipient_id == user_id
+        if not authorized and media.group_id:
+            authorized = db.query(GroupMember).filter(
+                GroupMember.group_id == media.group_id,
+                GroupMember.user_id == user_id
+            ).first() is not None
+        if not authorized:
             raise HTTPException(status_code=403, detail="Access denied")
-        
+
         # Get the actual file path from the database
         file_path = getattr(media, 'encrypted_file_path', None)
         if not file_path:
