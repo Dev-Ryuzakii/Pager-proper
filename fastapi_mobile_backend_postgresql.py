@@ -5454,10 +5454,13 @@ async def get_decoy_file(
     it away. Contents are internally consistent — an invoice that adds up, dates
     in order — because a decoy is only tested when somebody opens it.
     """
-    clean_media_id = media_id.split('.')[0]
-    media = db.query(Media).filter(Media.media_id == clean_media_id).first()
+    # media_id arrives exactly as stored (it includes the extension - Media.media_id
+    # is written as f"{uuid}{ext}" at upload time), so look it up as-is. Only the
+    # cache filename needs a single clean extension, which is a separate concern.
+    media = db.query(Media).filter(Media.media_id == media_id).first()
     if not media:
         raise HTTPException(status_code=404, detail="Media not found")
+    clean_media_id = os.path.splitext(media_id)[0]
 
     user_id = int(getattr(current_user, 'id', 0))
     authorized = media.sender_id == user_id or media.recipient_id == user_id
