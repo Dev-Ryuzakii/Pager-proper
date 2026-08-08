@@ -248,6 +248,10 @@ class Media(Base):
     # Encryption metadata
     encryption_metadata = Column(JSON, nullable=True)  # Encryption details
     encrypted_file_path = Column(String(512), nullable=False)  # Path to encrypted file
+
+    # Sender's choice of decoy document kind (invoice/delivery/minutes/memo), or
+    # null for the server to pick one deterministically from the media_id.
+    decoy_kind = Column(String(20), nullable=True)
     
     # Message relationship
     message_id = Column(Integer, ForeignKey("messages.id"), nullable=False)

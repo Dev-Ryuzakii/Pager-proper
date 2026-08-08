@@ -5460,7 +5460,13 @@ async def get_decoy_file(
         raise HTTPException(status_code=404, detail="Media not found")
 
     user_id = int(getattr(current_user, 'id', 0))
-    if media.sender_id != user_id and media.recipient_id != user_id:
+    authorized = media.sender_id == user_id or media.recipient_id == user_id
+    if not authorized and media.group_id:
+        authorized = db.query(GroupMember).filter(
+            GroupMember.group_id == media.group_id,
+            GroupMember.user_id == user_id
+        ).first() is not None
+    if not authorized:
         raise HTTPException(status_code=403, detail="Not authorized for this media")
 
     os.makedirs(DECOY_CACHE_DIR, exist_ok=True)
@@ -5469,6 +5475,7 @@ async def get_decoy_file(
         pdf, _name = generate_decoy_document(
             seed=clean_media_id,
             target_size=int(getattr(media, 'file_size', 0) or 0) or None,
+            kind=getattr(media, 'decoy_kind', None),
         )
         tmp = os.path.join(DECOY_CACHE_DIR, f".tmp_{uuid.uuid4().hex}.pdf")
         with open(tmp, "wb") as f:
@@ -6441,6 +6448,8 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 DECOY_CACHE_DIR = "decoy_cache"
 os.makedirs(DECOY_CACHE_DIR, exist_ok=True)
 
+DECOY_KINDS = {"invoice", "delivery", "minutes", "memo"}
+
 @app.post("/media/upload_raw")
 async def upload_raw_media(
     username: str = Form(...),
@@ -6448,6 +6457,7 @@ async def upload_raw_media(
     disappear_after_hours: Optional[int] = Form(None),
     content_type: Optional[str] = Form(None),
     encryption_metadata: Optional[str] = Form(None),
+    decoy_kind: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_database_session)
@@ -6456,6 +6466,8 @@ async def upload_raw_media(
     Endpoint for direct raw media upload without base64 encoding
     """
     try:
+        if decoy_kind is not None and decoy_kind not in DECOY_KINDS:
+            raise HTTPException(status_code=400, detail=f"decoy_kind must be one of {sorted(DECOY_KINDS)}")
         # Parse encryption metadata if provided
         metadata_json = None
         if encryption_metadata:
@@ -6530,6 +6542,7 @@ async def upload_raw_media(
             content_type=content_type or file.content_type or "application/octet-stream",
             encrypted_file_path=file_path,
             encryption_metadata=metadata_json,
+            decoy_kind=decoy_kind,
             message_id=message.id,
             sender_id=sender_id,
             recipient_id=recipient.id,
@@ -6537,7 +6550,7 @@ async def upload_raw_media(
             auto_delete=auto_delete
         )
 
-        
+
         db.add(media)
         db.commit()
         db.refresh(media)
@@ -6568,12 +6581,16 @@ async def upload_raw_group_media(
     file: UploadFile = File(...),
     disappear_after_hours: Optional[int] = Form(None),
     content_type: Optional[str] = Form(None),
+    decoy_kind: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_database_session)
 ):
     """Raw media upload to a group, mirroring /media/upload_raw for 1:1."""
     try:
+        if decoy_kind is not None and decoy_kind not in DECOY_KINDS:
+            raise HTTPException(status_code=400, detail=f"decoy_kind must be one of {sorted(DECOY_KINDS)}")
+
         sender_id = int(getattr(current_user, 'id', 0))
         membership = db.query(GroupMember).filter(
             GroupMember.group_id == group_id,
@@ -6628,6 +6645,7 @@ async def upload_raw_group_media(
             media_type="voice" if is_voice else "raw",
             content_type=content_type or file.content_type or "application/octet-stream",
             encrypted_file_path=file_path,
+            decoy_kind=decoy_kind,
             message_id=message.id,
             sender_id=sender_id,
             group_id=group_id,
