@@ -1,0 +1,21 @@
+# LiveKit single-node config for the Dilarion VPS.
+# Fill in keys below from `docker run --rm livekit/livekit-server generate-keys`,
+# then mirror the SAME values into the backend's LIVEKIT_API_KEY / LIVEKIT_API_SECRET.
+
+port: 7880
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 60000
+  use_external_ip: true   # VPS is on a public IP, no NAT to punch through
+
+keys:
+  # REPLACE with your generated key/secret pair. Do not commit real values.
+  APIkey0000000000: your-generated-secret-here
+
+# No redis: block — single-node mode. Add one only if this ever becomes
+# multi-node LiveKit (not needed at Dilarion's current scale).
+
+logging:
+  level: info

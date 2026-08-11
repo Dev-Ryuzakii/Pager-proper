@@ -23,6 +23,7 @@ httpx==0.23.3
 idna==3.4
 iniconfig==2.1.0
 kombu==5.2.4
+livekit-api==1.2.0
 Mako==1.2.4
 MarkupSafe==2.1.2
 packaging==21.3

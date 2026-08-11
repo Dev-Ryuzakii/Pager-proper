@@ -34,6 +34,14 @@ import json
 # Import bcrypt for password hashing
 import bcrypt
 
+# LiveKit (group video, Phase C). Optional at import time so a server that
+# hasn't run `pip install livekit-api` yet still starts — the token endpoint
+# 503s instead of crashing the whole app.
+try:
+    from livekit import api as lk_api
+except ImportError:
+    lk_api = None
+
 # Load environment variables
 if os.path.exists('.env'):
     with open('.env', 'r') as f:
@@ -44,7 +52,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -119,6 +127,26 @@ class MessageSend(BaseModel):
     encrypted_key: Optional[str] = Field(None, description="AES key encrypted with recipient RSA public key")
     iv: Optional[str] = Field(None, description="Initialization Vector for AES")
     decoy_content: Optional[str] = Field(None, description="Client-generated decoy content")
+
+class MeetingCreateRequest(BaseModel):
+    title: Optional[str] = Field(None, description="Meeting title")
+    scheduled_at: datetime = Field(..., description="When the meeting starts")
+    duration_minutes: Optional[int] = Field(60, description="Expected duration")
+    group_id: Optional[int] = Field(None, description="Invite an entire group")
+    invitee_usernames: Optional[List[str]] = Field(None, description="Ad-hoc invitees, in addition to any group")
+    recurrence: Optional[str] = Field(None, description="null, daily, weekly, or monthly")
+
+class MeetingJoinRequest(BaseModel):
+    join_code: str = Field(..., description="Short code shared with invitees")
+
+class WhiteboardStrokeRequest(BaseModel):
+    username: Optional[str] = Field(None, description="1:1 target — exactly one of username/group_id")
+    group_id: Optional[int] = Field(None, description="Group target — exactly one of username/group_id")
+    stroke: Dict[str, Any] = Field(..., description="Opaque point/color/width payload, relayed as-is")
+
+class WhiteboardClearRequest(BaseModel):
+    username: Optional[str] = Field(None, description="1:1 target — exactly one of username/group_id")
+    group_id: Optional[int] = Field(None, description="Group target — exactly one of username/group_id")
 
 class MasterToken(BaseModel):
     mastertoken: str = Field(..., description="Master decryption token")
@@ -1362,10 +1390,11 @@ async def flush_pending_ice(recipient_id: int) -> None:
 # expect from messaging apps; the PSTN convention of 30s feels abrupt here.
 CALL_RING_TIMEOUT_SECONDS = int(os.getenv("CALL_RING_TIMEOUT_SECONDS", "45"))
 
-# Mesh WebRTC has every participant sending to every other, so bandwidth and CPU
-# grow quadratically. Four is the practical ceiling on mobile hardware; going
-# beyond needs an SFU, which is separate infrastructure.
-CONFERENCE_MAX_PARTICIPANTS = int(os.getenv("CONFERENCE_MAX_PARTICIPANTS", "4"))
+# Group calls render through the LiveKit SFU (see /livekit-token below), not
+# raw mesh WebRTC, so this is no longer bounded by mesh's O(n^2) peer-connection
+# cost. It's the ConferenceSession/invite layer's cap — kept generous but finite
+# so a single VPS-hosted LiveKit room can't be grown into a webinar by accident.
+CONFERENCE_MAX_PARTICIPANTS = int(os.getenv("CONFERENCE_MAX_PARTICIPANTS", "30"))
 
 
 class CallService:
@@ -2964,9 +2993,50 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Auto-cleanup error: {e}")
 
+    async def periodic_meeting_reminders():
+        while True:
+            try:
+                await asyncio.sleep(60)  # check every minute
+                db = next(get_database_session())
+                try:
+                    now = datetime.now(timezone.utc)
+                    soon = now + timedelta(minutes=5)
+                    due = db.query(Meeting).filter(
+                        Meeting.status == "upcoming",
+                        Meeting.reminder_sent == False,
+                        Meeting.scheduled_at <= soon,
+                        Meeting.scheduled_at >= now,
+                    ).all()
+                    for meeting in due:
+                        parts = db.query(MeetingParticipant).filter(
+                            MeetingParticipant.meeting_id == meeting.id
+                        ).all()
+                        title_text = meeting.title or "Meeting"
+                        for p in parts:
+                            ws_sent = await ws_manager.send_to_user(p.user_id, {
+                                "type": "meeting_reminder",
+                                "data": {
+                                    "meeting_id": meeting.id,
+                                    "title": title_text,
+                                    "join_code": meeting.join_code,
+                                    "scheduled_at": meeting.scheduled_at.isoformat(),
+                                }
+                            })
+                            if not ws_sent:
+                                await push_to_user(db, p.user_id, "Meeting starting soon", f"{title_text} starts in a few minutes")
+                        meeting.reminder_sent = True
+                    if due:
+                        db.commit()
+                        logger.info(f"Meeting reminders: notified for {len(due)} upcoming meeting(s)")
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.error(f"Meeting reminder error: {e}")
+
     broadcast_task = asyncio.create_task(periodic_status_broadcast())
     deadmans_task = asyncio.create_task(DeadMansSwitchService.run_checker(None))
     cleanup_task = asyncio.create_task(periodic_message_cleanup())
+    meeting_reminder_task = asyncio.create_task(periodic_meeting_reminders())
 
     yield
 
@@ -2974,6 +3044,7 @@ async def lifespan(app: FastAPI):
     broadcast_task.cancel()
     deadmans_task.cancel()
     cleanup_task.cancel()
+    meeting_reminder_task.cancel()
     
     # Shutdown
     logger.info("📴 Shutting down FastAPI Mobile Backend")
@@ -4585,6 +4656,283 @@ async def conference_participants(
             for p in parts
         ]
     }
+
+
+# ─── LiveKit group video (gallery view) ────────────────────────────────────────
+# Self-hosted LiveKit SFU. This backend only issues short-lived JWT room-access
+# tokens (livekit-api) — LiveKit auto-creates rooms on first join by default,
+# so there's no separate room-lifecycle call to make. Room name is derived from
+# the conference_id so LiveKit rooms map 1:1 onto existing ConferenceSession
+# rows rather than a third parallel concept.
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
+
+
+@app.get("/calls/conference/{conference_id}/livekit-token")
+async def conference_livekit_token(
+    conference_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Issue a short-lived LiveKit room-access token for an active conference participant."""
+    if not (lk_api and LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        raise HTTPException(status_code=503, detail="Group video is not configured on this server")
+
+    user_id = int(getattr(current_user, 'id', 0))
+    username = str(getattr(current_user, 'username', ''))
+
+    part = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.user_id == user_id,
+        ConferenceParticipant.is_active == True,
+    ).first()
+    if not part:
+        raise HTTPException(status_code=403, detail="Not an active participant in this conference")
+
+    room_name = f"conf-{conference_id}"
+    token = (
+        lk_api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity(username)
+        .with_name(username)
+        .with_grants(lk_api.VideoGrants(room_join=True, room=room_name))
+        .with_ttl(timedelta(hours=4))
+        .to_jwt()
+    )
+    return {"url": LIVEKIT_URL, "token": token, "room": room_name}
+
+
+# ─── Scheduled meetings ────────────────────────────────────────────────────────
+# A meeting is inert until someone joins — it becomes a standalone
+# ConferenceSession at that point (the same call_id-omitted path instant
+# meetings already use), so there is no second calling mechanism to maintain.
+
+@app.post("/meetings/create")
+async def create_meeting(
+    payload: MeetingCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    creator_id = int(getattr(current_user, 'id', 0))
+    join_code = uuid.uuid4().hex[:8].upper()
+
+    meeting = Meeting(
+        creator_id=creator_id,
+        group_id=payload.group_id,
+        title=payload.title,
+        scheduled_at=payload.scheduled_at,
+        duration_minutes=payload.duration_minutes or 60,
+        recurrence=payload.recurrence,
+        join_code=join_code,
+        status="upcoming",
+    )
+    db.add(meeting)
+    db.commit()
+    db.refresh(meeting)
+
+    invitee_ids = set()
+    if payload.group_id:
+        members = db.query(GroupMember).filter(GroupMember.group_id == payload.group_id).all()
+        for m in members:
+            invitee_ids.add(int(m.user_id))
+    if payload.invitee_usernames:
+        for uname in payload.invitee_usernames:
+            u = db.query(User).filter(User.username == uname, User.is_active == True).first()
+            if u:
+                invitee_ids.add(int(u.id))
+    invitee_ids.discard(creator_id)  # creator is added separately below, avoid a duplicate row
+
+    db.add(MeetingParticipant(meeting_id=meeting.id, user_id=creator_id))
+    for uid in invitee_ids:
+        db.add(MeetingParticipant(meeting_id=meeting.id, user_id=uid))
+    db.commit()
+
+    return {
+        "meeting_id": meeting.id,
+        "join_code": join_code,
+        "scheduled_at": meeting.scheduled_at.isoformat(),
+    }
+
+
+@app.get("/meetings/upcoming")
+async def list_upcoming_meetings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    meeting_ids = [
+        p.meeting_id for p in
+        db.query(MeetingParticipant).filter(MeetingParticipant.user_id == user_id).all()
+    ]
+    meetings = db.query(Meeting).filter(
+        Meeting.id.in_(meeting_ids),
+        Meeting.status.in_(["upcoming", "live"]),
+    ).order_by(Meeting.scheduled_at.asc()).all()
+
+    result = []
+    for m in meetings:
+        creator = db.query(User).filter(User.id == m.creator_id).first()
+        result.append({
+            "id": m.id,
+            "title": m.title,
+            "scheduled_at": m.scheduled_at.isoformat(),
+            "duration_minutes": m.duration_minutes,
+            "status": m.status,
+            "join_code": m.join_code,
+            "creator_username": str(getattr(creator, "username", "")),
+            "group_id": m.group_id,
+        })
+    return {"meetings": result}
+
+
+@app.post("/meetings/join_by_code")
+async def join_meeting_by_code(
+    payload: MeetingJoinRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    meeting = db.query(Meeting).filter(Meeting.join_code == payload.join_code).first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    if meeting.status == "cancelled":
+        raise HTTPException(status_code=400, detail="Meeting was cancelled")
+    if meeting.status == "ended":
+        raise HTTPException(status_code=400, detail="Meeting has already ended")
+
+    user_id = int(getattr(current_user, 'id', 0))
+    username = str(getattr(current_user, 'username', ''))
+
+    # Having the code is the consent signal here (matches the "instant meeting"
+    # invite-by-picking model) — record as invited if not already.
+    already_invited = db.query(MeetingParticipant).filter(
+        MeetingParticipant.meeting_id == meeting.id,
+        MeetingParticipant.user_id == user_id,
+    ).first()
+    if not already_invited:
+        db.add(MeetingParticipant(meeting_id=meeting.id, user_id=user_id))
+        db.commit()
+
+    if not meeting.conference_id:
+        # First joiner — stand up the conference, same as an instant meeting's
+        # create_conference with no call_id.
+        conf = ConferenceSession(created_by_user_id=user_id, original_call_id=None, is_active=True)
+        db.add(conf)
+        db.flush()
+        db.add(ConferenceParticipant(conference_id=conf.id, user_id=user_id))
+        db.commit()
+        db.refresh(conf)
+
+        meeting.conference_id = conf.id
+        meeting.status = "live"
+        db.commit()
+        return {"conference_id": conf.id, "participants": []}
+
+    # Already live — join the existing conference and tell the other active
+    # participants to connect to us (mirrors conference_accept's broadcast).
+    existing = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == meeting.conference_id,
+        ConferenceParticipant.is_active == True,
+    ).all()
+    if not any(p.user_id == user_id for p in existing):
+        db.add(ConferenceParticipant(conference_id=meeting.conference_id, user_id=user_id))
+        db.commit()
+
+    other_usernames = []
+    for p in existing:
+        if p.user_id == user_id:
+            continue
+        other_user = db.query(User).filter(User.id == p.user_id).first()
+        other_usernames.append(str(getattr(other_user, 'username', '')))
+        await ws_manager.send_to_user(p.user_id, {
+            "type": "conference_peer_connect",
+            "data": {
+                "conference_id": meeting.conference_id,
+                "peer_username": username,
+                "role": "offer",
+            }
+        })
+
+    return {"conference_id": meeting.conference_id, "participants": other_usernames}
+
+
+@app.post("/meetings/{meeting_id}/cancel")
+async def cancel_meeting(
+    meeting_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    if int(meeting.creator_id) != int(getattr(current_user, 'id', 0)):
+        raise HTTPException(status_code=403, detail="Only the creator can cancel this meeting")
+    meeting.status = "cancelled"
+    db.commit()
+    return {"success": True}
+
+
+# ─── Whiteboard ─────────────────────────────────────────────────────────────
+# Ephemeral for v1 — strokes relay live via the existing WS push pattern
+# (matches conference_signal's architecture: REST in, ws_manager push out; the
+# WS connection itself only ever receives ping/pong from clients). Nothing is
+# persisted, so a late joiner or reconnect sees a blank board. Documented
+# tradeoff, not an oversight — keeps v1 to two endpoints and no migration.
+
+async def _whiteboard_targets(payload_username, payload_group_id, sender_id, db):
+    """Resolves a stroke/clear request to the list of user_ids to relay to."""
+    if payload_group_id:
+        membership = db.query(GroupMember).filter(
+            GroupMember.group_id == payload_group_id,
+            GroupMember.user_id == sender_id,
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="Not a member of this group")
+        members = db.query(GroupMember).filter(GroupMember.group_id == payload_group_id).all()
+        return [m.user_id for m in members if m.user_id != sender_id]
+    if payload_username:
+        target = db.query(User).filter(User.username == payload_username, User.is_active == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+        return [target.id]
+    raise HTTPException(status_code=400, detail="Must specify username or group_id")
+
+
+@app.post("/whiteboard/stroke")
+async def whiteboard_stroke(
+    payload: WhiteboardStrokeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    sender_id = int(getattr(current_user, 'id', 0))
+    sender_username = str(getattr(current_user, 'username', ''))
+    targets = await _whiteboard_targets(payload.username, payload.group_id, sender_id, db)
+    for user_id in targets:
+        await ws_manager.send_to_user(user_id, {
+            "type": "whiteboard_stroke",
+            "data": {
+                "from": sender_username,
+                "group_id": payload.group_id,
+                "stroke": payload.stroke,
+            }
+        })
+    return {"success": True}
+
+
+@app.post("/whiteboard/clear")
+async def whiteboard_clear(
+    payload: WhiteboardClearRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    sender_id = int(getattr(current_user, 'id', 0))
+    sender_username = str(getattr(current_user, 'username', ''))
+    targets = await _whiteboard_targets(payload.username, payload.group_id, sender_id, db)
+    for user_id in targets:
+        await ws_manager.send_to_user(user_id, {
+            "type": "whiteboard_clear",
+            "data": {"from": sender_username, "group_id": payload.group_id}
+        })
+    return {"success": True}
 
 
 @app.get("/messages/inbox")

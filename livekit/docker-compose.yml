@@ -1,0 +1,30 @@
+version: "3.9"
+
+# Single-node LiveKit SFU for Dilarion group video (gallery view).
+# No Redis — Redis is only needed for multi-node LiveKit clusters, and this
+# is one VPS. Run alongside the existing Postgres/FastAPI/Ollama/TURN stack.
+#
+# Setup (run on the VPS):
+#   1. cd ~/Pager-proper/livekit   (or wherever this repo lives on the VPS)
+#   2. Generate a key/secret pair:
+#        docker run --rm livekit/livekit-server generate-keys
+#      Copy the printed API Key / API Secret into livekit.yaml (keys: section)
+#      AND into the backend's .env as LIVEKIT_API_KEY / LIVEKIT_API_SECRET.
+#   3. Set LIVEKIT_URL in the backend .env to wss://<your-domain-or-ip>:7880
+#      (reverse-proxy 7880 behind TLS if you want wss:// — see notes below).
+#   4. docker compose up -d
+#   5. Open firewall: 7880/tcp (signaling), 7881/tcp (TCP media fallback),
+#      50000-60000/udp (RTC media - the bulk of the range LiveKit actually uses).
+#   6. pip install -r requirements_postgresql.txt (picks up livekit-api) and
+#      restart the backend (pm2 restart ...) so the new /livekit-token route
+#      and env vars take effect.
+
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: dilarion-livekit
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    network_mode: host
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro

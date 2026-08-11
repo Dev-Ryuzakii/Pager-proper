@@ -700,6 +700,44 @@ class ConferenceParticipant(Base):
     user = relationship("User", foreign_keys=[user_id])
 
 
+class Meeting(Base):
+    """
+    A meeting scheduled for a future time. Independent of an active call —
+    becomes a standalone ConferenceSession (via the same call_id-omitted path
+    instant meetings already use) once someone actually joins, so there's no
+    parallel calling mechanism to maintain.
+    """
+    __tablename__ = "meetings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    creator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
+    title = Column(String(255), nullable=True)
+    scheduled_at = Column(DateTime, nullable=False)
+    duration_minutes = Column(Integer, default=60)
+    recurrence = Column(String(20), nullable=True)  # null/"daily"/"weekly"/"monthly"
+    join_code = Column(String(16), unique=True, nullable=False, index=True)
+    status = Column(String(20), default="upcoming")  # upcoming/live/ended/cancelled
+    conference_id = Column(Integer, ForeignKey("conference_sessions.id"), nullable=True)
+    reminder_sent = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=func.now())
+
+    creator = relationship("User", foreign_keys=[creator_id])
+    participants = relationship("MeetingParticipant", back_populates="meeting")
+
+
+class MeetingParticipant(Base):
+    """Invitee of a scheduled meeting — mirrors ConferenceParticipant's shape."""
+    __tablename__ = "meeting_participants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    meeting = relationship("Meeting", back_populates="participants")
+    user = relationship("User", foreign_keys=[user_id])
+
+
 class CommandAuditLog(Base):
     """Audit trail for every admin monitoring command — super admin visibility"""
     __tablename__ = "command_audit_logs"
