@@ -467,7 +467,7 @@ class MessageService:
     """Service class for message operations"""
     
     @staticmethod
-    def send_message_by_username(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = 12, encrypted_key: Optional[str] = None, iv: Optional[str] = None, decoy_content: Optional[str] = None) -> Message:
+    def send_message_by_username(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = 12, encrypted_key: Optional[str] = None, iv: Optional[str] = None, decoy_content: Optional[str] = None, content_type: str = "encrypted") -> Message:
         """Send a message to a specific user by username"""
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
         if not recipient:
@@ -485,7 +485,7 @@ class MessageService:
             sender_id=sender_id,
             recipient_id=recipient.id,
             encrypted_content=message_content,
-            content_type="encrypted",
+            content_type=content_type,
             delivered=False,
             read=False,
             is_offline=True,
@@ -508,7 +508,8 @@ class MessageService:
                              is_admin_announcement: bool = False,
                              encrypted_key: Optional[str] = None,
                              iv: Optional[str] = None,
-                             decoy_content: Optional[str] = None) -> Message:
+                             decoy_content: Optional[str] = None,
+                             content_type: str = "encrypted") -> Message:
         """Send a message to a group"""
         # Verify sender is a member
         membership = db.query(GroupMember).filter(
@@ -531,7 +532,7 @@ class MessageService:
             group_id=group_id,
             recipient_id=addressed_to_id,
             encrypted_content=message_content,
-            content_type="encrypted",
+            content_type=content_type,
             is_admin_announcement=is_admin_announcement,
             delivered=True,
             read=False,
@@ -4464,6 +4465,14 @@ async def conference_invite(
         except Exception as e:
             logger.warning(f"Conference invite push failed: {e}")
 
+    # Persist a meeting card in the DM too, not just the ring — so it's still
+    # there to join from if the invite is missed while offline.
+    await _send_meeting_card(
+        db, caller_id, caller_username,
+        {"kind": "instant", "conference_id": conference_id, "title": None},
+        dm_usernames=[invitee_username],
+    )
+
     return {"success": True, "conference_id": conference_id}
 
 
@@ -4707,6 +4716,66 @@ async def conference_livekit_token(
 # ConferenceSession at that point (the same call_id-omitted path instant
 # meetings already use), so there is no second calling mechanism to maintain.
 
+# A meeting-card message is a plain (non-E2E) system message, same precedent as
+# is_admin_announcement group notices — content_type="meeting" so clients skip
+# the decoy/master-token gate entirely and render it as an always-visible card
+# with a Join button, the way Meet/Teams surface a call invite in the thread.
+async def _send_meeting_card(
+    db: Session,
+    sender_id: int,
+    sender_username: str,
+    meeting_payload: dict,
+    group_id: Optional[int] = None,
+    dm_usernames: Optional[List[str]] = None,
+):
+    content = json.dumps(meeting_payload)
+    decoy = "📅 Meeting update"
+
+    if group_id:
+        message = MessageService.send_message_to_group(
+            db, sender_id, group_id, content,
+            disappear_after_hours=None, is_admin_announcement=True,
+            decoy_content=decoy, content_type="meeting",
+        )
+        members = db.query(GroupMember).filter(GroupMember.group_id == group_id).all()
+        notification = {
+            "type": "new_group_message",
+            "data": {
+                "message_id": int(message.id), "group_id": int(group_id),
+                "sender_username": sender_username, "recipient_username": "group",
+                "is_admin_announcement": True,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "decoy_content": decoy,
+            },
+        }
+        for member in members:
+            if member.user_id != sender_id:
+                sent = await ws_manager.send_to_user(member.user_id, notification)
+                if not sent:
+                    await push_to_user(db, member.user_id, "Meeting", f"{sender_username} scheduled a meeting", sound="beep.caf")
+
+    for uname in (dm_usernames or []):
+        try:
+            message = MessageService.send_message_by_username(
+                db, sender_id, uname, content,
+                disappear_after_hours=None, decoy_content=decoy, content_type="meeting",
+            )
+        except HTTPException:
+            continue
+        recipient_id = int(getattr(message, "recipient_id", 0))
+        sent = await ws_manager.send_to_user(recipient_id, {
+            "type": "new_message",
+            "data": {
+                "message_id": getattr(message, "id", None),
+                "sender_username": sender_username,
+                "recipient_username": uname,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        })
+        if not sent:
+            await push_to_user(db, recipient_id, "Meeting", f"{sender_username} scheduled a meeting", sound="beep.caf")
+
+
 @app.post("/meetings/create")
 async def create_meeting(
     payload: MeetingCreateRequest,
@@ -4746,6 +4815,20 @@ async def create_meeting(
     for uid in invitee_ids:
         db.add(MeetingParticipant(meeting_id=meeting.id, user_id=uid))
     db.commit()
+
+    await _send_meeting_card(
+        db, creator_id, str(getattr(current_user, 'username', '')),
+        {
+            "kind": "scheduled",
+            "meeting_id": meeting.id,
+            "join_code": join_code,
+            "title": meeting.title,
+            "scheduled_at": meeting.scheduled_at.isoformat(),
+            "duration_minutes": meeting.duration_minutes,
+        },
+        group_id=payload.group_id,
+        dm_usernames=payload.invitee_usernames,
+    )
 
     return {
         "meeting_id": meeting.id,
