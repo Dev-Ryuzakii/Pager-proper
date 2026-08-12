@@ -4185,6 +4185,16 @@ TURN_REST_PORT = int(os.getenv("TURN_REST_PORT", "3479"))
 TURN_TLS_PORT = int(os.getenv("TURN_REST_TLS_PORT", "5350"))
 TURN_CRED_TTL = int(os.getenv("TURN_CRED_TTL_SECONDS", str(12 * 3600)))
 
+# Fallback for coturn deployments running lt-cred-mech (fixed username/password
+# in turnserver.conf) instead of the REST API's static-auth-secret. Used only
+# when TURN_AUTH_SECRET is unset — set both to match turnserver.conf's `user=`
+# line, and TURN_HOST to coturn's external-ip (or a DNS name pointed at it).
+TURN_STATIC_USERNAME = os.getenv("TURN_STATIC_USERNAME", "")
+TURN_STATIC_CREDENTIAL = os.getenv("TURN_STATIC_CREDENTIAL", "")
+TURN_HOST = os.getenv("TURN_HOST", "")
+TURN_PORT = int(os.getenv("TURN_PORT", "3478"))
+TURN_STATIC_TLS_PORT = int(os.getenv("TURN_STATIC_TLS_PORT", "5349"))
+
 # Answering a call requires the master token: it proves the owner is the one
 # picking up, so someone holding the unlocked handset cannot take their calls.
 # Deliberately on by default; set REQUIRE_MASTER_TOKEN_FOR_CALLS=0 to disable.
@@ -4246,9 +4256,21 @@ async def get_ice_servers(current_user: User = Depends(get_current_user)):
             "credential": credential,
         })
         ttl = TURN_CRED_TTL
+    elif TURN_STATIC_USERNAME and TURN_STATIC_CREDENTIAL and TURN_HOST:
+        ice_servers.append({
+            "urls": [
+                f"turn:{TURN_HOST}:{TURN_PORT}",
+                f"turn:{TURN_HOST}:{TURN_PORT}?transport=tcp",
+                f"turns:{TURN_HOST}:{TURN_STATIC_TLS_PORT}?transport=tcp",
+            ],
+            "username": TURN_STATIC_USERNAME,
+            "credential": TURN_STATIC_CREDENTIAL,
+        })
+        ttl = TURN_CRED_TTL
     else:
-        # No secret configured — clients fall back to their built-in servers.
-        logger.warning("TURN_AUTH_SECRET not set; serving STUN-only ICE config")
+        # No secret and no static credentials configured — clients fall back
+        # to their built-in servers (plus the public relay below, if enabled).
+        logger.warning("No TURN credentials configured; serving STUN-only ICE config")
         ttl = 0
 
     if TURN_PUBLIC_FALLBACK:
