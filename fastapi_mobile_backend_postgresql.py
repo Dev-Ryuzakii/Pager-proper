@@ -141,13 +141,15 @@ class MeetingJoinRequest(BaseModel):
     join_code: str = Field(..., description="Short code shared with invitees")
 
 class WhiteboardStrokeRequest(BaseModel):
-    username: Optional[str] = Field(None, description="1:1 target — exactly one of username/group_id")
-    group_id: Optional[int] = Field(None, description="Group target — exactly one of username/group_id")
+    username: Optional[str] = Field(None, description="1:1 target — exactly one of username/group_id/conference_id")
+    group_id: Optional[int] = Field(None, description="Group target — exactly one of username/group_id/conference_id")
+    conference_id: Optional[int] = Field(None, description="Meeting target — exactly one of username/group_id/conference_id")
     stroke: Dict[str, Any] = Field(..., description="Opaque point/color/width payload, relayed as-is")
 
 class WhiteboardClearRequest(BaseModel):
-    username: Optional[str] = Field(None, description="1:1 target — exactly one of username/group_id")
-    group_id: Optional[int] = Field(None, description="Group target — exactly one of username/group_id")
+    username: Optional[str] = Field(None, description="1:1 target — exactly one of username/group_id/conference_id")
+    group_id: Optional[int] = Field(None, description="Group target — exactly one of username/group_id/conference_id")
+    conference_id: Optional[int] = Field(None, description="Meeting target — exactly one of username/group_id/conference_id")
 
 class MasterToken(BaseModel):
     mastertoken: str = Field(..., description="Master decryption token")
@@ -4682,6 +4684,7 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
 @app.get("/calls/conference/{conference_id}/livekit-token")
 async def conference_livekit_token(
     conference_id: int,
+    display_name: Optional[str] = Query(None, max_length=50, description="Editable display name — identity stays the real username"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
@@ -4702,11 +4705,14 @@ async def conference_livekit_token(
     if getattr(part, 'status', 'admitted') != 'admitted':
         raise HTTPException(status_code=403, detail="Waiting for the host to admit you")
 
+    # identity is always the real authenticated username (can't be spoofed —
+    # that's what every other endpoint keys admit/deny/invite off of); name is
+    # a cosmetic label the lobby lets you edit before joining.
     room_name = f"conf-{conference_id}"
     token = (
         lk_api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
         .with_identity(username)
-        .with_name(username)
+        .with_name((display_name or "").strip() or username)
         .with_grants(lk_api.VideoGrants(room_join=True, room=room_name))
         .with_ttl(timedelta(hours=4))
         .to_jwt()
@@ -5092,8 +5098,21 @@ async def cancel_meeting(
 # persisted, so a late joiner or reconnect sees a blank board. Documented
 # tradeoff, not an oversight — keeps v1 to two endpoints and no migration.
 
-async def _whiteboard_targets(payload_username, payload_group_id, sender_id, db):
+async def _whiteboard_targets(payload_username, payload_group_id, payload_conference_id, sender_id, db):
     """Resolves a stroke/clear request to the list of user_ids to relay to."""
+    if payload_conference_id:
+        membership = db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.conference_id == payload_conference_id,
+            ConferenceParticipant.user_id == sender_id,
+            ConferenceParticipant.is_active == True,
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="Not an active participant in this conference")
+        members = db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.conference_id == payload_conference_id,
+            ConferenceParticipant.is_active == True,
+        ).all()
+        return [m.user_id for m in members if m.user_id != sender_id]
     if payload_group_id:
         membership = db.query(GroupMember).filter(
             GroupMember.group_id == payload_group_id,
@@ -5108,7 +5127,7 @@ async def _whiteboard_targets(payload_username, payload_group_id, sender_id, db)
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
         return [target.id]
-    raise HTTPException(status_code=400, detail="Must specify username or group_id")
+    raise HTTPException(status_code=400, detail="Must specify username, group_id, or conference_id")
 
 
 @app.post("/whiteboard/stroke")
@@ -5119,13 +5138,14 @@ async def whiteboard_stroke(
 ):
     sender_id = int(getattr(current_user, 'id', 0))
     sender_username = str(getattr(current_user, 'username', ''))
-    targets = await _whiteboard_targets(payload.username, payload.group_id, sender_id, db)
+    targets = await _whiteboard_targets(payload.username, payload.group_id, payload.conference_id, sender_id, db)
     for user_id in targets:
         await ws_manager.send_to_user(user_id, {
             "type": "whiteboard_stroke",
             "data": {
                 "from": sender_username,
                 "group_id": payload.group_id,
+                "conference_id": payload.conference_id,
                 "stroke": payload.stroke,
             }
         })
@@ -5140,11 +5160,11 @@ async def whiteboard_clear(
 ):
     sender_id = int(getattr(current_user, 'id', 0))
     sender_username = str(getattr(current_user, 'username', ''))
-    targets = await _whiteboard_targets(payload.username, payload.group_id, sender_id, db)
+    targets = await _whiteboard_targets(payload.username, payload.group_id, payload.conference_id, sender_id, db)
     for user_id in targets:
         await ws_manager.send_to_user(user_id, {
             "type": "whiteboard_clear",
-            "data": {"from": sender_username, "group_id": payload.group_id}
+            "data": {"from": sender_username, "group_id": payload.group_id, "conference_id": payload.conference_id}
         })
     return {"success": True}
 
