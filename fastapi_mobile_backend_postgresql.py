@@ -120,6 +120,13 @@ class GroupMessageSend(BaseModel):
     iv: Optional[str] = Field(None, description="Initialization Vector for AES")
     decoy_content: Optional[str] = Field(None, description="Client-generated decoy content")
 
+class ConferenceMessageSend(BaseModel):
+    conference_id: int = Field(..., description="ID of the meeting/conference to send message to")
+    message: str = Field(..., min_length=1, description="Message content")
+    encrypted_key: Optional[str] = Field(None, description="AES key encrypted with RSA (JSON map of username to key, like group chat)")
+    iv: Optional[str] = Field(None, description="Initialization Vector for AES")
+    decoy_content: Optional[str] = Field(None, description="Client-generated decoy content")
+
 class MessageSend(BaseModel):
     username: str = Field(..., description="Recipient username")
     message: str = Field(..., min_length=1, description="Message content")
@@ -550,7 +557,42 @@ class MessageService:
         db.commit()
         db.refresh(message)
         return message
-    
+
+    @staticmethod
+    def send_message_to_conference(db: Session, sender_id: int, conference_id: int, message_content: str,
+                                    encrypted_key: Optional[str] = None,
+                                    iv: Optional[str] = None,
+                                    decoy_content: Optional[str] = None,
+                                    content_type: str = "encrypted") -> Message:
+        """Send a message to everyone currently admitted in a meeting. Ephemeral in spirit like the
+        in-meeting whiteboard — scoped to the conference, not persisted into any DM/group thread."""
+        membership = db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.conference_id == conference_id,
+            ConferenceParticipant.user_id == sender_id,
+            ConferenceParticipant.is_active == True,
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="Not an active participant in this conference")
+
+        decoy_text = decoy_content if decoy_content else FakeTextGenerator.generate_decoy_text_for_message(message_content)
+
+        message = Message(
+            sender_id=sender_id,
+            conference_id=conference_id,
+            encrypted_content=message_content,
+            content_type=content_type,
+            delivered=True,
+            read=False,
+            decoy_content=decoy_text,
+            encrypted_key=encrypted_key,
+            iv=iv,
+        )
+
+        db.add(message)
+        db.commit()
+        db.refresh(message)
+        return message
+
     @staticmethod
     def get_user_messages(db: Session, user_id: int, limit: int = 50) -> List[Message]:
         """Get all messages for a user (direct and group)"""
@@ -5748,6 +5790,91 @@ async def send_group_message(
     except Exception as e:
         logger.error(f"Send group message error: {e}")
         raise HTTPException(status_code=500, detail="Failed to send group message")
+
+@app.post("/messages/conference/send")
+async def send_conference_message(
+    payload: ConferenceMessageSend,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Send a message to everyone currently admitted in a meeting."""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        message = MessageService.send_message_to_conference(
+            db, user_id, payload.conference_id, payload.message,
+            payload.encrypted_key, payload.iv, payload.decoy_content
+        )
+
+        participants = db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.conference_id == payload.conference_id,
+            ConferenceParticipant.is_active == True,
+        ).all()
+        sender_username = str(getattr(current_user, 'username', ''))
+
+        notification = {
+            "type": "new_conference_message",
+            "data": {
+                "message_id": int(message.id),
+                "conference_id": int(payload.conference_id),
+                "sender_username": sender_username,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "decoy_content": getattr(message, 'decoy_content', '')
+            }
+        }
+
+        for participant in participants:
+            if participant.user_id != user_id:
+                await ws_manager.send_to_user(participant.user_id, notification)
+
+        return {
+            "status": "sent",
+            "message_id": int(message.id)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Send conference message error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send conference message")
+
+@app.get("/messages/conference/{conference_id}")
+async def get_conference_conversation(
+    conference_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Get all chat messages sent so far in a meeting."""
+    try:
+        user_id = int(getattr(current_user, 'id', 0))
+        membership = db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.conference_id == conference_id,
+            ConferenceParticipant.user_id == user_id,
+            ConferenceParticipant.is_active == True,
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="Not an active participant in this conference")
+
+        msgs = db.query(Message).filter(Message.conference_id == conference_id).order_by(Message.timestamp.asc()).limit(500).all()
+
+        result = []
+        for msg in msgs:
+            sender = db.query(User).filter(User.id == msg.sender_id).first()
+            result.append({
+                "id": int(getattr(msg, 'id', 0)),
+                "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
+                "content": str(getattr(msg, 'encrypted_content', '')),
+                "content_type": str(getattr(msg, 'content_type', '')),
+                "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
+                "decoy_content": getattr(msg, 'decoy_content', ''),
+                "encrypted_key": getattr(msg, 'encrypted_key', None),
+                "iv": getattr(msg, 'iv', None),
+            })
+
+        return {"messages": result, "count": len(result)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Conference conversation fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve conference conversation")
 
 @app.get("/messages/group/{group_id}")
 async def get_group_conversation(

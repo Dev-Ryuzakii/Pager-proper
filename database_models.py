@@ -72,7 +72,8 @@ class Message(Base):
     sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     recipient_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
-    
+    conference_id = Column(Integer, ForeignKey("conference_sessions.id"), nullable=True)
+
     # Message content (encrypted)
     encrypted_content = Column(Text, nullable=False)
     content_type = Column(String(50), default="text")  # text, file, image, etc.
