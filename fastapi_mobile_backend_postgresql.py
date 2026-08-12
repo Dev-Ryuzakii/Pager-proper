@@ -135,6 +135,7 @@ class MeetingCreateRequest(BaseModel):
     group_id: Optional[int] = Field(None, description="Invite an entire group")
     invitee_usernames: Optional[List[str]] = Field(None, description="Ad-hoc invitees, in addition to any group")
     recurrence: Optional[str] = Field(None, description="null, daily, weekly, or monthly")
+    waiting_room_enabled: Optional[bool] = Field(False, description="Gate join_by_code behind host admission")
 
 class MeetingJoinRequest(BaseModel):
     join_code: str = Field(..., description="Short code shared with invitees")
@@ -4698,6 +4699,8 @@ async def conference_livekit_token(
     ).first()
     if not part:
         raise HTTPException(status_code=403, detail="Not an active participant in this conference")
+    if getattr(part, 'status', 'admitted') != 'admitted':
+        raise HTTPException(status_code=403, detail="Waiting for the host to admit you")
 
     room_name = f"conf-{conference_id}"
     token = (
@@ -4794,6 +4797,7 @@ async def create_meeting(
         recurrence=payload.recurrence,
         join_code=join_code,
         status="upcoming",
+        waiting_room_enabled=bool(payload.waiting_room_enabled),
     )
     db.add(meeting)
     db.commit()
@@ -4884,6 +4888,7 @@ async def join_meeting_by_code(
 
     user_id = int(getattr(current_user, 'id', 0))
     username = str(getattr(current_user, 'username', ''))
+    is_host = user_id == int(meeting.creator_id)
 
     # Having the code is the consent signal here (matches the "instant meeting"
     # invite-by-picking model) — record as invited if not already.
@@ -4896,32 +4901,68 @@ async def join_meeting_by_code(
         db.commit()
 
     if not meeting.conference_id:
-        # First joiner — stand up the conference, same as an instant meeting's
-        # create_conference with no call_id.
-        conf = ConferenceSession(created_by_user_id=user_id, original_call_id=None, is_active=True)
+        # First to hit the code stands up the conference row (bookkeeping only
+        # — no LiveKit room exists until someone with an admitted token actually
+        # calls /livekit-token), same call_id-omitted path an instant meeting
+        # uses. Guests can sit in the lobby before the host has even joined.
+        conf = ConferenceSession(created_by_user_id=meeting.creator_id, original_call_id=None, is_active=True)
         db.add(conf)
         db.flush()
-        db.add(ConferenceParticipant(conference_id=conf.id, user_id=user_id))
+        status = "admitted" if (is_host or not meeting.waiting_room_enabled) else "waiting"
+        db.add(ConferenceParticipant(conference_id=conf.id, user_id=user_id, status=status))
         db.commit()
         db.refresh(conf)
 
         meeting.conference_id = conf.id
         meeting.status = "live"
         db.commit()
-        return {"conference_id": conf.id, "participants": []}
 
-    # Already live — join the existing conference and tell the other active
-    # participants to connect to us (mirrors conference_accept's broadcast).
-    existing = db.query(ConferenceParticipant).filter(
+        if status == "waiting":
+            await ws_manager.send_to_user(meeting.creator_id, {
+                "type": "conference_join_request",
+                "data": {"conference_id": conf.id, "username": username, "user_id": user_id},
+            })
+            return {"conference_id": conf.id, "status": "waiting", "participants": []}
+        return {"conference_id": conf.id, "status": "admitted", "participants": []}
+
+    # Conference already exists.
+    existing_admitted = db.query(ConferenceParticipant).filter(
         ConferenceParticipant.conference_id == meeting.conference_id,
         ConferenceParticipant.is_active == True,
+        ConferenceParticipant.status == "admitted",
     ).all()
-    if not any(p.user_id == user_id for p in existing):
-        db.add(ConferenceParticipant(conference_id=meeting.conference_id, user_id=user_id))
-        db.commit()
 
+    my_row = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == meeting.conference_id,
+        ConferenceParticipant.user_id == user_id,
+    ).first()
+
+    if is_host or not meeting.waiting_room_enabled:
+        if not my_row:
+            db.add(ConferenceParticipant(conference_id=meeting.conference_id, user_id=user_id, status="admitted"))
+            db.commit()
+        elif my_row.status != "admitted":
+            setattr(my_row, 'status', 'admitted')
+            db.commit()
+    else:
+        if not my_row:
+            db.add(ConferenceParticipant(conference_id=meeting.conference_id, user_id=user_id, status="waiting"))
+            db.commit()
+            await ws_manager.send_to_user(meeting.creator_id, {
+                "type": "conference_join_request",
+                "data": {"conference_id": meeting.conference_id, "username": username, "user_id": user_id},
+            })
+            return {"conference_id": meeting.conference_id, "status": "waiting", "participants": []}
+        elif my_row.status == "waiting":
+            return {"conference_id": meeting.conference_id, "status": "waiting", "participants": []}
+        elif my_row.status == "denied":
+            raise HTTPException(status_code=403, detail="The host denied your request to join")
+
+    # Admitted (host, waiting room off, or already let in on a prior call) —
+    # join and tell the other active participants to connect to us (mirrors
+    # conference_accept's broadcast).
     other_usernames = []
-    for p in existing:
+    for p in existing_admitted:
         if p.user_id == user_id:
             continue
         other_user = db.query(User).filter(User.id == p.user_id).first()
@@ -4935,7 +4976,97 @@ async def join_meeting_by_code(
             }
         })
 
-    return {"conference_id": meeting.conference_id, "participants": other_usernames}
+    return {"conference_id": meeting.conference_id, "status": "admitted", "participants": other_usernames}
+
+
+def _conference_host_id(db: Session, conference_id: int, conf: Optional[ConferenceSession] = None) -> int:
+    """The real host: the Meeting's creator when this conference came from a
+    scheduled meeting (ConferenceSession.created_by_user_id is just whoever's
+    join_by_code call happened to stand the row up first, not necessarily the
+    host), falling back to created_by_user_id for instant meetings."""
+    meeting = db.query(Meeting).filter(Meeting.conference_id == conference_id).first()
+    if meeting:
+        return int(meeting.creator_id)
+    conf = conf or db.query(ConferenceSession).filter(ConferenceSession.id == conference_id).first()
+    return int(getattr(conf, 'created_by_user_id', 0)) if conf else 0
+
+
+@app.get("/calls/conference/{conference_id}/waiting-room")
+async def list_waiting_room(
+    conference_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Host-only: who's waiting to be let in."""
+    user_id = int(getattr(current_user, 'id', 0))
+    if _conference_host_id(db, conference_id) != user_id:
+        raise HTTPException(status_code=403, detail="Only the host can view the waiting room")
+
+    waiting = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.status == "waiting",
+    ).all()
+    return {
+        "waiting": [
+            {"user_id": p.user_id, "username": str(getattr(db.query(User).filter(User.id == p.user_id).first(), 'username', ''))}
+            for p in waiting
+        ]
+    }
+
+
+@app.post("/calls/conference/{conference_id}/waiting-room/{target_user_id}/admit")
+async def admit_from_waiting_room(
+    conference_id: int,
+    target_user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    host_id = int(getattr(current_user, 'id', 0))
+    if _conference_host_id(db, conference_id) != host_id:
+        raise HTTPException(status_code=403, detail="Only the host can admit participants")
+
+    part = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.user_id == target_user_id,
+    ).first()
+    if not part:
+        raise HTTPException(status_code=404, detail="No such participant")
+    setattr(part, 'status', 'admitted')
+    db.commit()
+
+    await ws_manager.send_to_user(target_user_id, {
+        "type": "conference_admitted",
+        "data": {"conference_id": conference_id},
+    })
+    return {"success": True}
+
+
+@app.post("/calls/conference/{conference_id}/waiting-room/{target_user_id}/deny")
+async def deny_from_waiting_room(
+    conference_id: int,
+    target_user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    host_id = int(getattr(current_user, 'id', 0))
+    if _conference_host_id(db, conference_id) != host_id:
+        raise HTTPException(status_code=403, detail="Only the host can deny participants")
+
+    part = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.user_id == target_user_id,
+    ).first()
+    if not part:
+        raise HTTPException(status_code=404, detail="No such participant")
+    setattr(part, 'status', 'denied')
+    setattr(part, 'is_active', False)
+    db.commit()
+
+    await ws_manager.send_to_user(target_user_id, {
+        "type": "conference_denied",
+        "data": {"conference_id": conference_id},
+    })
+    return {"success": True}
 
 
 @app.post("/meetings/{meeting_id}/cancel")

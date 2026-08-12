@@ -695,6 +695,11 @@ class ConferenceParticipant(Base):
     joined_at = Column(DateTime, default=func.now())
     left_at = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
+    # "admitted"/"waiting"/"denied" — separate from is_active, which already
+    # means "invited but hasn't accepted yet" on the invite+accept path. This
+    # only matters for the join-by-code path when the host has a waiting room
+    # on: rows there start "waiting" and never reach LiveKit until admitted.
+    status = Column(String(20), default="admitted")
 
     conference = relationship("ConferenceSession", back_populates="participants")
     user = relationship("User", foreign_keys=[user_id])
@@ -720,6 +725,10 @@ class Meeting(Base):
     status = Column(String(20), default="upcoming")  # upcoming/live/ended/cancelled
     conference_id = Column(Integer, ForeignKey("conference_sessions.id"), nullable=True)
     reminder_sent = Column(Boolean, default=False)
+    # Host-set at scheduling time. Only gates /meetings/join_by_code (anyone
+    # with the code) — explicit per-user invites already carry the host's
+    # consent, so instant meetings (invite-only, no open code) don't need this.
+    waiting_room_enabled = Column(Boolean, default=False)
     created_at = Column(DateTime, default=func.now())
 
     creator = relationship("User", foreign_keys=[creator_id])
