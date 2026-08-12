@@ -1,23 +1,36 @@
 version: "3.9"
 
-# Single-node LiveKit SFU for Dilarion group video (gallery view).
-# No Redis — Redis is only needed for multi-node LiveKit clusters, and this
-# is one VPS. Run alongside the existing Postgres/FastAPI/Ollama/TURN stack.
+# Single-node LiveKit SFU + Egress (recording) for Dilarion group video.
+# Run alongside the existing Postgres/FastAPI/Ollama/TURN stack.
 #
 # Setup (run on the VPS):
 #   1. cd ~/Pager-proper/livekit   (or wherever this repo lives on the VPS)
 #   2. Generate a key/secret pair:
 #        docker run --rm livekit/livekit-server generate-keys
-#      Copy the printed API Key / API Secret into livekit.yaml (keys: section)
-#      AND into the backend's .env as LIVEKIT_API_KEY / LIVEKIT_API_SECRET.
+#      Copy the printed API Key / API Secret into BOTH livekit.yaml (keys:)
+#      AND egress.yaml (api_key/api_secret) AND the backend's .env as
+#      LIVEKIT_API_KEY / LIVEKIT_API_SECRET — all four must match.
 #   3. Set LIVEKIT_URL in the backend .env to wss://<your-domain-or-ip>:7880
 #      (reverse-proxy 7880 behind TLS if you want wss:// — see notes below).
-#   4. docker compose up -d
-#   5. Open firewall: 7880/tcp (signaling), 7881/tcp (TCP media fallback),
+#   4. Create the recordings dir the backend already expects (must match its
+#      cwd — confirm with `pm2 show pager-backend | grep cwd`, then use that
+#      exact absolute path on BOTH sides of the egress volume mount below):
+#        mkdir -p ~/Pager-proper/meeting_recordings
+#   5. Edit the egress volume mount two lines down to that same absolute path.
+#   6. docker compose up -d
+#   7. Open firewall: 7880/tcp (signaling), 7881/tcp (TCP media fallback),
 #      50000-60000/udp (RTC media - the bulk of the range LiveKit actually uses).
-#   6. pip install -r requirements_postgresql.txt (picks up livekit-api) and
-#      restart the backend (pm2 restart ...) so the new /livekit-token route
-#      and env vars take effect.
+#   8. pip install -r requirements_postgresql.txt (picks up livekit-api) and
+#      restart the backend (pm2 restart ...) so the livekit-token route,
+#      recording start/stop, and env vars take effect.
+#
+# CAPACITY NOTE: Egress runs a real headless Chrome per active recording to
+# render the composite layout — this is meaningfully more CPU/RAM than
+# LiveKit's own SFU relay work. On an 8 vCPU / no-GPU box already running
+# Postgres, the backend, Ollama, LiveKit, and coturn, more than one or two
+# concurrent recordings will likely contend with everything else. Watch
+# `htop` during the first real recording before treating this as safe to
+# use at any scale.
 
 services:
   livekit:
@@ -28,3 +41,31 @@ services:
     network_mode: host
     volumes:
       - ./livekit.yaml:/etc/livekit.yaml:ro
+
+  redis:
+    image: redis:7-alpine
+    container_name: dilarion-redis
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - redis-data:/data
+
+  egress:
+    image: livekit/egress:latest
+    container_name: dilarion-egress
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - EGRESS_CONFIG_FILE=/etc/egress.yaml
+    volumes:
+      - ./egress.yaml:/etc/egress.yaml:ro
+      # EDIT: must be the exact same absolute path on both sides — this is
+      # what lets the backend (running directly on the host, not in docker)
+      # see the finished recording once Egress writes it.
+      - /home/cmdops/Pager-proper/meeting_recordings:/home/cmdops/Pager-proper/meeting_recordings
+    cap_add:
+      - SYS_ADMIN   # headless Chrome's sandbox needs this under Docker
+    shm_size: "1gb"  # Chrome is unstable with Docker's tiny default /dev/shm
+
+volumes:
+  redis-data:
