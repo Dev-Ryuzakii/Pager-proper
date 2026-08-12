@@ -706,6 +706,30 @@ class ConferenceParticipant(Base):
     user = relationship("User", foreign_keys=[user_id])
 
 
+class MeetingRecording(Base):
+    """
+    A LiveKit room-composite (mux of every published track) recording of a
+    conference, rendered server-side by LiveKit Egress and written to local
+    disk. Superadmin-only (Drive site) — never exposed to regular users, and
+    unrelated to the E2EE encrypted_content DMs/groups use: a recording
+    captures the call itself, not message contents.
+    """
+    __tablename__ = "meeting_recordings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conference_id = Column(Integer, ForeignKey("conference_sessions.id"), nullable=False)
+    started_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    egress_id = Column(String(64), nullable=False)
+    file_path = Column(String(512), nullable=True)
+    status = Column(String(20), default="recording")  # recording/completed/failed
+    file_size = Column(Integer, nullable=True)
+    started_at = Column(DateTime, default=func.now())
+    ended_at = Column(DateTime, nullable=True)
+
+    conference = relationship("ConferenceSession", foreign_keys=[conference_id])
+    started_by = relationship("User", foreign_keys=[started_by_user_id])
+
+
 class Meeting(Base):
     """
     A meeting scheduled for a future time. Independent of an active call —

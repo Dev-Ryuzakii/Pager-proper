@@ -52,7 +52,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -4744,6 +4744,12 @@ LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
 
+# Room-composite recordings (Egress renders every published track into one
+# MP4) — superadmin-only, written here rather than media_uploads/ since
+# recordings aren't part of the encrypted chat/media model at all.
+RECORDINGS_DIR = "meeting_recordings"
+os.makedirs(RECORDINGS_DIR, exist_ok=True)
+
 
 @app.get("/calls/conference/{conference_id}/livekit-token")
 async def conference_livekit_token(
@@ -4782,6 +4788,120 @@ async def conference_livekit_token(
         .to_jwt()
     )
     return {"url": LIVEKIT_URL, "token": token, "room": room_name}
+
+
+@app.post("/calls/conference/{conference_id}/recording/start")
+async def start_conference_recording(
+    conference_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Host-only. Starts a LiveKit Egress room-composite recording of the meeting."""
+    if not (lk_api and LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        raise HTTPException(status_code=503, detail="Group video is not configured on this server")
+
+    user_id = int(getattr(current_user, 'id', 0))
+    if _conference_host_id(db, conference_id) != user_id:
+        raise HTTPException(status_code=403, detail="Only the host can start recording")
+
+    existing = db.query(MeetingRecording).filter(
+        MeetingRecording.conference_id == conference_id,
+        MeetingRecording.status == "recording",
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Already recording")
+
+    room_name = f"conf-{conference_id}"
+    filename = f"{room_name}-{int(datetime.now(timezone.utc).timestamp())}.mp4"
+    file_path = os.path.join(RECORDINGS_DIR, filename)
+
+    api = lk_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        info = await api.egress.start_room_composite_egress(
+            lk_api.RoomCompositeEgressRequest(
+                room_name=room_name,
+                file_outputs=[lk_api.EncodedFileOutput(file_type=lk_api.EncodedFileType.MP4, filepath=file_path)],
+            )
+        )
+    except Exception as e:
+        logger.error(f"Egress start error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to start recording (is the Egress service running?)")
+    finally:
+        await api.aclose()
+
+    rec = MeetingRecording(
+        conference_id=conference_id,
+        started_by_user_id=user_id,
+        egress_id=info.egress_id,
+        file_path=file_path,
+        status="recording",
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+
+    members = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.is_active == True,
+    ).all()
+    for m in members:
+        await ws_manager.send_to_user(m.user_id, {
+            "type": "conference_recording_started",
+            "data": {"conference_id": conference_id},
+        })
+
+    return {"recording_id": rec.id, "status": "recording"}
+
+
+@app.post("/calls/conference/{conference_id}/recording/stop")
+async def stop_conference_recording(
+    conference_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Host-only. Stops the meeting's in-progress recording, if any."""
+    if not (lk_api and LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        raise HTTPException(status_code=503, detail="Group video is not configured on this server")
+
+    user_id = int(getattr(current_user, 'id', 0))
+    if _conference_host_id(db, conference_id) != user_id:
+        raise HTTPException(status_code=403, detail="Only the host can stop recording")
+
+    rec = db.query(MeetingRecording).filter(
+        MeetingRecording.conference_id == conference_id,
+        MeetingRecording.status == "recording",
+    ).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="No recording in progress")
+
+    api = lk_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        await api.egress.stop_egress(lk_api.StopEgressRequest(egress_id=rec.egress_id))
+    except Exception as e:
+        logger.error(f"Egress stop error: {e}")
+        # Fall through and mark it stopped locally anyway — Egress considers
+        # a room going empty an implicit stop too, so this call can 404/409
+        # legitimately if that already happened.
+    finally:
+        await api.aclose()
+
+    setattr(rec, 'status', 'completed')
+    setattr(rec, 'ended_at', datetime.now(timezone.utc))
+    if os.path.exists(rec.file_path):
+        setattr(rec, 'file_size', os.path.getsize(rec.file_path))
+    db.commit()
+
+    members = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.is_active == True,
+    ).all()
+    for m in members:
+        await ws_manager.send_to_user(m.user_id, {
+            "type": "conference_recording_stopped",
+            "data": {"conference_id": conference_id},
+        })
+
+    return {"recording_id": rec.id, "status": "completed"}
 
 
 # ─── Scheduled meetings ────────────────────────────────────────────────────────
@@ -9523,6 +9643,124 @@ async def raw_upload_health_check():
         "status": "running",
         "version": "1.0.0"
     }
+
+# ─── Drive (superadmin-only, separate site) ────────────────────────────────────
+# Lists what's already on disk: uploaded chat/group media and meeting
+# recordings. Media stays E2EE — encrypted_content/encrypted_file_path are
+# only ever decryptable by the recipient's own private key, which this
+# server never has, so the drive can only ever offer metadata + the raw
+# encrypted blob, never plaintext. Recordings are plain MP4 (Egress renders
+# the call itself, not message contents) and download directly.
+
+@app.get("/admin/drive/media")
+async def admin_list_media(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    rows = db.query(Media).order_by(Media.id.desc()).offset(offset).limit(limit).all()
+    total = db.query(Media).count()
+    items = []
+    for m in rows:
+        sender = db.query(User).filter(User.id == m.sender_id).first()
+        recipient = db.query(User).filter(User.id == m.recipient_id).first() if m.recipient_id else None
+        items.append({
+            "media_id": m.media_id,
+            "filename": m.filename,
+            "file_size": m.file_size,
+            "media_type": m.media_type,
+            "content_type": m.content_type,
+            "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
+            "recipient": str(getattr(recipient, 'username', '')) if recipient else None,
+            "group_id": m.group_id,
+        })
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/admin/drive/media/download/{media_id}")
+async def admin_download_drive_media(
+    media_id: str,
+    request: Request,
+    token: Optional[str] = None,
+    db: Session = Depends(get_database_session),
+):
+    """Downloads the raw ENCRYPTED blob as stored — cannot be decrypted server-side.
+    Accepts ?token= too, for direct browser download links on the Drive site."""
+    raw_token = token
+    if not raw_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            raw_token = auth_header[7:]
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    session = SessionService.validate_session(db, raw_token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    if not user or not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    m = db.query(Media).filter(Media.media_id == media_id).first()
+    if not m or not os.path.exists(m.encrypted_file_path):
+        raise HTTPException(status_code=404, detail="Media not found")
+    return FileResponse(m.encrypted_file_path, filename=m.filename, media_type="application/octet-stream")
+
+
+@app.get("/admin/drive/recordings")
+async def admin_list_recordings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    rows = db.query(MeetingRecording).order_by(MeetingRecording.id.desc()).offset(offset).limit(limit).all()
+    total = db.query(MeetingRecording).count()
+    items = []
+    for r in rows:
+        starter = db.query(User).filter(User.id == r.started_by_user_id).first()
+        items.append({
+            "id": r.id,
+            "conference_id": r.conference_id,
+            "started_by": str(getattr(starter, 'username', '')) if starter else "unknown",
+            "status": r.status,
+            "file_size": r.file_size,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "ended_at": r.ended_at.isoformat() if r.ended_at else None,
+        })
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/admin/drive/recordings/download/{recording_id}")
+async def admin_download_drive_recording(
+    recording_id: int,
+    request: Request,
+    token: Optional[str] = None,
+    db: Session = Depends(get_database_session),
+):
+    raw_token = token
+    if not raw_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            raw_token = auth_header[7:]
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    session = SessionService.validate_session(db, raw_token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    if not user or not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    r = db.query(MeetingRecording).filter(MeetingRecording.id == recording_id).first()
+    if not r or not r.file_path or not os.path.exists(r.file_path):
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return FileResponse(r.file_path, filename=os.path.basename(r.file_path), media_type="video/mp4")
+
 
 # ─── Snapshot endpoints (battery, network, device-info, clipboard, screenshot, photo) ───
 
