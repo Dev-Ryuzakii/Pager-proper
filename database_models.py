@@ -3,7 +3,7 @@ PostgreSQL Database Models for Secure Messaging System
 Using SQLAlchemy ORM for data modeling and relationships
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, LargeBinary, ForeignKey, Float, JSON
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, LargeBinary, ForeignKey, Float, JSON, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, relationship
 from sqlalchemy.sql import func
 from datetime import datetime
@@ -107,16 +107,78 @@ class Message(Base):
     # Broadcast and targeting
     is_admin_announcement = Column(Boolean, default=False)
     is_broadcast = Column(Boolean, default=False)
-    
+
+    # Threaded replies — nullable self-reference, no ORM relationship (just
+    # the id) since all we ever need is "which message is this replying to,"
+    # not a full parent object graph.
+    reply_to_message_id = Column(Integer, ForeignKey("messages.id"), nullable=True)
+
+    # Forwarding — client decrypts the original then re-sends as a normal new
+    # message (content stays E2EE end to end), this column is purely a label
+    # so the UI can show "Forwarded".
+    forwarded_from_message_id = Column(Integer, ForeignKey("messages.id"), nullable=True)
+
+    # Edit / soft-delete
+    is_edited = Column(Boolean, default=False)
+    edited_at = Column(DateTime, nullable=True)
+    is_deleted = Column(Boolean, default=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+    # Pin (one pin state per message — group/DM admin-visible)
+    is_pinned = Column(Boolean, default=False)
+    pinned_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    pinned_at = Column(DateTime, nullable=True)
+
+    # @mentions — usernames only, sent in cleartext alongside the encrypted
+    # payload purely for notification targeting. The server can never parse
+    # mentions out of encrypted_content, so the client must say who was
+    # mentioned explicitly; this carries no message content.
+    mentions = Column(JSON, nullable=True)
+
     # Relationships
     sender = relationship("User", foreign_keys=[sender_id], back_populates="sent_messages")
     recipient = relationship("User", foreign_keys=[recipient_id], back_populates="received_messages")
     group = relationship("Group", back_populates="messages")
     media_files = relationship("Media", back_populates="message")
     group_read_receipts = relationship("GroupMessageRead", back_populates="message", cascade="all, delete-orphan")
-    
+    reactions = relationship("MessageReaction", back_populates="message", cascade="all, delete-orphan")
+
     def __repr__(self):
         return f"<Message(sender={self.sender_id}, recipient={self.recipient_id}, timestamp={self.timestamp})>"
+
+
+class MessageReaction(Base):
+    """One row per (message, user, emoji) — a user can react to the same
+    message with several different emoji, same as Slack/Teams, but can't
+    double-react with the identical emoji twice (toggle instead)."""
+    __tablename__ = "message_reactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    emoji = Column(String(16), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+    message = relationship("Message", back_populates="reactions")
+    user = relationship("User", foreign_keys=[user_id])
+
+    __table_args__ = (UniqueConstraint("message_id", "user_id", "emoji", name="uq_message_reaction"),)
+
+
+class StarredMessage(Base):
+    """Per-user saved/starred messages — personal, not shared with anyone else
+    in the conversation, same as Slack's "Saved items"."""
+    __tablename__ = "starred_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    message = relationship("Message", foreign_keys=[message_id])
+
+    __table_args__ = (UniqueConstraint("user_id", "message_id", name="uq_starred_message"),)
 
 class UserKey(Base):
     """User encryption keys and master salts storage"""

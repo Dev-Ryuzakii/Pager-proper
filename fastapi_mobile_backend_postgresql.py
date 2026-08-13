@@ -52,7 +52,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -119,6 +119,9 @@ class GroupMessageSend(BaseModel):
     encrypted_key: Optional[str] = Field(None, description="AES key encrypted with RSA (JSON map of username to key for groups)")
     iv: Optional[str] = Field(None, description="Initialization Vector for AES")
     decoy_content: Optional[str] = Field(None, description="Client-generated decoy content")
+    reply_to_message_id: Optional[int] = Field(None, description="Message this is a threaded reply to")
+    forwarded_from_message_id: Optional[int] = Field(None, description="Original message this was forwarded from, for the UI label only")
+    mentions: Optional[List[str]] = Field(None, description="Usernames @mentioned — cleartext, notification targeting only, never message content")
 
 class ConferenceMessageSend(BaseModel):
     conference_id: int = Field(..., description="ID of the meeting/conference to send message to")
@@ -134,6 +137,18 @@ class MessageSend(BaseModel):
     encrypted_key: Optional[str] = Field(None, description="AES key encrypted with recipient RSA public key")
     iv: Optional[str] = Field(None, description="Initialization Vector for AES")
     decoy_content: Optional[str] = Field(None, description="Client-generated decoy content")
+    reply_to_message_id: Optional[int] = Field(None, description="Message this is a threaded reply to")
+    forwarded_from_message_id: Optional[int] = Field(None, description="Original message this was forwarded from, for the UI label only")
+    mentions: Optional[List[str]] = Field(None, description="Usernames @mentioned — cleartext, notification targeting only, never message content")
+
+class ReactionRequest(BaseModel):
+    emoji: str = Field(..., min_length=1, max_length=16)
+
+class MessageEditRequest(BaseModel):
+    message: str = Field(..., min_length=1, description="New ciphertext")
+    encrypted_key: Optional[str] = Field(None, description="Re-wrapped AES key, if it changed")
+    iv: Optional[str] = Field(None, description="New IV")
+    decoy_content: Optional[str] = Field(None, description="New decoy text")
 
 class MeetingCreateRequest(BaseModel):
     title: Optional[str] = Field(None, description="Meeting title")
@@ -188,6 +203,13 @@ class MessageResponse(BaseModel):
     iv: Optional[str] = None
     is_private_tagged: Optional[bool] = False
     group_id: Optional[int] = None
+    reactions: Optional[List[Dict[str, Any]]] = []
+    reply_to_message_id: Optional[int] = None
+    forwarded_from_message_id: Optional[int] = None
+    is_edited: Optional[bool] = False
+    is_deleted: Optional[bool] = False
+    is_pinned: Optional[bool] = False
+    mentions: Optional[List[str]] = []
 
 class UserResponse(BaseModel):
     username: str
@@ -477,12 +499,12 @@ class MessageService:
     """Service class for message operations"""
     
     @staticmethod
-    def send_message_by_username(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = 12, encrypted_key: Optional[str] = None, iv: Optional[str] = None, decoy_content: Optional[str] = None, content_type: str = "encrypted") -> Message:
+    def send_message_by_username(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = 12, encrypted_key: Optional[str] = None, iv: Optional[str] = None, decoy_content: Optional[str] = None, content_type: str = "encrypted", reply_to_message_id: Optional[int] = None, forwarded_from_message_id: Optional[int] = None, mentions: Optional[List[str]] = None) -> Message:
         """Send a message to a specific user by username"""
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
         if not recipient:
             raise HTTPException(status_code=404, detail="Recipient not found")
-        
+
         decoy_text = decoy_content if decoy_content else FakeTextGenerator.generate_decoy_text_for_message(message_content)
 
         expires_at = None
@@ -490,7 +512,7 @@ class MessageService:
         if disappear_after_hours is not None and disappear_after_hours > 0:
             expires_at = datetime.now(timezone.utc) + timedelta(hours=disappear_after_hours)
             auto_delete = True
-        
+
         message = Message(
             sender_id=sender_id,
             recipient_id=recipient.id,
@@ -503,9 +525,12 @@ class MessageService:
             auto_delete=auto_delete,
             decoy_content=decoy_text,
             encrypted_key=encrypted_key,
-            iv=iv
+            iv=iv,
+            reply_to_message_id=reply_to_message_id,
+            forwarded_from_message_id=forwarded_from_message_id,
+            mentions=mentions,
         )
-        
+
         db.add(message)
         db.commit()
         db.refresh(message)
@@ -519,16 +544,19 @@ class MessageService:
                              encrypted_key: Optional[str] = None,
                              iv: Optional[str] = None,
                              decoy_content: Optional[str] = None,
-                             content_type: str = "encrypted") -> Message:
+                             content_type: str = "encrypted",
+                             reply_to_message_id: Optional[int] = None,
+                             forwarded_from_message_id: Optional[int] = None,
+                             mentions: Optional[List[str]] = None) -> Message:
         """Send a message to a group"""
         # Verify sender is a member
         membership = db.query(GroupMember).filter(
-            GroupMember.group_id == group_id, 
+            GroupMember.group_id == group_id,
             GroupMember.user_id == sender_id
         ).first()
         if not membership:
             raise HTTPException(status_code=403, detail="You are not a member of this group")
-            
+
         decoy_text = decoy_content if decoy_content else FakeTextGenerator.generate_decoy_text_for_message(message_content)
 
         expires_at = None
@@ -536,7 +564,7 @@ class MessageService:
         if disappear_after_hours and disappear_after_hours > 0:
             expires_at = datetime.now(timezone.utc) + timedelta(hours=disappear_after_hours)
             auto_delete = True
-            
+
         message = Message(
             sender_id=sender_id,
             group_id=group_id,
@@ -550,7 +578,10 @@ class MessageService:
             auto_delete=auto_delete,
             decoy_content=decoy_text,
             encrypted_key=encrypted_key,
-            iv=iv
+            iv=iv,
+            reply_to_message_id=reply_to_message_id,
+            forwarded_from_message_id=forwarded_from_message_id,
+            mentions=mentions
         )
         
         db.add(message)
@@ -4040,10 +4071,14 @@ async def send_message(message_data: MessageSend,
         user_id = int(getattr(current_user, 'id', 0)) if hasattr(getattr(current_user, 'id', 0), '__int__') else int(getattr(current_user, 'id', 0))
         message = MessageService.send_message_by_username(
             db, user_id, message_data.username, message_data.message, message_data.disappear_after_hours,
-            message_data.encrypted_key, message_data.iv, message_data.decoy_content
+            message_data.encrypted_key, message_data.iv, message_data.decoy_content,
+            reply_to_message_id=message_data.reply_to_message_id,
+            forwarded_from_message_id=message_data.forwarded_from_message_id,
+            mentions=message_data.mentions,
         )
         recipient_id = int(getattr(message, 'recipient_id', 0))
         sender_username = str(getattr(current_user, 'username', ''))
+        mentioned = bool(message_data.mentions and sender_username not in message_data.mentions and message_data.username in message_data.mentions)
         ws_sent = await ws_manager.send_to_user(recipient_id, {
             "type": "new_message",
             "data": {
@@ -4055,7 +4090,8 @@ async def send_message(message_data: MessageSend,
         })
         if not ws_sent:
             # Recipient offline — fall back to APNs push (sound matches in-app beep)
-            await push_to_user(db, recipient_id, "New message", f"From {sender_username}", sound="beep.caf")
+            title = "You were mentioned" if mentioned else "New message"
+            await push_to_user(db, recipient_id, title, f"From {sender_username}", sound="beep.caf")
         response = {
             "username": message_data.username,
             "message": "sent"
@@ -5413,21 +5449,30 @@ async def get_conversation(
         ).order_by(Message.timestamp.asc()).limit(200).all()
 
         current_username = str(getattr(current_user, 'username', ''))
+        reactions_map = _reactions_summary(db, [m.id for m in msgs], user_id)
         result = []
         for msg in msgs:
+            is_deleted = bool(getattr(msg, 'is_deleted', False))
             result.append({
                 "id": int(getattr(msg, 'id', 0)),
                 "sender": current_username if msg.sender_id == user_id else partner_username,
                 "recipient": partner_username if msg.sender_id == user_id else current_username,
                 "is_admin_announcement": bool(getattr(msg, 'is_admin_announcement', False)),
-                "content": str(getattr(msg, 'encrypted_content', '')),
-                "decoy_content": str(getattr(msg, 'decoy_content', '') or ''),
-                "content_type": str(getattr(msg, 'content_type', '')),
-                "encrypted_key": getattr(msg, 'encrypted_key', None),
-                "iv": getattr(msg, 'iv', None),
+                "content": '' if is_deleted else str(getattr(msg, 'encrypted_content', '')),
+                "decoy_content": '' if is_deleted else str(getattr(msg, 'decoy_content', '') or ''),
+                "content_type": "deleted" if is_deleted else str(getattr(msg, 'content_type', '')),
+                "encrypted_key": None if is_deleted else getattr(msg, 'encrypted_key', None),
+                "iv": None if is_deleted else getattr(msg, 'iv', None),
                 "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
                 "delivered": bool(getattr(msg, 'delivered', False)),
                 "read": bool(getattr(msg, 'read', False)),
+                "reactions": reactions_map.get(msg.id, []),
+                "reply_to_message_id": msg.reply_to_message_id,
+                "forwarded_from_message_id": msg.forwarded_from_message_id,
+                "is_edited": bool(getattr(msg, 'is_edited', False)),
+                "is_deleted": is_deleted,
+                "is_pinned": bool(getattr(msg, 'is_pinned', False)),
+                "mentions": msg.mentions or [],
             })
 
         return {"messages": result, "count": len(result)}
@@ -5788,21 +5833,23 @@ async def get_group_messages(
     messages = db.query(Message).filter(
         Message.group_id == group_id
     ).order_by(Message.timestamp.desc()).limit(limit).all()
-    
+
+    reactions_map = _reactions_summary(db, [m.id for m in messages], user_id)
+
     # Map messages to response model
     result = []
     for m in messages:
         sender_user = db.query(User).filter(User.id == m.sender_id).first()
-        
+
         # Get who read this message
         read_by_rows = db.query(User.username, GroupMessageRead.user_id, GroupMessageRead.read_at).join(
             GroupMessageRead, User.id == GroupMessageRead.user_id
         ).filter(GroupMessageRead.message_id == m.id).all()
-        
+
         read_by_list = [row.username for row in read_by_rows]
         read_receipts = [{"username": row.username, "read_at": row.read_at} for row in read_by_rows]
         is_read_by_me = any(row.user_id == user_id for row in read_by_rows)
-        
+
         recipient_user = None
         if m.recipient_id:
             recipient_user = db.query(User).filter(User.id == m.recipient_id).first()
@@ -5812,14 +5859,15 @@ async def get_group_messages(
             user_id == m.sender_id or
             user_id == m.recipient_id
         )
+        is_deleted = bool(getattr(m, 'is_deleted', False))
         result.append({
             "id": int(m.id),
             "sender": str(getattr(sender_user, 'username', 'Unknown')),
             "recipient": str(getattr(recipient_user, 'username', '')) if recipient_user else "group",
-            "content": str(m.encrypted_content) if can_read_content else str(getattr(m, 'decoy_content', '') or '[Private tagged message]'),
-            "content_type": str(m.content_type) if can_read_content else "private_tagged",
-            "encrypted_key": getattr(m, 'encrypted_key', None) if can_read_content else None,
-            "iv": getattr(m, 'iv', None) if can_read_content else None,
+            "content": '' if is_deleted else (str(m.encrypted_content) if can_read_content else str(getattr(m, 'decoy_content', '') or '[Private tagged message]')),
+            "content_type": "deleted" if is_deleted else (str(m.content_type) if can_read_content else "private_tagged"),
+            "encrypted_key": None if is_deleted else (getattr(m, 'encrypted_key', None) if can_read_content else None),
+            "iv": None if is_deleted else (getattr(m, 'iv', None) if can_read_content else None),
             "timestamp": m.timestamp,
             "delivered": bool(m.delivered),
             "read": is_read_by_me,
@@ -5827,8 +5875,15 @@ async def get_group_messages(
             "read_receipts": read_receipts,
             "is_admin_announcement": bool(getattr(m, 'is_admin_announcement', False)),
             "is_private_tagged": is_private_tagged,
-            "decoy_content": str(getattr(m, 'decoy_content', '')),
-            "group_id": int(group_id)
+            "decoy_content": '' if is_deleted else str(getattr(m, 'decoy_content', '')),
+            "group_id": int(group_id),
+            "reactions": reactions_map.get(m.id, []),
+            "reply_to_message_id": m.reply_to_message_id,
+            "forwarded_from_message_id": m.forwarded_from_message_id,
+            "is_edited": bool(getattr(m, 'is_edited', False)),
+            "is_deleted": is_deleted,
+            "is_pinned": bool(getattr(m, 'is_pinned', False)),
+            "mentions": m.mentions or [],
         })
     return result
 
@@ -5895,15 +5950,19 @@ async def send_group_message(
             is_announcement = bool(getattr(current_user, 'is_admin', False))
             
         message = MessageService.send_message_to_group(
-            db, user_id, payload.group_id, payload.message, 
+            db, user_id, payload.group_id, payload.message,
             payload.disappear_after_hours, addressed_to_id, is_announcement,
-            payload.encrypted_key, payload.iv, payload.decoy_content
+            payload.encrypted_key, payload.iv, payload.decoy_content,
+            reply_to_message_id=payload.reply_to_message_id,
+            forwarded_from_message_id=payload.forwarded_from_message_id,
+            mentions=payload.mentions,
         )
-        
+
         # Notify all group members via WebSocket
         members = db.query(GroupMember).filter(GroupMember.group_id == payload.group_id).all()
         sender_username = str(getattr(current_user, 'username', ''))
-        
+        mentioned_usernames = set(payload.mentions or [])
+
         notification = {
             "type": "new_group_message",
             "data": {
@@ -5913,15 +5972,19 @@ async def send_group_message(
                 "recipient_username": payload.addressed_to_username if payload.addressed_to_username else "group",
                 "is_admin_announcement": is_announcement,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "decoy_content": getattr(message, 'decoy_content', '')
+                "decoy_content": getattr(message, 'decoy_content', ''),
+                "mentions": payload.mentions or [],
             }
         }
-        
+
         for member in members:
             if member.user_id != user_id:
                 ws_sent = await ws_manager.send_to_user(member.user_id, notification)
                 if not ws_sent:
-                    await push_to_user(db, member.user_id, "New message", f"From {sender_username}", sound="beep.caf")
+                    member_user = db.query(User).filter(User.id == member.user_id).first()
+                    was_mentioned = bool(member_user and member_user.username in mentioned_usernames)
+                    title = "You were mentioned" if was_mentioned else "New message"
+                    await push_to_user(db, member.user_id, title, f"From {sender_username}", sound="beep.caf")
                 
         return {
             "status": "sent",
@@ -5932,6 +5995,320 @@ async def send_group_message(
     except Exception as e:
         logger.error(f"Send group message error: {e}")
         raise HTTPException(status_code=500, detail="Failed to send group message")
+
+
+# ─── Chat collaboration: reactions, edit, delete, pin, star ────────────────────
+
+def _message_targets(db: Session, msg: Message) -> List[int]:
+    """User ids who should be notified about a change to this message —
+    the other DM participant, or every group member."""
+    if msg.group_id:
+        return [m.user_id for m in db.query(GroupMember).filter(GroupMember.group_id == msg.group_id).all()]
+    ids = [msg.sender_id]
+    if msg.recipient_id:
+        ids.append(msg.recipient_id)
+    return ids
+
+
+def _assert_can_access_message(db: Session, msg: Message, user_id: int):
+    if msg.group_id:
+        membership = db.query(GroupMember).filter(
+            GroupMember.group_id == msg.group_id, GroupMember.user_id == user_id
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="Not a member of this group")
+    elif msg.sender_id != user_id and msg.recipient_id != user_id:
+        raise HTTPException(status_code=403, detail="Not a participant in this conversation")
+
+
+def _reactions_summary(db: Session, message_ids: List[int], viewer_id: int) -> Dict[int, List[Dict[str, Any]]]:
+    if not message_ids:
+        return {}
+    rows = db.query(MessageReaction).filter(MessageReaction.message_id.in_(message_ids)).all()
+    by_message: Dict[int, Dict[str, Dict[str, Any]]] = {}
+    for r in rows:
+        bucket = by_message.setdefault(r.message_id, {})
+        entry = bucket.setdefault(r.emoji, {"emoji": r.emoji, "count": 0, "reacted_by_me": False})
+        entry["count"] += 1
+        if r.user_id == viewer_id:
+            entry["reacted_by_me"] = True
+    return {mid: list(emap.values()) for mid, emap in by_message.items()}
+
+
+@app.post("/messages/{message_id}/react")
+async def toggle_message_reaction(
+    message_id: int,
+    payload: ReactionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Toggles a reaction — add it if the user hasn't reacted with this emoji
+    yet, remove it if they have. A user can stack several different emoji on
+    the same message, matching Slack/Teams."""
+    user_id = int(getattr(current_user, 'id', 0))
+    msg = db.query(Message).filter(Message.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _assert_can_access_message(db, msg, user_id)
+
+    existing = db.query(MessageReaction).filter(
+        MessageReaction.message_id == message_id,
+        MessageReaction.user_id == user_id,
+        MessageReaction.emoji == payload.emoji,
+    ).first()
+    if existing:
+        db.delete(existing)
+        db.commit()
+        action = "removed"
+    else:
+        db.add(MessageReaction(message_id=message_id, user_id=user_id, emoji=payload.emoji))
+        db.commit()
+        action = "added"
+
+    username = str(getattr(current_user, 'username', ''))
+    notification = {
+        "type": "message_reaction_updated",
+        "data": {"message_id": message_id, "group_id": msg.group_id, "emoji": payload.emoji, "action": action, "username": username},
+    }
+    for uid in _message_targets(db, msg):
+        if uid != user_id:
+            await ws_manager.send_to_user(uid, notification)
+
+    return {"status": action}
+
+
+@app.put("/messages/{message_id}")
+async def edit_message(
+    message_id: int,
+    payload: MessageEditRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Sender-only. Re-encrypts client-side, this just swaps the stored
+    ciphertext/key/iv/decoy on the same row and flags it edited."""
+    user_id = int(getattr(current_user, 'id', 0))
+    msg = db.query(Message).filter(Message.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.sender_id != user_id:
+        raise HTTPException(status_code=403, detail="Only the sender can edit this message")
+    if msg.is_deleted:
+        raise HTTPException(status_code=400, detail="Cannot edit a deleted message")
+
+    setattr(msg, 'encrypted_content', payload.message)
+    if payload.encrypted_key is not None:
+        setattr(msg, 'encrypted_key', payload.encrypted_key)
+    if payload.iv is not None:
+        setattr(msg, 'iv', payload.iv)
+    if payload.decoy_content is not None:
+        setattr(msg, 'decoy_content', payload.decoy_content)
+    setattr(msg, 'is_edited', True)
+    setattr(msg, 'edited_at', datetime.now(timezone.utc))
+    db.commit()
+
+    notification = {"type": "message_edited", "data": {"message_id": message_id, "group_id": msg.group_id}}
+    for uid in _message_targets(db, msg):
+        if uid != user_id:
+            await ws_manager.send_to_user(uid, notification)
+
+    return {"status": "edited"}
+
+
+@app.delete("/messages/{message_id}")
+async def delete_message(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Soft delete — sender or a system admin only. Content stays in the row
+    (nothing is un-sendable once delivered) but list endpoints replace it
+    with a tombstone once is_deleted is set."""
+    user_id = int(getattr(current_user, 'id', 0))
+    is_admin = bool(getattr(current_user, 'is_admin', False))
+    msg = db.query(Message).filter(Message.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.sender_id != user_id and not is_admin:
+        raise HTTPException(status_code=403, detail="Only the sender can delete this message")
+
+    setattr(msg, 'is_deleted', True)
+    setattr(msg, 'deleted_at', datetime.now(timezone.utc))
+    db.commit()
+
+    notification = {"type": "message_deleted", "data": {"message_id": message_id, "group_id": msg.group_id}}
+    for uid in _message_targets(db, msg):
+        if uid != user_id:
+            await ws_manager.send_to_user(uid, notification)
+
+    return {"status": "deleted"}
+
+
+@app.post("/messages/{message_id}/pin")
+async def pin_message(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    msg = db.query(Message).filter(Message.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _assert_can_access_message(db, msg, user_id)
+
+    setattr(msg, 'is_pinned', True)
+    setattr(msg, 'pinned_by_id', user_id)
+    setattr(msg, 'pinned_at', datetime.now(timezone.utc))
+    db.commit()
+
+    notification = {"type": "message_pinned", "data": {"message_id": message_id, "group_id": msg.group_id}}
+    for uid in _message_targets(db, msg):
+        if uid != user_id:
+            await ws_manager.send_to_user(uid, notification)
+
+    return {"status": "pinned"}
+
+
+@app.post("/messages/{message_id}/unpin")
+async def unpin_message(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    msg = db.query(Message).filter(Message.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _assert_can_access_message(db, msg, user_id)
+
+    setattr(msg, 'is_pinned', False)
+    setattr(msg, 'pinned_by_id', None)
+    setattr(msg, 'pinned_at', None)
+    db.commit()
+
+    notification = {"type": "message_unpinned", "data": {"message_id": message_id, "group_id": msg.group_id}}
+    for uid in _message_targets(db, msg):
+        if uid != user_id:
+            await ws_manager.send_to_user(uid, notification)
+
+    return {"status": "unpinned"}
+
+
+@app.get("/messages/pinned")
+async def list_pinned_messages(
+    username: Optional[str] = Query(None, description="DM partner — exactly one of username/group_id"),
+    group_id: Optional[int] = Query(None, description="Group — exactly one of username/group_id"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    current_username = str(getattr(current_user, 'username', ''))
+
+    if group_id:
+        membership = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user_id).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="Not a member of this group")
+        rows = db.query(Message).filter(Message.group_id == group_id, Message.is_pinned == True).order_by(Message.pinned_at.desc()).all()
+    elif username:
+        partner = db.query(User).filter(User.username == username, User.is_active == True).first()
+        if not partner:
+            raise HTTPException(status_code=404, detail="User not found")
+        rows = db.query(Message).filter(
+            Message.group_id.is_(None), Message.is_pinned == True,
+            or_(
+                and_(Message.sender_id == user_id, Message.recipient_id == partner.id),
+                and_(Message.sender_id == partner.id, Message.recipient_id == user_id),
+            ),
+        ).order_by(Message.pinned_at.desc()).all()
+    else:
+        raise HTTPException(status_code=400, detail="Must specify username or group_id")
+
+    result = []
+    for msg in rows:
+        sender = db.query(User).filter(User.id == msg.sender_id).first()
+        pinned_by = db.query(User).filter(User.id == msg.pinned_by_id).first() if msg.pinned_by_id else None
+        result.append({
+            "id": msg.id,
+            "sender": str(getattr(sender, 'username', '')) if sender else current_username,
+            "content": msg.encrypted_content,
+            "decoy_content": msg.decoy_content or '',
+            "content_type": msg.content_type,
+            "encrypted_key": msg.encrypted_key,
+            "iv": msg.iv,
+            "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+            "pinned_by": str(getattr(pinned_by, 'username', '')) if pinned_by else None,
+            "pinned_at": msg.pinned_at.isoformat() if msg.pinned_at else None,
+        })
+    return {"messages": result, "count": len(result)}
+
+
+@app.post("/messages/{message_id}/star")
+async def star_message(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Personal — not visible to the other participant(s), same as Slack's Saved items."""
+    user_id = int(getattr(current_user, 'id', 0))
+    msg = db.query(Message).filter(Message.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _assert_can_access_message(db, msg, user_id)
+
+    existing = db.query(StarredMessage).filter(StarredMessage.user_id == user_id, StarredMessage.message_id == message_id).first()
+    if not existing:
+        db.add(StarredMessage(user_id=user_id, message_id=message_id))
+        db.commit()
+    return {"status": "starred"}
+
+
+@app.delete("/messages/{message_id}/star")
+async def unstar_message(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    existing = db.query(StarredMessage).filter(StarredMessage.user_id == user_id, StarredMessage.message_id == message_id).first()
+    if existing:
+        db.delete(existing)
+        db.commit()
+    return {"status": "unstarred"}
+
+
+@app.get("/messages/starred")
+async def list_starred_messages(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Spans every conversation — each row carries enough context (DM partner
+    or group name) to route back to it from a single flat list."""
+    user_id = int(getattr(current_user, 'id', 0))
+    stars = db.query(StarredMessage).filter(StarredMessage.user_id == user_id).order_by(StarredMessage.created_at.desc()).all()
+
+    result = []
+    for star in stars:
+        msg = db.query(Message).filter(Message.id == star.message_id).first()
+        if not msg or msg.is_deleted:
+            continue
+        sender = db.query(User).filter(User.id == msg.sender_id).first()
+        group = db.query(Group).filter(Group.id == msg.group_id).first() if msg.group_id else None
+        recipient = db.query(User).filter(User.id == msg.recipient_id).first() if msg.recipient_id else None
+        result.append({
+            "id": msg.id,
+            "sender": str(getattr(sender, 'username', '')) if sender else 'unknown',
+            "content": msg.encrypted_content,
+            "decoy_content": msg.decoy_content or '',
+            "content_type": msg.content_type,
+            "encrypted_key": msg.encrypted_key,
+            "iv": msg.iv,
+            "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+            "group_id": msg.group_id,
+            "group_name": str(getattr(group, 'name', '')) if group else None,
+            "recipient": str(getattr(recipient, 'username', '')) if recipient else None,
+            "starred_at": star.created_at.isoformat() if star.created_at else None,
+        })
+    return {"messages": result, "count": len(result)}
+
 
 @app.post("/messages/conference/send")
 async def send_conference_message(
