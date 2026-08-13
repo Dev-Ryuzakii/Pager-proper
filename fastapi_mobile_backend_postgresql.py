@@ -9652,17 +9652,84 @@ async def raw_upload_health_check():
 # encrypted blob, never plaintext. Recordings are plain MP4 (Egress renders
 # the call itself, not message contents) and download directly.
 
+def _media_folder_key(sender_username: str, recipient_username: Optional[str], group_id: Optional[int]) -> str:
+    """DM folders are keyed by the pair sorted alphabetically so both directions
+    (A->B and B->A) land in the same folder, same as a chat thread would."""
+    if group_id:
+        return f"group:{group_id}"
+    pair = sorted([sender_username, recipient_username or "unknown"])
+    return f"dm:{pair[0]}::{pair[1]}"
+
+
+@app.get("/admin/drive/folders")
+async def admin_list_drive_folders(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Folders computed on the fly from existing Media rows — one per DM pair
+    and one per group — rather than a stored hierarchy, since the underlying
+    data already has this exact structure (a chat thread IS the folder)."""
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    rows = db.query(Media).all()
+    users_by_id = {u.id: u.username for u in db.query(User).all()}
+    groups_by_id = {g.id: g.name for g in db.query(Group).all()}
+
+    folders: Dict[str, Dict[str, Any]] = {}
+    for m in rows:
+        sender_username = users_by_id.get(m.sender_id, "unknown")
+        recipient_username = users_by_id.get(m.recipient_id) if m.recipient_id else None
+        key = _media_folder_key(sender_username, recipient_username, m.group_id)
+        if key not in folders:
+            if m.group_id:
+                folders[key] = {
+                    "key": key, "type": "group",
+                    "name": groups_by_id.get(m.group_id, f"Group #{m.group_id}"),
+                    "item_count": 0, "total_size": 0,
+                }
+            else:
+                pair = sorted([sender_username, recipient_username or "unknown"])
+                folders[key] = {
+                    "key": key, "type": "dm",
+                    "name": f"{pair[0]} & {pair[1]}",
+                    "item_count": 0, "total_size": 0,
+                }
+        folders[key]["item_count"] += 1
+        folders[key]["total_size"] += m.file_size or 0
+
+    return {"folders": sorted(folders.values(), key=lambda f: -f["item_count"])}
+
+
 @app.get("/admin/drive/media")
 async def admin_list_media(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
+    folder: Optional[str] = Query(None, description="Folder key from /admin/drive/folders — omit to list everything"),
 ):
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Admin only")
-    rows = db.query(Media).order_by(Media.id.desc()).offset(offset).limit(limit).all()
-    total = db.query(Media).count()
+
+    query = db.query(Media)
+    if folder:
+        if folder.startswith("group:"):
+            group_id = int(folder.removeprefix("group:"))
+            query = query.filter(Media.group_id == group_id)
+        elif folder.startswith("dm:"):
+            pair = folder.removeprefix("dm:").split("::", 1)
+            if len(pair) == 2:
+                users = db.query(User).filter(User.username.in_(pair)).all()
+                ids = [u.id for u in users]
+                query = query.filter(
+                    Media.group_id.is_(None),
+                    Media.sender_id.in_(ids),
+                    or_(Media.recipient_id.in_(ids), Media.recipient_id.is_(None)),
+                )
+
+    total = query.count()
+    rows = query.order_by(Media.id.desc()).offset(offset).limit(limit).all()
     items = []
     for m in rows:
         sender = db.query(User).filter(User.id == m.sender_id).first()
@@ -9676,6 +9743,7 @@ async def admin_list_media(
             "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
             "recipient": str(getattr(recipient, 'username', '')) if recipient else None,
             "group_id": m.group_id,
+            "uploaded_at": m.uploaded_at.isoformat() if m.uploaded_at else None,
         })
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
