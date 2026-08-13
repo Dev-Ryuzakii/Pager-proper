@@ -792,6 +792,41 @@ class MeetingRecording(Base):
     started_by = relationship("User", foreign_keys=[started_by_user_id])
 
 
+class RetentionPolicy(Base):
+    """Single global row (no multi-tenant concept yet, so this is site-wide) —
+    superadmin-set. When auto_delete_days is set, a periodic job hard-deletes
+    messages (and their attached Media) older than that many days, on top of
+    (not instead of) the existing per-message disappearing-message feature."""
+    __tablename__ = "retention_policy"
+
+    id = Column(Integer, primary_key=True, index=True)
+    auto_delete_days = Column(Integer, nullable=True)  # null = disabled
+    updated_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    updated_by = relationship("User", foreign_keys=[updated_by_id])
+
+
+class Webhook(Base):
+    """Superadmin-managed outbound webhook — lets a customer connect Dilarion
+    events to their own tools. Delivery is fire-and-forget with HMAC-SHA256
+    signing (X-Dilarion-Signature) so the receiver can verify authenticity."""
+    __tablename__ = "webhooks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    url = Column(String(512), nullable=False)
+    secret = Column(String(64), nullable=False)
+    event_types = Column(JSON, nullable=False)  # list of subscribed event names, e.g. ["message.sent", "meeting.scheduled"]
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+    last_triggered_at = Column(DateTime, nullable=True)
+    last_status_code = Column(Integer, nullable=True)
+    failure_count = Column(Integer, default=0)
+
+    created_by = relationship("User", foreign_keys=[created_by_id])
+
+
 class Meeting(Base):
     """
     A meeting scheduled for a future time. Independent of an active call —

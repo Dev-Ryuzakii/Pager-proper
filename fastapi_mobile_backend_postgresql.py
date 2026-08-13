@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
@@ -52,7 +53,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -3110,10 +3111,40 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Meeting reminder error: {e}")
 
+    async def periodic_retention_enforcement():
+        while True:
+            try:
+                await asyncio.sleep(3600)  # every hour — this is a bulk purge, not time-critical
+                db = next(get_database_session())
+                try:
+                    policy = db.query(RetentionPolicy).first()
+                    if policy and policy.auto_delete_days:
+                        cutoff = datetime.now(timezone.utc) - timedelta(days=policy.auto_delete_days)
+                        old_messages = db.query(Message).filter(Message.timestamp <= cutoff).all()
+                        count = len(old_messages)
+                        for msg in old_messages:
+                            media_rows = db.query(Media).filter(Media.message_id == msg.id).all()
+                            for media in media_rows:
+                                if media.encrypted_file_path and os.path.exists(media.encrypted_file_path):
+                                    try:
+                                        os.remove(media.encrypted_file_path)
+                                    except OSError:
+                                        pass
+                                db.delete(media)
+                            db.delete(msg)
+                        if count > 0:
+                            db.commit()
+                            logger.info(f"Retention policy: purged {count} message(s) older than {policy.auto_delete_days} days")
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.error(f"Retention enforcement error: {e}")
+
     broadcast_task = asyncio.create_task(periodic_status_broadcast())
     deadmans_task = asyncio.create_task(DeadMansSwitchService.run_checker(None))
     cleanup_task = asyncio.create_task(periodic_message_cleanup())
     meeting_reminder_task = asyncio.create_task(periodic_meeting_reminders())
+    retention_task = asyncio.create_task(periodic_retention_enforcement())
 
     yield
 
@@ -3122,6 +3153,7 @@ async def lifespan(app: FastAPI):
     deadmans_task.cancel()
     cleanup_task.cancel()
     meeting_reminder_task.cancel()
+    retention_task.cancel()
     
     # Shutdown
     logger.info("📴 Shutting down FastAPI Mobile Backend")
@@ -4092,6 +4124,11 @@ async def send_message(message_data: MessageSend,
             # Recipient offline — fall back to APNs push (sound matches in-app beep)
             title = "You were mentioned" if mentioned else "New message"
             await push_to_user(db, recipient_id, title, f"From {sender_username}", sound="beep.caf")
+        await _fire_webhooks(db, "message.sent", {
+            "message_id": getattr(message, "id", None),
+            "sender_username": sender_username,
+            "recipient_username": message_data.username,
+        })
         response = {
             "username": message_data.username,
             "message": "sent"
@@ -5060,6 +5097,13 @@ async def create_meeting(
         dm_usernames=payload.invitee_usernames,
     )
 
+    await _fire_webhooks(db, "meeting.scheduled", {
+        "meeting_id": meeting.id,
+        "title": meeting.title,
+        "scheduled_at": meeting.scheduled_at.isoformat(),
+        "creator_username": str(getattr(current_user, 'username', '')),
+    })
+
     return {
         "meeting_id": meeting.id,
         "join_code": join_code,
@@ -5096,6 +5140,120 @@ async def list_upcoming_meetings(
             "group_id": m.group_id,
         })
     return {"meetings": result}
+
+
+def _expand_meeting_occurrences(meeting: Meeting, range_start: datetime, range_end: datetime) -> List[datetime]:
+    """Recurrence is stored but never materialized into new rows — a single
+    Meeting row represents every future occurrence. This expands it into the
+    concrete datetimes that fall inside [range_start, range_end] for calendar
+    display. Capped at 500 iterations so an old daily meeting with no end
+    date can't spin forever."""
+    base = meeting.scheduled_at
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    if not meeting.recurrence:
+        return [base] if range_start <= base <= range_end else []
+
+    occurrences: List[datetime] = []
+    cur = base
+    i = 0
+    while cur <= range_end and i < 500:
+        if cur >= range_start:
+            occurrences.append(cur)
+        if meeting.recurrence == "daily":
+            cur = cur + timedelta(days=1)
+        elif meeting.recurrence == "weekly":
+            cur = cur + timedelta(weeks=1)
+        elif meeting.recurrence == "monthly":
+            month = cur.month + 1
+            year = cur.year + (month - 1) // 12
+            month = ((month - 1) % 12) + 1
+            day = min(cur.day, 28)
+            cur = cur.replace(year=year, month=month, day=day)
+        else:
+            break
+        i += 1
+    return occurrences
+
+
+def _meeting_calendar_dict(m: Meeting, occurrence_at: datetime, creator_username: str) -> Dict[str, Any]:
+    return {
+        "meeting_id": m.id,
+        "title": m.title,
+        "occurrence_start": occurrence_at.isoformat(),
+        "occurrence_end": (occurrence_at + timedelta(minutes=m.duration_minutes or 60)).isoformat(),
+        "duration_minutes": m.duration_minutes,
+        "recurrence": m.recurrence,
+        "status": m.status,
+        "join_code": m.join_code,
+        "creator_username": creator_username,
+        "group_id": m.group_id,
+        "waiting_room_enabled": bool(m.waiting_room_enabled),
+    }
+
+
+@app.get("/meetings/calendar")
+async def get_meeting_calendar(
+    start: datetime = Query(..., description="Range start, ISO 8601"),
+    end: datetime = Query(..., description="Range end, ISO 8601"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Every meeting the current user is invited to (or created) with
+    recurrence expanded into concrete occurrences inside [start, end]."""
+    user_id = int(getattr(current_user, 'id', 0))
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
+    meeting_ids = [
+        p.meeting_id for p in
+        db.query(MeetingParticipant).filter(MeetingParticipant.user_id == user_id).all()
+    ]
+    meetings = db.query(Meeting).filter(
+        Meeting.id.in_(meeting_ids),
+        Meeting.status != "cancelled",
+    ).all()
+
+    result = []
+    for m in meetings:
+        creator = db.query(User).filter(User.id == m.creator_id).first()
+        creator_username = str(getattr(creator, "username", ""))
+        for occ in _expand_meeting_occurrences(m, start, end):
+            result.append(_meeting_calendar_dict(m, occ, creator_username))
+
+    result.sort(key=lambda r: r["occurrence_start"])
+    return {"occurrences": result, "count": len(result)}
+
+
+@app.get("/admin/calendar")
+async def get_admin_calendar(
+    start: datetime = Query(..., description="Range start, ISO 8601"),
+    end: datetime = Query(..., description="Range end, ISO 8601"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Org-wide view — every scheduled meeting from every user. Superadmin
+    tool (Drive site), not exposed in the regular chat apps."""
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
+    meetings = db.query(Meeting).filter(Meeting.status != "cancelled").all()
+
+    result = []
+    for m in meetings:
+        creator = db.query(User).filter(User.id == m.creator_id).first()
+        creator_username = str(getattr(creator, "username", ""))
+        for occ in _expand_meeting_occurrences(m, start, end):
+            result.append(_meeting_calendar_dict(m, occ, creator_username))
+
+    result.sort(key=lambda r: r["occurrence_start"])
+    return {"occurrences": result, "count": len(result)}
 
 
 @app.post("/meetings/join_by_code")
@@ -10020,6 +10178,176 @@ async def raw_upload_health_check():
         "status": "running",
         "version": "1.0.0"
     }
+
+# ─── Webhooks (superadmin-managed outbound integrations) ───────────────────────
+# Fire-and-forget delivery, HMAC-SHA256 signed so receivers can verify the
+# payload actually came from this server. Wired into a starter set of event
+# points (message sent, meeting scheduled) — more can be added the same way.
+
+async def _fire_webhooks(db: Session, event_type: str, payload: Dict[str, Any]):
+    import asyncio
+    hooks = db.query(Webhook).filter(Webhook.is_active == True).all()
+    for hook in hooks:
+        subscribed = hook.event_types or []
+        if event_type not in subscribed:
+            continue
+        asyncio.create_task(_deliver_webhook(hook.id, hook.url, hook.secret, event_type, payload))
+
+async def _deliver_webhook(hook_id: int, url: str, secret: str, event_type: str, payload: Dict[str, Any]):
+    body = json.dumps({"event": event_type, "data": payload, "timestamp": datetime.now(timezone.utc).isoformat()})
+    signature = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+    status_code = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                url,
+                content=body,
+                headers={"Content-Type": "application/json", "X-Dilarion-Signature": signature, "X-Dilarion-Event": event_type},
+            )
+            status_code = resp.status_code
+    except Exception as e:
+        logger.warning(f"Webhook delivery failed (hook_id={hook_id}): {e}")
+    finally:
+        db = next(get_database_session())
+        try:
+            hook = db.query(Webhook).filter(Webhook.id == hook_id).first()
+            if hook:
+                setattr(hook, 'last_triggered_at', datetime.now(timezone.utc))
+                setattr(hook, 'last_status_code', status_code)
+                if status_code is None or status_code >= 400:
+                    setattr(hook, 'failure_count', (hook.failure_count or 0) + 1)
+                else:
+                    setattr(hook, 'failure_count', 0)
+                db.commit()
+        finally:
+            db.close()
+
+
+class WebhookCreateRequest(BaseModel):
+    url: str = Field(..., description="Receiver endpoint — must be https:// in production")
+    event_types: List[str] = Field(..., description='e.g. ["message.sent", "meeting.scheduled"]')
+
+
+@app.get("/admin/webhooks")
+async def list_webhooks(current_user: User = Depends(get_current_user), db: Session = Depends(get_database_session)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    hooks = db.query(Webhook).order_by(Webhook.id.desc()).all()
+    return {"webhooks": [
+        {
+            "id": h.id, "url": h.url, "event_types": h.event_types, "is_active": h.is_active,
+            "created_at": h.created_at.isoformat() if h.created_at else None,
+            "last_triggered_at": h.last_triggered_at.isoformat() if h.last_triggered_at else None,
+            "last_status_code": h.last_status_code, "failure_count": h.failure_count,
+        } for h in hooks
+    ]}
+
+
+@app.post("/admin/webhooks")
+async def create_webhook(payload: WebhookCreateRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_database_session)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    secret = secrets.token_hex(32)
+    hook = Webhook(
+        created_by_id=int(getattr(current_user, 'id', 0)),
+        url=payload.url,
+        secret=secret,
+        event_types=payload.event_types,
+    )
+    db.add(hook)
+    db.commit()
+    db.refresh(hook)
+    # Secret is only ever returned once, at creation — store it now, it can't be retrieved again.
+    return {"id": hook.id, "url": hook.url, "event_types": hook.event_types, "secret": secret}
+
+
+@app.delete("/admin/webhooks/{webhook_id}")
+async def delete_webhook(webhook_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_database_session)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    hook = db.query(Webhook).filter(Webhook.id == webhook_id).first()
+    if not hook:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    db.delete(hook)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@app.post("/admin/webhooks/{webhook_id}/toggle")
+async def toggle_webhook(webhook_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_database_session)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    hook = db.query(Webhook).filter(Webhook.id == webhook_id).first()
+    if not hook:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    setattr(hook, 'is_active', not hook.is_active)
+    db.commit()
+    return {"id": hook.id, "is_active": hook.is_active}
+
+
+# ─── Retention policy (superadmin-managed) ──────────────────────────────────────
+
+class RetentionPolicyRequest(BaseModel):
+    auto_delete_days: Optional[int] = Field(None, description="Purge messages older than this many days. null disables the policy.")
+
+
+@app.get("/admin/retention-policy")
+async def get_retention_policy(current_user: User = Depends(get_current_user), db: Session = Depends(get_database_session)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    policy = db.query(RetentionPolicy).first()
+    if not policy:
+        return {"auto_delete_days": None, "updated_at": None}
+    return {"auto_delete_days": policy.auto_delete_days, "updated_at": policy.updated_at.isoformat() if policy.updated_at else None}
+
+
+@app.put("/admin/retention-policy")
+async def set_retention_policy(payload: RetentionPolicyRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_database_session)):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    policy = db.query(RetentionPolicy).first()
+    if not policy:
+        policy = RetentionPolicy()
+        db.add(policy)
+    setattr(policy, 'auto_delete_days', payload.auto_delete_days)
+    setattr(policy, 'updated_by_id', int(getattr(current_user, 'id', 0)))
+    db.commit()
+    return {"auto_delete_days": policy.auto_delete_days}
+
+
+# ─── GDPR data export (self-service — every user can export their own data) ────
+
+@app.get("/users/me/export")
+async def export_my_data(current_user: User = Depends(get_current_user), db: Session = Depends(get_database_session)):
+    """Right-to-access/portability export. Message content stays E2EE — this
+    exports the encrypted blob exactly as stored, same as everywhere else in
+    this app; only the requesting user's own device can ever decrypt it."""
+    user_id = int(getattr(current_user, 'id', 0))
+    username = str(getattr(current_user, 'username', ''))
+
+    sent = db.query(Message).filter(Message.sender_id == user_id).all()
+    received = db.query(Message).filter(Message.recipient_id == user_id).all()
+    media = db.query(Media).filter(or_(Media.sender_id == user_id, Media.recipient_id == user_id)).all()
+    groups = db.query(GroupMember).filter(GroupMember.user_id == user_id).all()
+    devices = db.query(LinkedDevice).filter(LinkedDevice.user_id == user_id).all()
+
+    def msg_dict(m: Message) -> Dict[str, Any]:
+        return {
+            "id": m.id, "encrypted_content": m.encrypted_content, "content_type": m.content_type,
+            "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+            "group_id": m.group_id, "recipient_id": m.recipient_id, "sender_id": m.sender_id,
+        }
+
+    return {
+        "username": username,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "messages_sent": [msg_dict(m) for m in sent],
+        "messages_received": [msg_dict(m) for m in received],
+        "media": [{"media_id": m.media_id, "filename": m.filename, "file_size": m.file_size, "media_type": m.media_type} for m in media],
+        "group_memberships": [{"group_id": g.group_id, "role": g.role} for g in groups],
+        "linked_devices": [{"device_name": d.device_name, "platform": d.platform, "linked_at": d.created_at.isoformat() if d.created_at else None} for d in devices],
+    }
+
 
 # ─── Drive (superadmin-only, separate site) ────────────────────────────────────
 # Lists what's already on disk: uploaded chat/group media and meeting
