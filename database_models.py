@@ -51,7 +51,15 @@ class User(Base):
     # duress wipe requests. Superadmin can always approve regardless of this flag.
     can_approve_duress_wipe = Column(Boolean, default=False)
     voice_identity_path = Column(String(512), nullable=True)  # Path to voice identity file
-    
+
+    # Master-token 2FA — a second, separate secret required to create/replace
+    # the master token, so a stolen session token alone can't silently reset
+    # it out from under the real owner. Never involved in decrypting content;
+    # this only gates the mastertoken/create endpoint itself.
+    mastertoken_2fa_enabled = Column(Boolean, default=False)
+    mastertoken_2fa_hash = Column(String(255), nullable=True)
+    mastertoken_2fa_salt = Column(String(255), nullable=True)
+
     # Relationships
     sent_messages = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")
     received_messages = relationship("Message", foreign_keys="Message.recipient_id", back_populates="recipient")
@@ -790,6 +798,24 @@ class MeetingRecording(Base):
 
     conference = relationship("ConferenceSession", foreign_keys=[conference_id])
     started_by = relationship("User", foreign_keys=[started_by_user_id])
+
+
+class AccountDeletionRequest(Base):
+    """Self-service request — the user asks, an admin approves (which actually
+    deletes the account, reusing the existing admin delete-user path) or
+    denies. Nothing is deleted automatically just by requesting."""
+    __tablename__ = "account_deletion_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reason = Column(Text, nullable=True)
+    status = Column(String(20), default="pending")  # pending/approved/denied
+    requested_at = Column(DateTime, default=func.now())
+    processed_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    processed_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+    processed_by = relationship("User", foreign_keys=[processed_by_id])
 
 
 class RetentionPolicy(Base):

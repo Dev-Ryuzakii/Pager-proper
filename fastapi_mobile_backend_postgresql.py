@@ -53,7 +53,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -176,6 +176,20 @@ class WhiteboardClearRequest(BaseModel):
 
 class MasterToken(BaseModel):
     mastertoken: str = Field(..., description="Master decryption token")
+    two_fa_password: Optional[str] = Field(None, description="Required only if master-token 2FA is enabled for this account")
+
+class MasterToken2FAEnableRequest(BaseModel):
+    mastertoken: str = Field(..., description="Current active master token — proves you're really the owner, not just a stolen session")
+    two_fa_password: str = Field(..., min_length=6, description="New 2FA password, required from now on to create/replace the master token")
+
+class MasterToken2FADisableRequest(BaseModel):
+    two_fa_password: str = Field(..., description="Current 2FA password")
+
+class AccountDeletionRequestCreate(BaseModel):
+    reason: Optional[str] = Field(None, max_length=1000)
+
+class AccountDeletionDecision(BaseModel):
+    reason: Optional[str] = Field(None, description="Admin's note, e.g. why denied")
 
 class DecryptRequest(BaseModel):
     mastertoken: str = Field(..., description="Master token for decryption")
@@ -6917,7 +6931,7 @@ async def get_decoy_voice(
     return FileResponse(cached, media_type="audio/m4a")
 
 @app.post("/mastertoken/create")
-async def create_mastertoken(token_data: MasterToken, 
+async def create_mastertoken(token_data: MasterToken,
                            current_user: User = Depends(get_current_user),
                            db: Session = Depends(get_database_session)):
     """Create master token - simplified JSON: {mastertoken}"""
@@ -6928,6 +6942,17 @@ async def create_mastertoken(token_data: MasterToken,
 
         if not mastertoken:
             raise HTTPException(status_code=400, detail="mastertoken is required")
+
+        # 2FA gate — if enabled, a stolen session token alone can't silently
+        # reset the master token; the separate 2FA password is required too.
+        user_row = db.query(User).filter(User.id == user_id).first()
+        if user_row and getattr(user_row, 'mastertoken_2fa_enabled', False):
+            provided = (token_data.two_fa_password or "").strip()
+            if not provided:
+                raise HTTPException(status_code=403, detail="Master-token 2FA is enabled — two_fa_password is required")
+            expected_hash = hashlib.sha256((provided + str(user_row.mastertoken_2fa_salt)).encode()).hexdigest()
+            if not hmac.compare_digest(expected_hash, str(user_row.mastertoken_2fa_hash)):
+                raise HTTPException(status_code=403, detail="Incorrect 2FA password")
 
         # Deactivate existing master tokens
         db.query(DBMasterToken).filter(
@@ -6957,7 +6982,9 @@ async def create_mastertoken(token_data: MasterToken,
         return {
             "mastertoken": "created"
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Create mastertoken error: {e}")
         raise HTTPException(status_code=500, detail="Failed to create master token")
@@ -6983,10 +7010,207 @@ async def confirm_mastertoken(token_data: MasterToken,
         return {
             "mastertoken": "confirmed"
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Confirm mastertoken error: {e}")
         raise HTTPException(status_code=500, detail="Failed to confirm master token")
+
+
+@app.get("/mastertoken/2fa/status")
+async def mastertoken_2fa_status(current_user: User = Depends(get_current_user), db: Session = Depends(get_database_session)):
+    user_id = int(getattr(current_user, 'id', 0))
+    user_row = db.query(User).filter(User.id == user_id).first()
+    return {"enabled": bool(getattr(user_row, 'mastertoken_2fa_enabled', False))}
+
+
+@app.post("/mastertoken/2fa/enable")
+async def enable_mastertoken_2fa(
+    payload: MasterToken2FAEnableRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    if not validate_master_token(db, user_id, payload.mastertoken):
+        raise HTTPException(status_code=401, detail="Invalid master token")
+
+    user_row = db.query(User).filter(User.id == user_id).first()
+    if not user_row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    salt = base64.b64encode(os.urandom(32)).decode()
+    setattr(user_row, 'mastertoken_2fa_salt', salt)
+    setattr(user_row, 'mastertoken_2fa_hash', hashlib.sha256((payload.two_fa_password + salt).encode()).hexdigest())
+    setattr(user_row, 'mastertoken_2fa_enabled', True)
+    db.commit()
+
+    AuditService.log_event(db, user_id, "mastertoken_2fa_enabled", "Master-token 2FA enabled")
+    return {"enabled": True}
+
+
+@app.post("/mastertoken/2fa/disable")
+async def disable_mastertoken_2fa(
+    payload: MasterToken2FADisableRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    user_row = db.query(User).filter(User.id == user_id).first()
+    if not user_row or not getattr(user_row, 'mastertoken_2fa_enabled', False):
+        raise HTTPException(status_code=400, detail="2FA is not enabled")
+
+    expected_hash = hashlib.sha256((payload.two_fa_password + str(user_row.mastertoken_2fa_salt)).encode()).hexdigest()
+    if not hmac.compare_digest(expected_hash, str(user_row.mastertoken_2fa_hash)):
+        raise HTTPException(status_code=403, detail="Incorrect 2FA password")
+
+    setattr(user_row, 'mastertoken_2fa_enabled', False)
+    setattr(user_row, 'mastertoken_2fa_hash', None)
+    setattr(user_row, 'mastertoken_2fa_salt', None)
+    db.commit()
+
+    AuditService.log_event(db, user_id, "mastertoken_2fa_disabled", "Master-token 2FA disabled")
+    return {"enabled": False}
+
+
+# ─── Account deletion requests (self-service ask, admin approves/denies) ───────
+
+@app.post("/account/delete-request")
+async def request_account_deletion(
+    payload: AccountDeletionRequestCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    username = str(getattr(current_user, 'username', ''))
+
+    existing = db.query(AccountDeletionRequest).filter(
+        AccountDeletionRequest.user_id == user_id,
+        AccountDeletionRequest.status == "pending",
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="You already have a pending deletion request")
+
+    req = AccountDeletionRequest(user_id=user_id, reason=payload.reason)
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+
+    admins = db.query(User).filter(User.is_admin == True, User.is_active == True).all()
+    for admin in admins:
+        ws_sent = await ws_manager.send_to_user(admin.id, {
+            "type": "account_deletion_requested",
+            "data": {"request_id": req.id, "username": username, "reason": payload.reason},
+        })
+        if not ws_sent:
+            await push_to_user(db, admin.id, "Account deletion request", f"{username} requested account deletion")
+
+    AuditService.log_event(db, user_id, "account_deletion_requested", f"{username} requested account deletion")
+    return {"request_id": req.id, "status": "pending"}
+
+
+@app.get("/account/delete-request/status")
+async def my_account_deletion_status(current_user: User = Depends(get_current_user), db: Session = Depends(get_database_session)):
+    user_id = int(getattr(current_user, 'id', 0))
+    req = db.query(AccountDeletionRequest).filter(
+        AccountDeletionRequest.user_id == user_id
+    ).order_by(AccountDeletionRequest.requested_at.desc()).first()
+    if not req:
+        return {"status": None}
+    return {
+        "request_id": req.id, "status": req.status,
+        "requested_at": req.requested_at.isoformat() if req.requested_at else None,
+        "processed_at": req.processed_at.isoformat() if req.processed_at else None,
+    }
+
+
+@app.get("/admin/account-deletion-requests")
+async def list_account_deletion_requests(
+    status: Optional[str] = Query(None, description="Filter by pending/approved/denied — omit for all"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    query = db.query(AccountDeletionRequest)
+    if status:
+        query = query.filter(AccountDeletionRequest.status == status)
+    rows = query.order_by(AccountDeletionRequest.requested_at.desc()).all()
+
+    result = []
+    for r in rows:
+        requester = db.query(User).filter(User.id == r.user_id).first()
+        processor = db.query(User).filter(User.id == r.processed_by_id).first() if r.processed_by_id else None
+        result.append({
+            "id": r.id,
+            "username": str(getattr(requester, 'username', '')) if requester else "unknown",
+            "reason": r.reason,
+            "status": r.status,
+            "requested_at": r.requested_at.isoformat() if r.requested_at else None,
+            "processed_by": str(getattr(processor, 'username', '')) if processor else None,
+            "processed_at": r.processed_at.isoformat() if r.processed_at else None,
+        })
+    return {"requests": result, "count": len(result)}
+
+
+@app.post("/admin/account-deletion-requests/{request_id}/approve")
+async def approve_account_deletion(
+    request_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Approving actually deletes the account — reuses the same admin
+    delete-user path as the manual /admin/users/{phone_number} endpoint."""
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    admin_id = int(getattr(current_user, 'id', 0))
+
+    req = db.query(AccountDeletionRequest).filter(AccountDeletionRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Request already {req.status}")
+
+    target = db.query(User).filter(User.id == req.user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User account no longer exists")
+
+    setattr(req, 'status', 'approved')
+    setattr(req, 'processed_by_id', admin_id)
+    setattr(req, 'processed_at', datetime.now(timezone.utc))
+    db.commit()
+
+    AdminService.delete_user(db, admin_id, str(target.phone_number))
+    return {"status": "approved", "deleted": True}
+
+
+@app.post("/admin/account-deletion-requests/{request_id}/deny")
+async def deny_account_deletion(
+    request_id: int,
+    payload: AccountDeletionDecision,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    admin_id = int(getattr(current_user, 'id', 0))
+
+    req = db.query(AccountDeletionRequest).filter(AccountDeletionRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Request already {req.status}")
+
+    setattr(req, 'status', 'denied')
+    setattr(req, 'processed_by_id', admin_id)
+    setattr(req, 'processed_at', datetime.now(timezone.utc))
+    db.commit()
+
+    await ws_manager.send_to_user(req.user_id, {
+        "type": "account_deletion_denied",
+        "data": {"request_id": req.id, "reason": payload.reason},
+    })
+    return {"status": "denied"}
 
 @app.post("/messages/cleanup")
 async def cleanup_expired_messages(
