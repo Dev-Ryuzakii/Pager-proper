@@ -174,6 +174,9 @@ class WhiteboardClearRequest(BaseModel):
     group_id: Optional[int] = Field(None, description="Group target — exactly one of username/group_id/conference_id")
     conference_id: Optional[int] = Field(None, description="Meeting target — exactly one of username/group_id/conference_id")
 
+class WhiteboardOpenRequest(BaseModel):
+    conference_id: int = Field(..., description="Meeting whose whiteboard is being opened")
+
 class MasterToken(BaseModel):
     mastertoken: str = Field(..., description="Master decryption token")
     two_fa_password: Optional[str] = Field(None, description="Required only if master-token 2FA is enabled for this account")
@@ -1421,6 +1424,14 @@ class MediaService:
 # Answer SDPs waiting to be collected by a caller whose WebSocket missed the
 # push. call_id -> sdp, dropped as soon as the call ends or the caller reads it.
 _pending_answer_sdp: Dict[int, str] = {}
+
+# In-meeting whiteboard is shared for the life of the conference, not
+# ephemeral point-to-point like the DM/group whiteboard — conference_id ->
+# ordered stroke list, so opening it late (or reopening after closing) shows
+# the current canvas instead of always starting blank. In-memory only
+# (cleared on server restart, same durability tier as _pending_answer_sdp);
+# a dead conference's entry just goes stale and is never read again.
+_conference_whiteboard_strokes: Dict[int, List[Dict[str, Any]]] = {}
 
 # States a call can be in before anyone has answered it.
 UNANSWERED_STATUSES = ("initiated", "calling", "ringing")
@@ -5531,6 +5542,8 @@ async def whiteboard_stroke(
     sender_id = int(getattr(current_user, 'id', 0))
     sender_username = str(getattr(current_user, 'username', ''))
     targets = await _whiteboard_targets(payload.username, payload.group_id, payload.conference_id, sender_id, db)
+    if payload.conference_id:
+        _conference_whiteboard_strokes.setdefault(payload.conference_id, []).append(payload.stroke)
     for user_id in targets:
         await ws_manager.send_to_user(user_id, {
             "type": "whiteboard_stroke",
@@ -5553,10 +5566,71 @@ async def whiteboard_clear(
     sender_id = int(getattr(current_user, 'id', 0))
     sender_username = str(getattr(current_user, 'username', ''))
     targets = await _whiteboard_targets(payload.username, payload.group_id, payload.conference_id, sender_id, db)
+    if payload.conference_id:
+        _conference_whiteboard_strokes.pop(payload.conference_id, None)
     for user_id in targets:
         await ws_manager.send_to_user(user_id, {
             "type": "whiteboard_clear",
             "data": {"from": sender_username, "group_id": payload.group_id, "conference_id": payload.conference_id}
+        })
+    return {"success": True}
+
+
+@app.get("/whiteboard/history/{conference_id}")
+async def whiteboard_history(
+    conference_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Current shared canvas for a meeting's whiteboard — lets someone opening
+    it late (or reopening it) see what's already there instead of a blank
+    canvas, the way joining a screen share shows the current frame."""
+    sender_id = int(getattr(current_user, 'id', 0))
+    membership = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.user_id == sender_id,
+        ConferenceParticipant.is_active == True,
+    ).first()
+    if not membership:
+        raise HTTPException(status_code=403, detail="Not an active participant in this conference")
+    return {"strokes": _conference_whiteboard_strokes.get(conference_id, [])}
+
+
+@app.post("/whiteboard/open")
+async def whiteboard_open(
+    payload: WhiteboardOpenRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Announces the whiteboard to everyone in the meeting the moment one
+    participant opens it — so it surfaces for the room the way a screen share
+    would, instead of everyone needing to separately tap in to discover it."""
+    sender_id = int(getattr(current_user, 'id', 0))
+    sender_username = str(getattr(current_user, 'username', ''))
+    targets = await _whiteboard_targets(None, None, payload.conference_id, sender_id, db)
+    for user_id in targets:
+        await ws_manager.send_to_user(user_id, {
+            "type": "whiteboard_opened",
+            "data": {"from": sender_username, "conference_id": payload.conference_id},
+        })
+    return {"success": True}
+
+
+@app.post("/whiteboard/close")
+async def whiteboard_close(
+    payload: WhiteboardOpenRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Mirrors /whiteboard/open — the presenter stopping sharing hides the
+    board for the room the way ending a screen share does."""
+    sender_id = int(getattr(current_user, 'id', 0))
+    sender_username = str(getattr(current_user, 'username', ''))
+    targets = await _whiteboard_targets(None, None, payload.conference_id, sender_id, db)
+    for user_id in targets:
+        await ws_manager.send_to_user(user_id, {
+            "type": "whiteboard_closed",
+            "data": {"from": sender_username, "conference_id": payload.conference_id},
         })
     return {"success": True}
 
