@@ -4545,12 +4545,30 @@ async def create_conference(
     # Add the other party if call provided. The column is recipient_id — reading
     # callee_id raised AttributeError here, so creating a conference from a live
     # call always failed with a 500 and "add participant" never worked.
+    other_id = None
     if call:
         other_id = (int(call.caller_id) if int(call.recipient_id) == caller_id
                     else int(call.recipient_id))
         db.add(ConferenceParticipant(conference_id=conf.id, user_id=other_id))
     db.commit()
     db.refresh(conf)
+
+    # A conference runs on the LiveKit SFU, not the 1:1 mesh peer connection the
+    # two of them are currently on. The other party has to be moved into the room
+    # as well, or they stay on a mesh leg nobody else is connected to — which is
+    # what left an invited third participant audio-only with no way to turn video
+    # on. Their client tears the 1:1 call down and joins conf-<id> on this.
+    if other_id is not None:
+        await ws_manager.send_to_user(int(other_id), {
+            "type": "conference_upgraded",
+            "data": {
+                "conference_id": int(conf.id),
+                "call_id": int(call_id) if call_id else None,
+                "upgraded_by": str(getattr(current_user, 'username', '')),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        })
+
     return {"conference_id": conf.id}
 
 
@@ -7543,9 +7561,24 @@ async def get_media_inbox(
     try:
         user_id = int(getattr(current_user, 'id', 0))
         media_files = MediaService.get_user_media(db, user_id)
-        
+
+        # One-time media whose message has been burned (the recipient read it) is
+        # gone, not merely unreadable — leaving it in the inbox is what kept a
+        # document sitting in the thread after it had already been opened.
+        burned_message_ids = set()
+        message_ids = [int(m.message_id) for m in media_files if getattr(m, 'message_id', None)]
+        if message_ids:
+            burned_message_ids = {
+                int(row.id) for row in db.query(Message.id).filter(
+                    Message.id.in_(message_ids),
+                    Message.is_deleted == True,
+                ).all()
+            }
+
         result = []
         for media in media_files:
+            if int(getattr(media, 'message_id', 0) or 0) in burned_message_ids:
+                continue
             sender = db.query(User).filter(User.id == media.sender_id).first()
             recipient = db.query(User).filter(User.id == media.recipient_id).first()
             result.append({
@@ -7611,6 +7644,7 @@ async def get_media_file(
             
             # Auto-delete from server after viewing (one-time view, user cannot go back)
             MediaService.delete_media_file_from_disk(media.encrypted_file_path)
+            await _burn_one_time_media(db, media, user_id)
             
             return {
                 "media_id": media.media_id,
@@ -8381,6 +8415,43 @@ async def upload_raw_group_media(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
 
+async def _burn_one_time_media(db: Session, media: Media, reader_id: int) -> None:
+    """
+    Retire a one-time media message once its recipient has read it.
+
+    Deleting the encrypted file already made the media unreadable, but the
+    message row stayed behind, so a document kept sitting in the thread after
+    the recipient opened it — it never disappeared, it just stopped working.
+    Only the recipient's read burns it: the sender re-reading their own
+    attachment is not what "read by the recipient" means.
+    """
+    if int(getattr(media, 'sender_id', 0)) == int(reader_id):
+        return
+    if str(getattr(media, 'media_type', '')).lower() == 'voice':
+        return  # voice notes stay replayable — the file is kept on disk too
+
+    message_id = getattr(media, 'message_id', None)
+    if not message_id:
+        return
+    msg = db.query(Message).filter(Message.id == message_id).first()
+    if not msg or bool(getattr(msg, 'is_deleted', False)):
+        return
+
+    setattr(msg, 'is_deleted', True)
+    setattr(msg, 'deleted_at', datetime.now(timezone.utc))
+    db.commit()
+
+    notification = {
+        "type": "message_deleted",
+        "data": {"message_id": int(message_id), "group_id": msg.group_id},
+    }
+    for uid in _message_targets(db, msg):
+        try:
+            await ws_manager.send_to_user(uid, notification)
+        except Exception as e:
+            logger.warning(f"One-time media burn notify failed for user {uid}: {e}")
+
+
 @app.get("/media/download/{media_id}")
 async def download_raw_media(
     media_id: str, 
@@ -8445,6 +8516,9 @@ async def download_raw_media(
         # Voice notes: keep file on disk for replay. Only delete regular media (one-time view).
         if not is_voice:
             MediaService.delete_media_file_from_disk(file_path)
+            # …and retire the message itself, so the attachment disappears from
+            # the thread instead of lingering as a bubble that only 410s.
+            await _burn_one_time_media(db, media, user_id)
         
         content_len = len(content) if hasattr(content, "__len__") else 0
         return Response(
