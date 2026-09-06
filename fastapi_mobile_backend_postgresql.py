@@ -1546,7 +1546,7 @@ class CallService:
             await push_to_user(
                 db, int(recipient.id),
                 f"Incoming {'Video' if call_type == 'video' else 'Voice'} Call",
-                str(caller.username),
+                "Someone is calling you",
                 sound="ringingtone.caf",
             )
         else:
@@ -1641,7 +1641,7 @@ class CallService:
             try:
                 await push_to_user(
                     db, int(call.recipient_id),
-                    "Missed call", f"From {caller_name}", sound="beep.caf",
+                    "Missed call", "You have a missed call", sound="beep.caf",
                 )
             except Exception as e:
                 logger.warning(f"Missed-call push failed: {e}")
@@ -4148,7 +4148,7 @@ async def send_message(message_data: MessageSend,
         if not ws_sent:
             # Recipient offline — fall back to APNs push (sound matches in-app beep)
             title = "You were mentioned" if mentioned else "New message"
-            await push_to_user(db, recipient_id, title, f"From {sender_username}", sound="beep.caf")
+            await push_to_user(db, recipient_id, title, "You have a new message", sound="beep.caf")
         await _fire_webhooks(db, "message.sent", {
             "message_id": getattr(message, "id", None),
             "sender_username": sender_username,
@@ -4643,7 +4643,7 @@ async def conference_invite(
         try:
             await push_to_user(
                 db, invitee_id, "Group call",
-                f"{caller_username} is adding you to a call", sound="ringingtone.caf",
+                "You're being added to a call", sound="ringingtone.caf",
             )
         except Exception as e:
             logger.warning(f"Conference invite push failed: {e}")
@@ -6248,7 +6248,7 @@ async def send_group_message(
                     member_user = db.query(User).filter(User.id == member.user_id).first()
                     was_mentioned = bool(member_user and member_user.username in mentioned_usernames)
                     title = "You were mentioned" if was_mentioned else "New message"
-                    await push_to_user(db, member.user_id, title, f"From {sender_username}", sound="beep.caf")
+                    await push_to_user(db, member.user_id, title, "You have a new message", sound="beep.caf")
                 
         return {
             "status": "sent",
@@ -8398,7 +8398,7 @@ async def upload_raw_group_media(
             if member.user_id != sender_id:
                 ws_sent = await ws_manager.send_to_user(member.user_id, notification)
                 if not ws_sent:
-                    await push_to_user(db, member.user_id, "New message", f"From {sender_username}", sound="beep.caf")
+                    await push_to_user(db, member.user_id, "New message", "You have a new message", sound="beep.caf")
 
         return {
             "media_id": unique_filename,
