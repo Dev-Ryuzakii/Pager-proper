@@ -59,6 +59,7 @@ from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
 from decoy_document import generate_decoy_document
 from push_notifications import push_to_user
+from copilot_ollama import parse_schedule_text
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -162,6 +163,10 @@ class MeetingCreateRequest(BaseModel):
 
 class MeetingJoinRequest(BaseModel):
     join_code: str = Field(..., description="Short code shared with invitees")
+
+class CopilotScheduleRequest(BaseModel):
+    text: str = Field(..., description="Freeform text the user typed directly into the copilot box")
+    current_time: str = Field(..., description="Client's local 'now' (ISO 8601), so relative phrases like 'tomorrow' resolve correctly")
 
 class WhiteboardStrokeRequest(BaseModel):
     username: Optional[str] = Field(None, description="1:1 target — exactly one of username/group_id/conference_id")
@@ -5083,6 +5088,26 @@ async def _send_meeting_card(
         })
         if not sent:
             await push_to_user(db, recipient_id, "Meeting", f"{sender_username} scheduled a meeting", sound="beep.caf")
+
+
+@app.post("/copilot/parse-schedule")
+async def copilot_parse_schedule(
+    payload: CopilotScheduleRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Turns a freeform request like "call with the team tomorrow at 3 for half
+    an hour" into {title, scheduled_at, duration_minutes} via the local
+    Ollama model — see copilot_ollama.py. Deliberately does not create the
+    meeting itself: the client prefills the existing New Meeting flow with
+    this and still requires the user to pick attendees and confirm. Never
+    reads message content; `text` is whatever the user typed directly into
+    the copilot box.
+    """
+    result = await parse_schedule_text(payload.text, payload.current_time)
+    if result is None:
+        raise HTTPException(status_code=502, detail="Copilot couldn't parse that — try rephrasing, or enter the meeting details manually")
+    return result
 
 
 @app.post("/meetings/create")
