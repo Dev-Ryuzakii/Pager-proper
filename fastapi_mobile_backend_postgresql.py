@@ -60,7 +60,15 @@ from voice_scrambler import generate_voice_decoy
 from decoy_document import generate_decoy_document
 from decoy_image import generate_decoy_image, IMAGE_DECOY_KINDS
 from push_notifications import push_to_user
-from copilot_ollama import parse_schedule_text
+from copilot_ollama import (
+    parse_schedule_text,
+    summarize_thread,
+    compose_reply,
+    answer_document_question,
+    translate_text,
+)
+from voice_transcribe import transcribe_audio
+from link_preview import fetch_link_preview
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -168,6 +176,24 @@ class MeetingJoinRequest(BaseModel):
 class CopilotScheduleRequest(BaseModel):
     text: str = Field(..., description="Freeform text the user typed directly into the copilot box")
     current_time: str = Field(..., description="Client's local 'now' (ISO 8601), so relative phrases like 'tomorrow' resolve correctly")
+
+class CopilotSummarizeRequest(BaseModel):
+    text: str = Field(..., description="Decrypted thread text the client has chosen to share, one message per line")
+
+class CopilotComposeRequest(BaseModel):
+    context: str = Field(..., description="Decrypted message/situation being replied to")
+    instruction: Optional[str] = Field(None, description="Optional steer, e.g. 'more formal', 'shorter'")
+
+class CopilotDocumentQARequest(BaseModel):
+    document_text: str = Field(..., description="Decrypted, unlocked document text")
+    question: str = Field(..., description="Question about the document")
+
+class CopilotTranslateRequest(BaseModel):
+    text: str = Field(..., description="Decrypted text to translate")
+    target_language: str = Field(..., description="Free-form target language name, e.g. 'French', 'Yoruba'")
+
+class LinkPreviewRequest(BaseModel):
+    url: str = Field(..., description="URL to unfurl — fetched server-side so the viewer's IP is never exposed to the linked site")
 
 class WhiteboardStrokeRequest(BaseModel):
     username: Optional[str] = Field(None, description="1:1 target — exactly one of username/group_id/conference_id")
@@ -5111,6 +5137,109 @@ async def copilot_parse_schedule(
     return result
 
 
+@app.post("/copilot/summarize")
+async def copilot_summarize(
+    payload: CopilotSummarizeRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Summarizes thread text the client has already decrypted locally and
+    chosen to share for this one request — never pulled from chat history
+    automatically, never stored server-side.
+    """
+    summary = await summarize_thread(payload.text)
+    if summary is None:
+        raise HTTPException(status_code=502, detail="Copilot couldn't summarize that — try again")
+    return {"summary": summary}
+
+
+@app.post("/copilot/compose")
+async def copilot_compose(
+    payload: CopilotComposeRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Drafts up to 3 reply options for a message the client has decrypted and
+    chosen to share, optionally steered by `instruction` (tone/length).
+    """
+    suggestions = await compose_reply(payload.context, payload.instruction)
+    if suggestions is None:
+        raise HTTPException(status_code=502, detail="Copilot couldn't draft a reply — try again")
+    return {"suggestions": suggestions}
+
+
+@app.post("/copilot/document-qa")
+async def copilot_document_qa(
+    payload: CopilotDocumentQARequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Answers a question grounded in document text the client has already
+    unlocked (master-token revealed) and chosen to share for this question.
+    """
+    answer = await answer_document_question(payload.document_text, payload.question)
+    if answer is None:
+        raise HTTPException(status_code=502, detail="Copilot couldn't answer that — try again")
+    return {"answer": answer}
+
+
+@app.post("/copilot/translate")
+async def copilot_translate(
+    payload: CopilotTranslateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Translates decrypted text the client has chosen to share."""
+    translated = await translate_text(payload.text, payload.target_language)
+    if translated is None:
+        raise HTTPException(status_code=502, detail="Copilot couldn't translate that — try again")
+    return {"translated": translated}
+
+
+@app.post("/copilot/transcribe")
+async def copilot_transcribe(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Transcribes audio the client has already decrypted locally and uploaded
+    for this one request — the backend never has plaintext for a real E2EE
+    voice note, only its ciphertext, so this can only ever work on audio
+    handed to it explicitly for transcription, matching every other copilot
+    endpoint's opt-in model. Nothing here is stored.
+
+    Requires faster-whisper (`pip install faster-whisper`) — returns 503
+    with a clear message if it isn't installed, rather than a confusing
+    generic failure.
+    """
+    import asyncio
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+    suffix = os.path.splitext(file.filename or "")[1] or ".m4a"
+    loop = asyncio.get_event_loop()
+    text = await loop.run_in_executor(None, transcribe_audio, audio_bytes, suffix)
+    if text is None:
+        raise HTTPException(status_code=503, detail="Transcription isn't available on this server yet — install faster-whisper")
+    return {"transcript": text}
+
+
+@app.post("/links/preview")
+async def link_preview(
+    payload: LinkPreviewRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Server-side link unfurling — fetched from this server so the viewer's
+    IP/user-agent is never exposed to whatever site is linked. SSRF-hardened
+    (see link_preview.py): rejects internal/private/metadata addresses,
+    revalidates every redirect hop, bounded size and timeout.
+    """
+    preview = await fetch_link_preview(payload.url)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="No preview available for that link")
+    return preview
+
+
 @app.post("/meetings/create")
 async def create_meeting(
     payload: MeetingCreateRequest,
@@ -7290,6 +7419,75 @@ async def my_account_deletion_status(current_user: User = Depends(get_current_us
         "request_id": req.id, "status": req.status,
         "requested_at": req.requested_at.isoformat() if req.requested_at else None,
         "processed_at": req.processed_at.isoformat() if req.processed_at else None,
+    }
+
+
+@app.get("/account/export-messages")
+async def export_messages(
+    after_id: Optional[int] = Query(None, description="Cursor — return messages with id > after_id, oldest first"),
+    limit: int = Query(500, ge=1, le=1000),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """
+    Bulk export of every message (DM + group) this user is party to, for a
+    client-side encrypted local backup. Purely a paginated dump of what a
+    client could already reconstruct one conversation at a time — this just
+    saves the round trips. Stays fully E2EE: ciphertext, keys, and IVs pass
+    through unchanged, this endpoint never decrypts anything. The backup
+    file itself (encrypting it with a passphrase, writing it to disk) is
+    entirely a client-side concern — this only supplies the data to save.
+
+    Page through with `after_id` (the last message's id from the previous
+    page) until `has_more` is false.
+    """
+    user_id = int(getattr(current_user, 'id', 0))
+    group_ids = [row[0] for row in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()]
+
+    query = db.query(Message).filter(
+        or_(
+            Message.sender_id == user_id,
+            Message.recipient_id == user_id,
+            Message.group_id.in_(group_ids) if group_ids else False,
+        )
+    )
+    if after_id is not None:
+        query = query.filter(Message.id > after_id)
+    msgs = query.order_by(Message.id.asc()).limit(limit + 1).all()
+
+    has_more = len(msgs) > limit
+    msgs = msgs[:limit]
+
+    user_ids = {int(m.sender_id) for m in msgs if m.sender_id} | {int(m.recipient_id) for m in msgs if m.recipient_id}
+    users_by_id = {u.id: u.username for u in db.query(User).filter(User.id.in_(user_ids)).all()} if user_ids else {}
+
+    result = []
+    for msg in msgs:
+        is_deleted = bool(getattr(msg, 'is_deleted', False))
+        result.append({
+            "id": int(msg.id),
+            "sender": users_by_id.get(msg.sender_id),
+            "recipient": users_by_id.get(msg.recipient_id) if msg.recipient_id else None,
+            "group_id": msg.group_id,
+            "content": '' if is_deleted else str(getattr(msg, 'encrypted_content', '') or ''),
+            "decoy_content": '' if is_deleted else str(getattr(msg, 'decoy_content', '') or ''),
+            "content_type": "deleted" if is_deleted else str(getattr(msg, 'content_type', '') or ''),
+            "encrypted_key": None if is_deleted else getattr(msg, 'encrypted_key', None),
+            "iv": None if is_deleted else getattr(msg, 'iv', None),
+            "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+            "is_deleted": is_deleted,
+            "is_edited": bool(getattr(msg, 'is_edited', False)),
+            "is_pinned": bool(getattr(msg, 'is_pinned', False)),
+            "reply_to_message_id": msg.reply_to_message_id,
+            "forwarded_from_message_id": msg.forwarded_from_message_id,
+            "mentions": msg.mentions or [],
+        })
+
+    return {
+        "messages": result,
+        "count": len(result),
+        "has_more": has_more,
+        "next_after_id": result[-1]["id"] if result and has_more else None,
     }
 
 

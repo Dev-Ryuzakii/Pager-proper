@@ -1,24 +1,19 @@
 """
-Dilarion Copilot — natural-language meeting scheduling.
+Dilarion Copilot — Ollama-backed assistant features.
 
-Deliberately the narrowest possible slice: this module never sees message
-content, never picks attendees, never touches anything E2EE. It takes one
-line of text the user typed directly into a "Ask Copilot" box (not pulled
-from any chat) and asks the local Ollama model to turn it into
-{title, scheduled_at, duration_minutes} — the exact fields
-MeetingCreateRequest expects, so a client can drop the result straight into
-the existing "New Meeting" flow's prefill and still requires the user to
-review/pick attendees and confirm before anything is actually created.
-
-Ollama runs on localhost on this same VPS — never exposed externally, no
-network hop, no third-party API key.
+Every function here shares the same design rule: it only ever sees the exact
+text a client explicitly hands it for THIS ONE request — never pulled from
+chat history automatically, never stored, never logged in full. A client
+decrypts locally and opts in per-call; nothing here changes that. Ollama
+runs on localhost on this same VPS — never exposed externally, no network
+hop, no third-party API key.
 """
 
 import json
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -26,6 +21,47 @@ logger = logging.getLogger(__name__)
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+
+# Generous but bounded — keeps prompt size (and CPU latency) predictable
+# regardless of what a client sends, without silently truncating anything
+# reasonable a person would actually paste in.
+_MAX_INPUT_CHARS = 16000
+
+
+async def _ollama_generate(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    json_mode: bool = False,
+    timeout: float = 60.0,
+) -> Optional[str]:
+    """
+    Shared low-level Ollama call. Returns the raw text response, or None on
+    any failure (unreachable, non-200, timeout) — every caller below treats
+    None as "surface a clear try-again error", never as license to guess.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "system": system_prompt,
+                    "prompt": user_prompt,
+                    "format": "json" if json_mode else "",
+                    "stream": False,
+                    "options": {"temperature": 0.2},
+                },
+            )
+        if resp.status_code != 200:
+            logger.warning(f"[copilot] Ollama returned {resp.status_code}: {resp.text[:200]}")
+            return None
+        return resp.json().get("response", "")
+    except Exception as e:
+        # str(e) can be empty for some httpx exceptions — always log the type
+        # too, or a failure like that is undiagnosable from the log alone.
+        logger.warning(f"[copilot] Ollama call failed: {type(e).__name__}: {e}")
+        return None
 
 _SYSTEM_PROMPT = """You extract meeting-scheduling details from a short natural-language request.
 
@@ -116,3 +152,92 @@ async def parse_schedule_text(text: str, current_time_iso: str) -> Optional[Dict
         "confidence": confidence,
         "note": note,
     }
+
+
+_SUMMARIZE_PROMPT = """You summarize a chat conversation. You will be given the decrypted text of a thread, in chronological order, one message per line.
+
+Write a short summary: 3-6 sentences, or a short bullet list if there are distinct topics. Call out any decisions made or action items mentioned. Do not invent anything not in the text. Respond with ONLY the summary — no preamble like "Here is a summary", no markdown headers."""
+
+
+async def summarize_thread(text: str) -> Optional[str]:
+    """
+    Summarizes chat text the client has already decrypted and chosen to
+    share for this one request. Returns None on failure.
+    """
+    trimmed = text.strip()[:_MAX_INPUT_CHARS]
+    if not trimmed:
+        return None
+    result = await _ollama_generate(_SUMMARIZE_PROMPT, trimmed)
+    return result.strip() if result else None
+
+
+_COMPOSE_PROMPT = """You help draft a reply message in a chat. You will be given the message (or situation) being replied to, and optionally an instruction about tone or length.
+
+Produce exactly 3 distinct, short reply options a person could send as-is. Vary them (e.g. one brief, one more detailed, one with a different tone) rather than giving 3 near-identical replies.
+
+Respond with ONLY a JSON array of exactly 3 strings, no other text, no markdown fences. Example: ["Sounds good, see you then!", "Works for me — I'll bring the notes from last time.", "Can we push it 30 minutes? Running a bit behind."]"""
+
+
+async def compose_reply(context: str, instruction: Optional[str] = None) -> Optional[List[str]]:
+    """
+    Drafts reply options for a message the client has decrypted and chosen
+    to share. `instruction` is an optional free-form steer ("more formal",
+    "shorter"). Returns a list of suggestion strings, or None on failure.
+    """
+    trimmed_context = context.strip()[:_MAX_INPUT_CHARS]
+    if not trimmed_context:
+        return None
+    prompt = f"Message to reply to: {trimmed_context}"
+    if instruction and instruction.strip():
+        prompt += f"\n\nInstruction: {instruction.strip()[:200]}"
+    raw = await _ollama_generate(_COMPOSE_PROMPT, prompt, json_mode=True)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning(f"[copilot] compose_reply got non-JSON response: {raw[:200]!r}")
+        return None
+    if not isinstance(parsed, list) or not parsed:
+        return None
+    suggestions = [str(s).strip() for s in parsed if str(s).strip()][:3]
+    return suggestions or None
+
+
+_DOCUMENT_QA_PROMPT = """You answer a question using ONLY the document text provided below. If the answer isn't in the document, say so plainly rather than guessing or using outside knowledge.
+
+Respond with ONLY the answer — no preamble, no repeating the question."""
+
+
+async def answer_document_question(document_text: str, question: str) -> Optional[str]:
+    """
+    Answers a question grounded in document text the client has already
+    unlocked (master-token revealed) and chosen to share for this one
+    question. Returns None on failure.
+    """
+    trimmed_doc = document_text.strip()[:_MAX_INPUT_CHARS]
+    trimmed_q = question.strip()[:500]
+    if not trimmed_doc or not trimmed_q:
+        return None
+    prompt = f"Document:\n{trimmed_doc}\n\nQuestion: {trimmed_q}"
+    result = await _ollama_generate(_DOCUMENT_QA_PROMPT, prompt)
+    return result.strip() if result else None
+
+
+_TRANSLATE_PROMPT_TEMPLATE = """You translate text into {language}. Respond with ONLY the translation — no quotes, no explanation, no notes about the source language."""
+
+
+async def translate_text(text: str, target_language: str) -> Optional[str]:
+    """
+    Translates text the client has decrypted and chosen to share.
+    `target_language` is a free-form name ("French", "Yoruba", "es") — the
+    model resolves it, no fixed language list to maintain. Returns None on
+    failure.
+    """
+    trimmed = text.strip()[:_MAX_INPUT_CHARS]
+    lang = target_language.strip()[:50]
+    if not trimmed or not lang:
+        return None
+    system_prompt = _TRANSLATE_PROMPT_TEMPLATE.format(language=lang)
+    result = await _ollama_generate(system_prompt, trimmed)
+    return result.strip() if result else None
