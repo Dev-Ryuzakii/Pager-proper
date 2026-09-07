@@ -68,7 +68,11 @@ async def parse_schedule_text(text: str, current_time_iso: str) -> Optional[Dict
     """
     prompt = f"Current date and time: {current_time_iso}\n\nRequest: {text.strip()}"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # 60s, not 30s — qwen2.5:7b on a CPU-shared VPS can occasionally be
+        # slow to respond under load (e.g. a concurrent heavy pip
+        # install/model download), and a spurious timeout here reads to the
+        # user as copilot silently failing rather than just being slow.
+        async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{OLLAMA_BASE_URL}/api/generate",
                 json={
@@ -86,7 +90,10 @@ async def parse_schedule_text(text: str, current_time_iso: str) -> Optional[Dict
         raw = resp.json().get("response", "")
         parsed = json.loads(raw)
     except Exception as e:
-        logger.warning(f"[copilot] parse_schedule_text failed: {e}")
+        # str(e) can be empty for some httpx exceptions (e.g. a bare
+        # ConnectError) — always log the exception type too, or a failure
+        # like this one is undiagnosable from the log alone.
+        logger.warning(f"[copilot] parse_schedule_text failed: {type(e).__name__}: {e}")
         return None
 
     scheduled_at = _parse_iso(parsed.get("scheduled_at"))
