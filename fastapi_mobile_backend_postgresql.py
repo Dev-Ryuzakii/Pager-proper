@@ -58,6 +58,7 @@ from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
 from decoy_document import generate_decoy_document
+from decoy_image import generate_decoy_image, IMAGE_DECOY_KINDS
 from push_notifications import push_to_user
 from copilot_ollama import parse_schedule_text
 
@@ -7005,6 +7006,54 @@ async def get_decoy_file(
     return FileResponse(cached, media_type="application/pdf")
 
 
+@app.get("/media/decoy-image/{media_id}")
+async def get_decoy_image(
+    media_id: str,
+    db: Session = Depends(get_database_session),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    A stand-in photo for a locked image/video attachment — same model as
+    get_decoy_file above, just for the one media type that had no decoy at
+    all until now (locked photos previously showed an opaque placeholder
+    with nothing to tap through to, the one real inconsistency left in the
+    decoy system versus text/document/voice).
+
+    Deliberately never generates faces/people — see decoy_image.py's own
+    docstring. Padded towards the real file's size so the listing doesn't
+    give it away, and cached per media_id so replays show the same image.
+    """
+    media = db.query(Media).filter(Media.media_id == media_id).first()
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
+    clean_media_id = os.path.splitext(media_id)[0]
+
+    user_id = int(getattr(current_user, 'id', 0))
+    authorized = media.sender_id == user_id or media.recipient_id == user_id
+    if not authorized and media.group_id:
+        authorized = db.query(GroupMember).filter(
+            GroupMember.group_id == media.group_id,
+            GroupMember.user_id == user_id
+        ).first() is not None
+    if not authorized:
+        raise HTTPException(status_code=403, detail="Not authorized for this media")
+
+    os.makedirs(DECOY_CACHE_DIR, exist_ok=True)
+    cached = os.path.join(DECOY_CACHE_DIR, f"{clean_media_id}.jpg")
+    if not os.path.exists(cached):
+        jpg, _kind = generate_decoy_image(
+            seed=clean_media_id,
+            target_size=int(getattr(media, 'file_size', 0) or 0) or None,
+            kind=getattr(media, 'decoy_kind', None),
+        )
+        tmp = os.path.join(DECOY_CACHE_DIR, f".tmp_{uuid.uuid4().hex}.jpg")
+        with open(tmp, "wb") as f:
+            f.write(jpg)
+        os.replace(tmp, cached)
+
+    return FileResponse(cached, media_type="image/jpeg")
+
+
 @app.get("/media/decoy-voice/{media_id}")
 async def get_decoy_voice(
     media_id: str,
@@ -8197,7 +8246,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 DECOY_CACHE_DIR = "decoy_cache"
 os.makedirs(DECOY_CACHE_DIR, exist_ok=True)
 
-DECOY_KINDS = {"invoice", "delivery", "minutes", "memo"}
+DECOY_KINDS = {"invoice", "delivery", "minutes", "memo"} | set(IMAGE_DECOY_KINDS)
 
 @app.post("/media/upload_raw")
 async def upload_raw_media(
@@ -8536,9 +8585,25 @@ async def download_raw_media(
         # Read the file content
         with open(file_path, "rb") as file:
             content = file.read()
-        
+
+        # Dynamic leak-trace watermark: stamped with whoever is ACTUALLY
+        # downloading this real one-time copy right now, not whoever it was
+        # originally addressed to at upload — the two differ for group media
+        # and forwards, which is exactly the case this needs to cover.
+        download_time = datetime.now(timezone.utc)
+        try:
+            content = apply_watermark(
+                content,
+                str(getattr(media, 'content_type', '') or ''),
+                str(getattr(media, 'filename', '') or ''),
+                str(getattr(current_user, 'username', '') or ''),
+                viewed_at=download_time.strftime('%Y-%m-%d %H:%M UTC'),
+            )
+        except Exception as e:
+            logger.warning(f"Download-time watermark failed for {media_id}: {e}")
+
         # Mark media as downloaded
-        media.downloaded_at = datetime.now(timezone.utc)
+        media.downloaded_at = download_time
         db.commit()
         
         # Voice notes: keep file on disk for replay. Only delete regular media (one-time view).

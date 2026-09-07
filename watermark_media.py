@@ -150,15 +150,22 @@ def apply_watermark(
     content_type: str,
     filename: str,
     recipient_username: str,
+    viewed_at: Optional[str] = None,
 ) -> bytes:
     """
     Apply up to WATERMARKS_PER_MEDIA watermarks to media bytes.
-    Watermark text is the recipient's username (for leak detection).
+    Watermark text is the recipient's username (for leak detection), plus an
+    optional timestamp — pass `viewed_at` (an ISO string) when this is being
+    stamped at the moment someone actually opens/downloads the file, not at
+    upload time, so the mark reflects who *specifically* pulled this exact
+    copy and when, not just who it was addressed to. Matters most for group
+    media, where "addressed to" and "who leaked it" aren't the same person.
     Supported: images (JPEG, PNG, etc.) and PDF. Others returned unchanged.
     """
     if not data:
         return data
-    payload_text = (recipient_username or "User").strip() or "User"
+    base = (recipient_username or "User").strip() or "User"
+    payload_text = f"{base} · {viewed_at}" if viewed_at else base
     ct = (content_type or "").lower()
     fn = (filename or "").lower()
 
