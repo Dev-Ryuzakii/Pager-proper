@@ -36,8 +36,9 @@ Respond with ONLY a JSON object, no other text, no markdown fences, matching exa
 
 Rules:
 - "scheduled_at" must be an ISO 8601 date-time (e.g. "2026-09-07T15:00:00"), in the same local time as the current time you were given — no timezone suffix needed.
-- If no title is stated, use a short generic one like "Meeting" or "Call".
+- Prefer a short, specific title drawn from what the meeting is actually about (e.g. "Dilarion & CGAS progress update") over a generic one — only fall back to "Meeting" or "Call" when the request gives no topic at all.
 - If no duration is stated, default duration_minutes to 30.
+- If a date is given but no time of day is stated, default to 09:00 (business hours) rather than midnight, set confidence to "low", and say so in "note" (e.g. "No time given — assumed 9:00 AM") so the app can flag it for the user to double-check.
 - If the request has no discernible date/time at all, still give your best guess for scheduled_at, but set confidence to "low" and explain briefly in "note".
 - If confidence is "high", "note" should be an empty string.
 - Never invent attendee names or emails — this only extracts title/time/duration, nothing else.
