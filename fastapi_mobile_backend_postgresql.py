@@ -4176,6 +4176,15 @@ async def register_device_token(payload: DeviceTokenRegister,
         logger.error(f"Register device token error: {e}")
         raise HTTPException(status_code=500, detail="Failed to register device token")
 
+def _resolve_disappear_hours(sender: User, explicit: Optional[int], kind: str) -> Optional[int]:
+    """A client-supplied disappear_after_hours always wins (per-message
+    override); otherwise falls back to the sender's own stored default for
+    that content kind (see User.disappear_{text,media,voice}_hours, set via
+    /users/me/disappear-settings). None either way = never disappears."""
+    if explicit is not None:
+        return explicit
+    return getattr(sender, f"disappear_{kind}_hours", None)
+
 @app.post("/messages/send")
 async def send_message(message_data: MessageSend, 
                       current_user: User = Depends(get_current_user),
@@ -4184,7 +4193,8 @@ async def send_message(message_data: MessageSend,
     try:
         user_id = int(getattr(current_user, 'id', 0)) if hasattr(getattr(current_user, 'id', 0), '__int__') else int(getattr(current_user, 'id', 0))
         message = MessageService.send_message_by_username(
-            db, user_id, message_data.username, message_data.message, message_data.disappear_after_hours,
+            db, user_id, message_data.username, message_data.message,
+            _resolve_disappear_hours(current_user, message_data.disappear_after_hours, "text"),
             message_data.encrypted_key, message_data.iv, message_data.decoy_content,
             reply_to_message_id=message_data.reply_to_message_id,
             forwarded_from_message_id=message_data.forwarded_from_message_id,
@@ -6512,7 +6522,7 @@ async def send_group_message(
             
         message = MessageService.send_message_to_group(
             db, user_id, payload.group_id, payload.message,
-            payload.disappear_after_hours, addressed_to_id, is_announcement,
+            _resolve_disappear_hours(current_user, payload.disappear_after_hours, "text"), addressed_to_id, is_announcement,
             payload.encrypted_key, payload.iv, payload.decoy_content,
             reply_to_message_id=payload.reply_to_message_id,
             forwarded_from_message_id=payload.forwarded_from_message_id,
@@ -6705,6 +6715,51 @@ async def delete_message(
             await ws_manager.send_to_user(uid, notification)
 
     return {"status": "deleted"}
+
+
+@app.post("/messages/clear/{other_username}")
+async def clear_conversation(
+    other_username: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Clears an entire 1:1 conversation for both people — same soft-delete
+    tombstone the single-message delete uses, just bulk and not restricted to
+    messages you personally sent (clearing a chat should actually clear it).
+    Media files on disk for any cleared messages are also removed."""
+    user_id = int(getattr(current_user, 'id', 0))
+    other = db.query(User).filter(User.username == other_username, User.is_active == True).first()
+    if not other:
+        raise HTTPException(status_code=404, detail="User not found")
+    other_id = int(other.id)
+
+    messages = db.query(Message).filter(
+        Message.group_id.is_(None),
+        Message.is_deleted == False,
+        or_(
+            and_(Message.sender_id == user_id, Message.recipient_id == other_id),
+            and_(Message.sender_id == other_id, Message.recipient_id == user_id),
+        ),
+    ).all()
+
+    now = datetime.now(timezone.utc)
+    cleared_ids = []
+    for msg in messages:
+        media = db.query(Media).filter(Media.message_id == msg.id).first()
+        if media and media.encrypted_file_path and os.path.exists(media.encrypted_file_path):
+            MediaService.delete_media_file_from_disk(media.encrypted_file_path)
+        msg.is_deleted = True
+        msg.deleted_at = now
+        cleared_ids.append(msg.id)
+    db.commit()
+
+    if cleared_ids:
+        await ws_manager.send_to_user(other_id, {
+            "type": "conversation_cleared",
+            "data": {"with_username": str(getattr(current_user, 'username', '')), "message_ids": cleared_ids},
+        })
+    monitor_record_event("messages", "clear_conversation", user_id=user_id, detail=f"{len(cleared_ids)} messages")
+    return {"status": "cleared", "count": len(cleared_ids)}
 
 
 @app.post("/messages/{message_id}/pin")
@@ -7192,6 +7247,40 @@ async def get_call_history(
     except Exception as e:
         logger.error(f"Call history error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve call history")
+
+class DisappearSettingsRequest(BaseModel):
+    text_hours: Optional[int] = Field(None, description="Default disappear timer for plain text messages you send, in hours. Null/omitted = never.")
+    media_hours: Optional[int] = Field(None, description="Default disappear timer for photos/videos/documents you send. Null/omitted = never.")
+    voice_hours: Optional[int] = Field(None, description="Default disappear timer for voice notes you send. Null/omitted = never.")
+
+@app.get("/users/me/disappear-settings")
+async def get_disappear_settings(current_user: User = Depends(get_current_user)):
+    """Your own default disappearing-message timers — applied automatically
+    to anything you send that doesn't explicitly override it per-message."""
+    return {
+        "text_hours": current_user.disappear_text_hours,
+        "media_hours": current_user.disappear_media_hours,
+        "voice_hours": current_user.disappear_voice_hours,
+    }
+
+@app.post("/users/me/disappear-settings")
+async def set_disappear_settings(
+    data: DisappearSettingsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    for hours, label in ((data.text_hours, "text_hours"), (data.media_hours, "media_hours"), (data.voice_hours, "voice_hours")):
+        if hours is not None and hours <= 0:
+            raise HTTPException(status_code=400, detail=f"{label} must be a positive number of hours, or omitted to turn it off")
+    current_user.disappear_text_hours = data.text_hours
+    current_user.disappear_media_hours = data.media_hours
+    current_user.disappear_voice_hours = data.voice_hours
+    db.commit()
+    return {
+        "text_hours": current_user.disappear_text_hours,
+        "media_hours": current_user.disappear_media_hours,
+        "voice_hours": current_user.disappear_voice_hours,
+    }
 
 @app.post("/users/me/voice-identity")
 async def upload_voice_identity(
@@ -8209,6 +8298,7 @@ async def list_operators(
              "admin_role": u.admin_role, "is_active": u.is_active,
              "can_approve_duress_wipe": bool(u.can_approve_duress_wipe),
              "monitored_services": u.monitored_services or [],
+             "accessible_pages": u.accessible_pages,
              "last_login": str(u.last_login) if u.last_login else None} for u in ops]
 
 class UpdateOperatorRequest(BaseModel):
@@ -8263,9 +8353,49 @@ async def delete_operator(
 # (E2EE — this server never sees plaintext), so those two channels are fed by
 # clients self-reporting local crypto failures via POST /monitoring/client-event.
 
+# Must match the `path` segments in pager-admin's AdminLayout.jsx ALL_NAV.
+ADMIN_PAGE_KEYS = [
+    "users", "groups", "emergency", "field-ops", "wipe-approvals",
+    "account-deletions", "recordings", "operators", "service-health",
+    "device-policy", "kill-switch", "data-purge", "settings",
+]
+
 class SetServiceAccessRequest(BaseModel):
     username: str
     services: List[str] = Field(default_factory=list, description="Subset of known service names this admin may monitor")
+
+class SetPageAccessRequest(BaseModel):
+    username: str
+    pages: Optional[List[str]] = Field(None, description="Subset of ADMIN_PAGE_KEYS this admin may see; null clears the override back to their role's default")
+
+@app.post("/admin/users/page-access")
+async def set_page_access(
+    data: SetPageAccessRequest,
+    current_sa: User = Depends(get_superadmin_only),
+    db: Session = Depends(get_database_session),
+):
+    """Superadmin picks which pager-admin pages an admin/operator can see.
+    Passing pages=null clears the override, falling back to their role's
+    default set (matches pre-existing behavior for anyone never assigned one)."""
+    target = db.query(User).filter(User.username == data.username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if getattr(target, 'admin_role', None) == 'superadmin':
+        raise HTTPException(status_code=400, detail="Superadmin already sees every page")
+    if data.pages is None:
+        target.accessible_pages = None
+    else:
+        unknown = [p for p in data.pages if p not in ADMIN_PAGE_KEYS]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Unknown page key(s): {unknown}")
+        target.accessible_pages = sorted(set(data.pages))
+    db.commit()
+    return {"username": target.username, "accessible_pages": target.accessible_pages}
+
+@app.get("/admin/page-keys")
+async def list_admin_page_keys(current_admin: User = Depends(get_admin_user)):
+    """So the frontend's access-management UI doesn't have to hardcode the list twice."""
+    return {"pages": ADMIN_PAGE_KEYS}
 
 @app.post("/admin/users/service-access")
 async def set_service_access(
@@ -8635,9 +8765,12 @@ async def admin_login(login_data: AdminLogin, db: Session = Depends(get_database
             "username": str(getattr(user, 'username', '')),
             "token": str(getattr(session, 'session_token', '')),
             "must_change_password": bool(getattr(user, 'must_change_password', False)),
-            "admin_role": getattr(user, 'admin_role', None) or "admin"
+            "admin_role": getattr(user, 'admin_role', None) or "admin",
+            # None = no override, frontend falls back to the role's default
+            # page set; superadmin always gets None (sees everything anyway).
+            "accessible_pages": getattr(user, 'accessible_pages', None),
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -8969,7 +9102,7 @@ async def upload_raw_media(
         
         # Determine if this is a voice note or already encrypted content
         is_voice = content_type == "media/voice" or bool(content_type and content_type.startswith("audio/"))
-        
+
         # Apply watermark ONLY for images and PDFs, and SKIP for voice notes/encrypted blobs
         if not is_voice and not (content_type and "encrypted" in content_type):
             content = apply_watermark(
@@ -8978,19 +9111,21 @@ async def upload_raw_media(
                 file.filename or "media",
                 str(getattr(recipient, "username", "") or "User"),
             )
-        
+
         # Save the uploaded file
         with open(file_path, "wb") as buffer:
             buffer.write(content)
-        
+
         # Get sender ID
         sender_id = int(getattr(current_user, 'id', 0))
-        
-        # Calculate expiration time if disappearing media
+
+        # Calculate expiration time if disappearing media — falls back to the
+        # sender's own default (voice vs. other media) when not explicit.
+        resolved_disappear_hours = _resolve_disappear_hours(current_user, disappear_after_hours, "voice" if is_voice else "media")
         expires_at = None
         auto_delete = False
-        if disappear_after_hours is not None and disappear_after_hours > 0:
-            expires_at = datetime.now(timezone.utc) + timedelta(hours=disappear_after_hours)
+        if resolved_disappear_hours is not None and resolved_disappear_hours > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=resolved_disappear_hours)
             auto_delete = True
         
         # Create message for the media
@@ -9098,10 +9233,11 @@ async def upload_raw_group_media(
         with open(file_path, "wb") as buffer:
             buffer.write(content)
 
+        resolved_disappear_hours = _resolve_disappear_hours(current_user, disappear_after_hours, "voice" if is_voice else "media")
         expires_at = None
         auto_delete = False
-        if disappear_after_hours is not None and disappear_after_hours > 0:
-            expires_at = datetime.now(timezone.utc) + timedelta(hours=disappear_after_hours)
+        if resolved_disappear_hours is not None and resolved_disappear_hours > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=resolved_disappear_hours)
             auto_delete = True
 
         message = Message(

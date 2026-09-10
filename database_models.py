@@ -54,6 +54,19 @@ class User(Base):
     # this admin/operator can view, e.g. ["calls","messages"]. Null/empty = none.
     # Superadmin always sees every service regardless of this list.
     monitored_services = Column(JSON, nullable=True)
+    # Superadmin-granted: which pager-admin pages this admin/operator can see,
+    # e.g. ["users","groups"]. Null = no override — the frontend falls back to
+    # that role's default page set. Superadmin is never restricted by this.
+    accessible_pages = Column(JSON, nullable=True)
+
+    # Per-sender default disappearing-message timers (hours). Null = off.
+    # Applied automatically to a send when the request doesn't explicitly
+    # pass disappear_after_hours — see _resolve_disappear_hours(). Kept
+    # separate per content kind since a user reasonably wants voice notes or
+    # photos to vanish sooner/later than plain text.
+    disappear_text_hours = Column(Integer, nullable=True)
+    disappear_media_hours = Column(Integer, nullable=True)
+    disappear_voice_hours = Column(Integer, nullable=True)
     voice_identity_path = Column(String(512), nullable=True)  # Path to voice identity file
 
     # Master-token 2FA — a second, separate secret required to create/replace
