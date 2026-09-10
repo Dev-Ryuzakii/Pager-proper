@@ -50,6 +50,10 @@ class User(Base):
     # Superadmin-granted: lets this admin approve/reject SOS- and geofence-triggered
     # duress wipe requests. Superadmin can always approve regardless of this flag.
     can_approve_duress_wipe = Column(Boolean, default=False)
+    # Superadmin-granted: which service-health channels (see ServiceEvent.service)
+    # this admin/operator can view, e.g. ["calls","messages"]. Null/empty = none.
+    # Superadmin always sees every service regardless of this list.
+    monitored_services = Column(JSON, nullable=True)
     voice_identity_path = Column(String(512), nullable=True)  # Path to voice identity file
 
     # Master-token 2FA — a second, separate secret required to create/replace
@@ -911,6 +915,25 @@ class CommandAuditLog(Base):
     admin = relationship("User", foreign_keys=[admin_id])
     target_user = relationship("User", foreign_keys=[target_user_id])
     command = relationship("RemoteCommand", foreign_keys=[command_id])
+
+
+class ServiceEvent(Base):
+    """One row per traced operation across every backend feature (calls, messages,
+    media, meetings, copilot, encryption/decryption, webhooks, auth, ...) — the
+    data source for the realtime service-health monitor. `detail` is a short
+    error string for tracing, never message plaintext or media content."""
+    __tablename__ = "service_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service = Column(String(40), nullable=False, index=True)
+    event_type = Column(String(80), nullable=False)
+    status = Column(String(10), nullable=False, default="ok")  # "ok" | "error"
+    detail = Column(Text, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+    user = relationship("User", foreign_keys=[user_id])
 
 
 # Database connection configuration

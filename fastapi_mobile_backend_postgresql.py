@@ -69,6 +69,13 @@ from copilot_ollama import (
 )
 from voice_transcribe import transcribe_audio
 from link_preview import fetch_link_preview
+from service_monitor import (
+    record_event as monitor_record_event,
+    SERVICE_NAMES as MONITOR_SERVICE_NAMES,
+    service_allowed as monitor_service_allowed,
+    subscribe as monitor_subscribe,
+    unsubscribe as monitor_unsubscribe,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -3858,22 +3865,25 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
             ip_address="mobile_app"
         )
         if not user:
+            monitor_record_event("auth", "login", status="error", detail="Invalid username, token, or password")
             raise HTTPException(status_code=401, detail="Invalid username, token, or password")
-        
+
         # Create session
         user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
         session = SessionService.create_session(db, user_id, "mobile", "mobile_app")
-        
+
+        monitor_record_event("auth", "login", user_id=user_id)
         return {
             "username": str(getattr(user, 'username', '')),
             "token": str(getattr(session, 'session_token', '')),
             "is_admin": bool(getattr(user, 'is_admin', False))
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Login error: {e}")
+        monitor_record_event("auth", "login", status="error", detail=f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Login failed")
 
 @app.post("/auth/logout")
@@ -4195,11 +4205,14 @@ async def send_message(message_data: MessageSend,
         if auto_delete and expires_at:
             response["expires_at"] = expires_at.isoformat() if hasattr(expires_at, 'isoformat') else str(expires_at)
             response["auto_delete"] = str(auto_delete).lower()
+        monitor_record_event("messages", "send_dm", user_id=user_id)
         return response
-    except HTTPException:
+    except HTTPException as e:
+        monitor_record_event("messages", "send_dm", status="error", detail=str(e.detail), user_id=int(getattr(current_user, 'id', 0)))
         raise
     except Exception as e:
         logger.error(f"Send message error: {e}")
+        monitor_record_event("messages", "send_dm", status="error", detail=f"{type(e).__name__}: {e}", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=500, detail="Failed to send message")
 
 @app.post("/messages/send_decoy_image")
@@ -4421,15 +4434,18 @@ async def initiate_call(
         call = await CallService.initiate_call(
             db, user_id, call_data.recipient_username, call_data.call_type, call_data.offer_sdp
         )
+        monitor_record_event("calls", "initiate", user_id=user_id)
         return {
             "call_id": int(call.id),
             "status": "initiated",
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-    except HTTPException:
+    except HTTPException as e:
+        monitor_record_event("calls", "initiate", status="error", detail=str(e.detail), user_id=int(getattr(current_user, 'id', 0)))
         raise
     except Exception as e:
         logger.error(f"Initiate call error: {e}")
+        monitor_record_event("calls", "initiate", status="error", detail=f"{type(e).__name__}: {e}", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=500, detail="Failed to initiate call")
 
 @app.get("/calls/{call_id}/status")
@@ -4487,15 +4503,18 @@ async def call_action(
         call = await CallService.update_call_status(
             db, action_data.call_id, user_id, action_data.action, action_data.answer_sdp
         )
+        monitor_record_event("calls", f"action.{action_data.action}", user_id=user_id)
         return {
             "call_id": int(call.id),
             "status": action_data.action,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-    except HTTPException:
+    except HTTPException as e:
+        monitor_record_event("calls", f"action.{action_data.action}", status="error", detail=str(e.detail), user_id=int(getattr(current_user, 'id', 0)))
         raise
     except Exception as e:
         logger.error(f"Call action error: {e}")
+        monitor_record_event("calls", f"action.{action_data.action}", status="error", detail=f"{type(e).__name__}: {e}", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=500, detail="Failed to perform call action")
 
 @app.post("/calls/{call_id}/media-state")
@@ -4546,12 +4565,15 @@ async def send_ice_candidate(
             db, user_id, payload.call_id, payload.recipient_username, payload.candidate
         )
         if not success:
+            monitor_record_event("calls", "ice_candidate", status="error", detail="recipient offline or call invalid", user_id=user_id)
             raise HTTPException(status_code=400, detail="Failed to forward ICE candidate (recipient offline or call invalid)")
+        monitor_record_event("calls", "ice_candidate", user_id=user_id)
         return {"success": True}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Send ICE candidate error: {e}")
+        monitor_record_event("calls", "ice_candidate", status="error", detail=f"{type(e).__name__}: {e}", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=500, detail="Failed to forward ICE candidate")
 
 
@@ -4601,6 +4623,7 @@ async def create_conference(
             }
         })
 
+    monitor_record_event("conference", "create", user_id=caller_id)
     return {"conference_id": conf.id}
 
 
@@ -5133,7 +5156,9 @@ async def copilot_parse_schedule(
     """
     result = await parse_schedule_text(payload.text, payload.current_time)
     if result is None:
+        monitor_record_event("copilot", "parse_schedule", status="error", detail="Ollama returned no result", user_id=current_user.id)
         raise HTTPException(status_code=502, detail="Copilot couldn't parse that — try rephrasing, or enter the meeting details manually")
+    monitor_record_event("copilot", "parse_schedule", user_id=current_user.id)
     return result
 
 
@@ -5149,7 +5174,9 @@ async def copilot_summarize(
     """
     summary = await summarize_thread(payload.text)
     if summary is None:
+        monitor_record_event("copilot", "summarize", status="error", detail="Ollama returned no result", user_id=current_user.id)
         raise HTTPException(status_code=502, detail="Copilot couldn't summarize that — try again")
+    monitor_record_event("copilot", "summarize", user_id=current_user.id)
     return {"summary": summary}
 
 
@@ -5164,7 +5191,9 @@ async def copilot_compose(
     """
     suggestions = await compose_reply(payload.context, payload.instruction)
     if suggestions is None:
+        monitor_record_event("copilot", "compose", status="error", detail="Ollama returned no result", user_id=current_user.id)
         raise HTTPException(status_code=502, detail="Copilot couldn't draft a reply — try again")
+    monitor_record_event("copilot", "compose", user_id=current_user.id)
     return {"suggestions": suggestions}
 
 
@@ -5179,7 +5208,9 @@ async def copilot_document_qa(
     """
     answer = await answer_document_question(payload.document_text, payload.question)
     if answer is None:
+        monitor_record_event("copilot", "document_qa", status="error", detail="Ollama returned no result", user_id=current_user.id)
         raise HTTPException(status_code=502, detail="Copilot couldn't answer that — try again")
+    monitor_record_event("copilot", "document_qa", user_id=current_user.id)
     return {"answer": answer}
 
 
@@ -5191,7 +5222,9 @@ async def copilot_translate(
     """Translates decrypted text the client has chosen to share."""
     translated = await translate_text(payload.text, payload.target_language)
     if translated is None:
+        monitor_record_event("copilot", "translate", status="error", detail="Ollama returned no result", user_id=current_user.id)
         raise HTTPException(status_code=502, detail="Copilot couldn't translate that — try again")
+    monitor_record_event("copilot", "translate", user_id=current_user.id)
     return {"translated": translated}
 
 
@@ -5219,7 +5252,9 @@ async def copilot_transcribe(
     loop = asyncio.get_event_loop()
     text = await loop.run_in_executor(None, transcribe_audio, audio_bytes, suffix)
     if text is None:
+        monitor_record_event("copilot", "transcribe", status="error", detail="faster-whisper not installed", user_id=current_user.id)
         raise HTTPException(status_code=503, detail="Transcription isn't available on this server yet — install faster-whisper")
+    monitor_record_event("copilot", "transcribe", user_id=current_user.id)
     return {"transcript": text}
 
 
@@ -5302,6 +5337,7 @@ async def create_meeting(
         "creator_username": str(getattr(current_user, 'username', '')),
     })
 
+    monitor_record_event("meetings", "create", user_id=creator_id)
     return {
         "meeting_id": meeting.id,
         "join_code": join_code,
@@ -5462,11 +5498,15 @@ async def join_meeting_by_code(
 ):
     meeting = db.query(Meeting).filter(Meeting.join_code == payload.join_code).first()
     if not meeting:
+        monitor_record_event("meetings", "join_by_code", status="error", detail="Meeting not found", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=404, detail="Meeting not found")
     if meeting.status == "cancelled":
+        monitor_record_event("meetings", "join_by_code", status="error", detail="Meeting was cancelled", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=400, detail="Meeting was cancelled")
     if meeting.status == "ended":
+        monitor_record_event("meetings", "join_by_code", status="error", detail="Meeting has already ended", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=400, detail="Meeting has already ended")
+    monitor_record_event("meetings", "join_by_code", user_id=int(getattr(current_user, 'id', 0)))
 
     user_id = int(getattr(current_user, 'id', 0))
     username = str(getattr(current_user, 'username', ''))
@@ -6405,14 +6445,17 @@ async def send_group_message(
                     title = "You were mentioned" if was_mentioned else "New message"
                     await push_to_user(db, member.user_id, title, "You have a new message", sound="beep.caf")
                 
+        monitor_record_event("messages", "send_group", user_id=user_id)
         return {
             "status": "sent",
             "message_id": int(message.id)
         }
-    except HTTPException:
+    except HTTPException as e:
+        monitor_record_event("messages", "send_group", status="error", detail=str(e.detail), user_id=int(getattr(current_user, 'id', 0)))
         raise
     except Exception as e:
         logger.error(f"Send group message error: {e}")
+        monitor_record_event("messages", "send_group", status="error", detail=f"{type(e).__name__}: {e}", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=500, detail="Failed to send group message")
 
 
@@ -8063,6 +8106,7 @@ async def list_operators(
     return [{"id": u.id, "username": u.username, "phone_number": u.phone_number,
              "admin_role": u.admin_role, "is_active": u.is_active,
              "can_approve_duress_wipe": bool(u.can_approve_duress_wipe),
+             "monitored_services": u.monitored_services or [],
              "last_login": str(u.last_login) if u.last_login else None} for u in ops]
 
 class UpdateOperatorRequest(BaseModel):
@@ -8108,6 +8152,163 @@ async def delete_operator(
     op.admin_role = None
     db.commit()
     return {"status": "removed", "username": username}
+
+# ── Service health monitoring ─────────────────────────────────────────────────
+# Realtime tracing per feature (calls, messages, media, meetings, copilot,
+# webhooks, auth, encryption/decryption). Superadmin sees every service by
+# default; an admin/operator only sees what superadmin has assigned them via
+# /admin/users/service-access. Encryption/decryption happen on the CLIENT
+# (E2EE — this server never sees plaintext), so those two channels are fed by
+# clients self-reporting local crypto failures via POST /monitoring/client-event.
+
+class SetServiceAccessRequest(BaseModel):
+    username: str
+    services: List[str] = Field(default_factory=list, description="Subset of known service names this admin may monitor")
+
+@app.post("/admin/users/service-access")
+async def set_service_access(
+    data: SetServiceAccessRequest,
+    current_sa: User = Depends(get_superadmin_only),
+    db: Session = Depends(get_database_session),
+):
+    """Superadmin grants/revokes which service-health channels an admin/operator can view."""
+    target = db.query(User).filter(User.username == data.username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if getattr(target, 'admin_role', None) == 'superadmin':
+        raise HTTPException(status_code=400, detail="Superadmin already sees every service")
+    unknown = [s for s in data.services if s not in MONITOR_SERVICE_NAMES]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown service name(s): {unknown}")
+    target.monitored_services = sorted(set(data.services))
+    db.commit()
+    return {"username": target.username, "monitored_services": target.monitored_services}
+
+@app.get("/admin/service-health/services")
+async def list_service_health_services(
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Known service names, filtered to what this admin may view, with a quick
+    ok/error count over the last hour so the dashboard can render a status dot
+    before the realtime feed has produced anything."""
+    from database_models import ServiceEvent
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    visible = [s for s in MONITOR_SERVICE_NAMES if monitor_service_allowed(current_admin, s)]
+    result = []
+    for service in visible:
+        ok_count = db.query(ServiceEvent).filter(
+            ServiceEvent.service == service, ServiceEvent.status == "ok", ServiceEvent.created_at >= since,
+        ).count()
+        error_count = db.query(ServiceEvent).filter(
+            ServiceEvent.service == service, ServiceEvent.status == "error", ServiceEvent.created_at >= since,
+        ).count()
+        result.append({"service": service, "ok_count_1h": ok_count, "error_count_1h": error_count})
+    return {"services": result, "is_superadmin": getattr(current_admin, 'admin_role', None) == 'superadmin'}
+
+@app.get("/admin/service-health/events")
+async def list_service_health_events(
+    service: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    limit: int = 100,
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Recent events, most recent first. `service` (optional) narrows to one
+    channel this admin is allowed to see; omitted, returns every channel they
+    can see. `status` optionally filters to 'ok' or 'error'."""
+    from database_models import ServiceEvent
+    if service is not None:
+        if not monitor_service_allowed(current_admin, service):
+            raise HTTPException(status_code=403, detail="Not authorized to view this service")
+        allowed_services = [service]
+    else:
+        allowed_services = [s for s in MONITOR_SERVICE_NAMES if monitor_service_allowed(current_admin, s)]
+    if not allowed_services:
+        return {"events": []}
+    q = db.query(ServiceEvent).filter(ServiceEvent.service.in_(allowed_services))
+    if status_filter in ("ok", "error"):
+        q = q.filter(ServiceEvent.status == status_filter)
+    rows = q.order_by(ServiceEvent.created_at.desc()).limit(min(max(limit, 1), 500)).all()
+    return {"events": [
+        {
+            "id": r.id, "service": r.service, "event_type": r.event_type, "status": r.status,
+            "detail": r.detail, "duration_ms": r.duration_ms, "user_id": r.user_id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        } for r in rows
+    ]}
+
+class ClientEventRequest(BaseModel):
+    service: str = Field(..., description="Must be one of the known service names, typically 'encryption' or 'decryption'")
+    event_type: str = Field(..., max_length=80)
+    status: str = Field(default="error", description="'ok' or 'error'")
+    detail: Optional[str] = Field(None, max_length=500, description="Short error string — never plaintext content")
+
+@app.post("/monitoring/client-event")
+async def report_client_event(
+    payload: ClientEventRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Lets any client (iOS/Android/Desktop) self-report a local error for a
+    channel the server can't see directly — chiefly encryption/decryption,
+    which happen entirely client-side under E2EE. Opt-in per event, no
+    plaintext ever accepted: `detail` is capped at 500 chars and meant for a
+    short error string, e.g. "RSA decrypt failed: no matching device key".
+    """
+    if payload.service not in MONITOR_SERVICE_NAMES:
+        raise HTTPException(status_code=400, detail=f"Unknown service name; must be one of {MONITOR_SERVICE_NAMES}")
+    if payload.status not in ("ok", "error"):
+        raise HTTPException(status_code=400, detail="status must be 'ok' or 'error'")
+    monitor_record_event(
+        payload.service, payload.event_type, status=payload.status,
+        detail=payload.detail, user_id=int(getattr(current_user, 'id', 0)),
+    )
+    return {"recorded": True}
+
+@app.websocket("/admin/service-health/live")
+async def service_health_live(websocket: WebSocket, token: Optional[str] = None):
+    """Realtime fan-out of every ServiceEvent this admin is allowed to see.
+    Auth via ?token= (browsers can't set WS headers) — same session-token
+    validation as the main chat socket, plus an is_admin check."""
+    db = None
+    try:
+        if not token:
+            await websocket.close(code=4001)
+            return
+        db = db_config.get_session()
+        if not db:
+            await websocket.close(code=4010)
+            return
+        session = SessionService.validate_session(db, token)
+        if not session:
+            await websocket.close(code=4001)
+            return
+        user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.is_admin == True).first()
+        if not user:
+            await websocket.close(code=4003)
+            return
+        is_superadmin = getattr(user, 'admin_role', None) == 'superadmin'
+        allowed_services = None if is_superadmin else set(getattr(user, 'monitored_services', None) or [])
+        await websocket.accept()
+        await monitor_subscribe(websocket, allowed_services)
+        await websocket.send_json({"type": "connected", "services": MONITOR_SERVICE_NAMES if is_superadmin else sorted(allowed_services)})
+        try:
+            while True:
+                # This socket is receive-only from the client's side (server pushes
+                # events); just keep the connection alive and drain anything sent.
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            pass
+    except Exception as e:
+        logger.warning(f"service_health_live error: {e}")
+    finally:
+        try:
+            await monitor_unsubscribe(websocket)
+        except Exception:
+            pass
+        if db:
+            db.close()
 
 @app.post("/admin/superadmin/kill_switch")
 async def kill_switch(
@@ -8564,11 +8765,14 @@ async def upload_raw_media(
             "disappear_after_hours": disappear_after_hours
         }
         
+        monitor_record_event("media", "upload", user_id=sender_id)
         return response
-    
-    except HTTPException:
+
+    except HTTPException as e:
+        monitor_record_event("media", "upload", status="error", detail=str(e.detail), user_id=int(getattr(current_user, 'id', 0)))
         raise
     except Exception as e:
+        monitor_record_event("media", "upload", status="error", detail=f"{type(e).__name__}: {e}", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
 
 @app.post("/media/upload_raw_group")
@@ -8812,6 +9016,7 @@ async def download_raw_media(
             await _burn_one_time_media(db, media, user_id)
         
         content_len = len(content) if hasattr(content, "__len__") else 0
+        monitor_record_event("media", "download", user_id=user_id)
         return Response(
             content=content,
             media_type=media.content_type,
@@ -8820,11 +9025,13 @@ async def download_raw_media(
                 "Content-Length": str(content_len)
             }
         )
-    
 
-    except HTTPException:
+
+    except HTTPException as e:
+        monitor_record_event("media", "download", status="error", detail=str(e.detail), user_id=int(getattr(current_user, 'id', 0)))
         raise
     except Exception as e:
+        monitor_record_event("media", "download", status="error", detail=f"{type(e).__name__}: {e}", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=500, detail=f"Failed to download file: {str(e)}")
 
 @app.get("/media/{media_id}")
@@ -10870,6 +11077,7 @@ async def _deliver_webhook(hook_id: int, url: str, secret: str, event_type: str,
             status_code = resp.status_code
     except Exception as e:
         logger.warning(f"Webhook delivery failed (hook_id={hook_id}): {e}")
+        monitor_record_event("webhooks", event_type, status="error", detail=f"hook_id={hook_id}: {type(e).__name__}: {e}")
     finally:
         db = next(get_database_session())
         try:
@@ -10879,8 +11087,10 @@ async def _deliver_webhook(hook_id: int, url: str, secret: str, event_type: str,
                 setattr(hook, 'last_status_code', status_code)
                 if status_code is None or status_code >= 400:
                     setattr(hook, 'failure_count', (hook.failure_count or 0) + 1)
+                    monitor_record_event("webhooks", event_type, status="error", detail=f"hook_id={hook_id}: HTTP {status_code}")
                 else:
                     setattr(hook, 'failure_count', 0)
+                    monitor_record_event("webhooks", event_type, status="ok")
                 db.commit()
         finally:
             db.close()
