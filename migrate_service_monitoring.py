@@ -10,6 +10,9 @@ ALTER_STATEMENTS = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS monitored_services JSON",
     "CREATE INDEX IF NOT EXISTS ix_service_events_service ON service_events (service)",
     "CREATE INDEX IF NOT EXISTS ix_service_events_created_at ON service_events (created_at)",
+    "ALTER TABLE monitoring_consents ADD COLUMN IF NOT EXISTS allow_app_policy_monitoring BOOLEAN DEFAULT FALSE",
+    "CREATE INDEX IF NOT EXISTS ix_policy_violation_screenshots_user_id ON policy_violation_screenshots (user_id)",
+    "CREATE INDEX IF NOT EXISTS ix_policy_violation_screenshots_detected_at ON policy_violation_screenshots (detected_at)",
 ]
 
 def migrate():

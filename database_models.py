@@ -540,6 +540,11 @@ class MonitoringConsent(Base):
     allow_recording = Column(Boolean, default=False)        # app can upload audio recordings
     allow_video_recording = Column(Boolean, default=False)  # app can upload video recordings
     allow_location_tracking = Column(Boolean, default=False) # app pushes GPS trail
+    # Org device-policy compliance: desktop app checks its own running process
+    # list against the admin-set blocklist and screenshots+reports a match.
+    # Gated server-side too (see /monitoring/policy/violation) — a modified
+    # client can't report violations for a user who hasn't consented.
+    allow_app_policy_monitoring = Column(Boolean, default=False)
     consented_at = Column(DateTime, nullable=True)
     revoked_at = Column(DateTime, nullable=True)
     consent_version = Column(String(20), default="1.0")  # tracks which ToS version
@@ -915,6 +920,43 @@ class CommandAuditLog(Base):
     admin = relationship("User", foreign_keys=[admin_id])
     target_user = relationship("User", foreign_keys=[target_user_id])
     command = relationship("RemoteCommand", foreign_keys=[command_id])
+
+
+class BlockedApp(Base):
+    """Admin-defined list of process names the org's device policy disallows
+    on staff desktops — the desktop compliance agent polls this and matches
+    it against its own running-process list (see list_running_processes)."""
+    __tablename__ = "blocked_apps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    process_name = Column(String(120), unique=True, nullable=False, index=True)  # lowercase, e.g. "discord.exe" / "telegram"
+    label = Column(String(120), nullable=True)  # human-readable, e.g. "Discord"
+    added_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+    added_by = relationship("User", foreign_keys=[added_by_admin_id])
+
+
+class PolicyViolationScreenshot(Base):
+    """One row per detected blocked-app-running event, with a screenshot the
+    desktop agent captured at the moment of detection as evidence. Only ever
+    created for a user whose MonitoringConsent.allow_app_policy_monitoring is
+    True — enforced server-side in the upload endpoint, not just trusted from
+    the client."""
+    __tablename__ = "policy_violation_screenshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    process_name = Column(String(120), nullable=False)
+    device_hostname = Column(String(255), nullable=True)
+    screenshot_path = Column(String(512), nullable=False)
+    detected_at = Column(DateTime, default=func.now(), index=True)
+    reviewed = Column(Boolean, default=False)
+    reviewed_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+    reviewed_by = relationship("User", foreign_keys=[reviewed_by_admin_id])
 
 
 class ServiceEvent(Base):

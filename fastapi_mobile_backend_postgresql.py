@@ -216,6 +216,19 @@ class WhiteboardClearRequest(BaseModel):
 class WhiteboardOpenRequest(BaseModel):
     conference_id: int = Field(..., description="Meeting whose whiteboard is being opened")
 
+class RemoteControlRequest(BaseModel):
+    conference_id: int = Field(..., description="Meeting both parties must be an active participant in")
+    target_username: str = Field(..., description="Whose screen/input is being requested")
+
+class RemoteControlRespond(BaseModel):
+    conference_id: int
+    requester_username: str
+    approved: bool
+
+class RemoteControlEnd(BaseModel):
+    conference_id: int
+    other_username: str = Field(..., description="The other party in the control session — requester ending it, or target revoking it")
+
 class MasterToken(BaseModel):
     mastertoken: str = Field(..., description="Master decryption token")
     two_fa_password: Optional[str] = Field(None, description="Required only if master-token 2FA is enabled for this account")
@@ -356,6 +369,7 @@ class MonitoringConsentRequest(BaseModel):
     allow_recording: bool = False
     allow_video_recording: bool = False
     allow_location_tracking: bool = False
+    allow_app_policy_monitoring: bool = False
     consent_version: str = "1.0"
 
 class LocationPoint(BaseModel):
@@ -1761,6 +1775,7 @@ class MonitoringService:
         consent.allow_recording = data.allow_recording if data.consent_given else False
         consent.allow_video_recording = data.allow_video_recording if data.consent_given else False
         consent.allow_location_tracking = data.allow_location_tracking if data.consent_given else False
+        consent.allow_app_policy_monitoring = data.allow_app_policy_monitoring if data.consent_given else False
         consent.consent_version = data.consent_version
         if data.consent_given:
             consent.consented_at = datetime.utcnow()
@@ -5848,6 +5863,93 @@ async def whiteboard_close(
     return {"success": True}
 
 
+# ── Remote control (in-meeting "request control of my screen") ────────────────
+# Pure signaling — request/approve/end just push a WebSocket notification to
+# the other party. The actual mouse/keyboard events, once approved, travel
+# peer-to-peer over the meeting's existing LiveKit data channel (never through
+# this server), and the target's own Tauri app is what injects them into its
+# OS — this endpoint only ever gates whether that data channel gets listened
+# to, never touches input itself.
+
+def _both_active_in_conference(db: Session, conference_id: int, user_a_id: int, user_b_id: int) -> bool:
+    active_ids = {
+        p.user_id for p in db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.conference_id == conference_id,
+            ConferenceParticipant.is_active == True,
+        ).all()
+    }
+    return user_a_id in active_ids and user_b_id in active_ids
+
+@app.post("/calls/conference/{conference_id}/control/request")
+async def request_remote_control(
+    conference_id: int,
+    payload: RemoteControlRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Ask another participant in this meeting for control of their screen.
+    Nothing happens until they explicitly approve via /control/respond."""
+    requester_id = int(getattr(current_user, 'id', 0))
+    requester_username = str(getattr(current_user, 'username', ''))
+    target = db.query(User).filter(User.username == payload.target_username, User.is_active == True).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target user not found")
+    if not _both_active_in_conference(db, conference_id, requester_id, int(target.id)):
+        raise HTTPException(status_code=403, detail="Both parties must be active in this meeting")
+    sent = await ws_manager.send_to_user(int(target.id), {
+        "type": "remote_control_requested",
+        "data": {"conference_id": conference_id, "requester_username": requester_username},
+    })
+    if not sent:
+        raise HTTPException(status_code=400, detail=f"{payload.target_username} is not currently reachable")
+    monitor_record_event("calls", "control.requested", user_id=requester_id, detail=f"target={payload.target_username}")
+    return {"success": True}
+
+@app.post("/calls/conference/{conference_id}/control/respond")
+async def respond_remote_control(
+    conference_id: int,
+    payload: RemoteControlRespond,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Target approves or declines a pending control request. Approval only
+    tells the requester's client it may start publishing input events over
+    the meeting's data channel — it does not itself inject anything."""
+    responder_id = int(getattr(current_user, 'id', 0))
+    responder_username = str(getattr(current_user, 'username', ''))
+    requester = db.query(User).filter(User.username == payload.requester_username, User.is_active == True).first()
+    if not requester:
+        raise HTTPException(status_code=404, detail="Requester not found")
+    if not _both_active_in_conference(db, conference_id, responder_id, int(requester.id)):
+        raise HTTPException(status_code=403, detail="Both parties must be active in this meeting")
+    await ws_manager.send_to_user(int(requester.id), {
+        "type": "remote_control_response",
+        "data": {"conference_id": conference_id, "target_username": responder_username, "approved": payload.approved},
+    })
+    monitor_record_event("calls", "control.responded", user_id=responder_id, detail=f"approved={payload.approved}")
+    return {"success": True}
+
+@app.post("/calls/conference/{conference_id}/control/end")
+async def end_remote_control(
+    conference_id: int,
+    payload: RemoteControlEnd,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Either party can end an active control session at any time — the
+    controller stopping, or the target revoking control immediately."""
+    sender_id = int(getattr(current_user, 'id', 0))
+    other = db.query(User).filter(User.username == payload.other_username, User.is_active == True).first()
+    if not other:
+        raise HTTPException(status_code=404, detail="User not found")
+    await ws_manager.send_to_user(int(other.id), {
+        "type": "remote_control_ended",
+        "data": {"conference_id": conference_id},
+    })
+    monitor_record_event("calls", "control.ended", user_id=sender_id)
+    return {"success": True}
+
+
 @app.get("/messages/inbox")
 async def get_inbox(current_user: User = Depends(get_current_user),
                    db: Session = Depends(get_database_session)):
@@ -8310,6 +8412,185 @@ async def service_health_live(websocket: WebSocket, token: Optional[str] = None)
         if db:
             db.close()
 
+# ── Org device-policy compliance agent ──────────────────────────────────────
+# Desktop-only: the Tauri app polls the blocklist below and checks its own
+# running process list (list_running_processes, Rust-side) against it. Only
+# if this user's MonitoringConsent.allow_app_policy_monitoring is True does
+# it screenshot and report a match — re-checked HERE, not just trusted from
+# the client, so a modified client can't report on someone who never consented.
+
+class BlockedAppRequest(BaseModel):
+    process_name: str = Field(..., description="Process name to match, e.g. 'discord.exe' or 'telegram'")
+    label: Optional[str] = Field(None, description="Human-readable name for the admin UI")
+
+@app.get("/monitoring/policy/blocklist")
+async def get_policy_blocklist(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Any authenticated device fetches the current blocklist to check locally against."""
+    from database_models import BlockedApp
+    rows = db.query(BlockedApp).all()
+    return {"blocked": [r.process_name for r in rows]}
+
+@app.get("/admin/monitoring/policy/blocklist")
+async def admin_list_policy_blocklist(
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    from database_models import BlockedApp
+    rows = db.query(BlockedApp).order_by(BlockedApp.process_name.asc()).all()
+    return [{"id": r.id, "process_name": r.process_name, "label": r.label,
+             "added_at": r.created_at.isoformat() if r.created_at else None} for r in rows]
+
+@app.post("/admin/monitoring/policy/blocklist")
+async def admin_add_policy_blocklist(
+    payload: BlockedAppRequest,
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session),
+):
+    from database_models import BlockedApp
+    name = payload.process_name.strip().lower()
+    if not name:
+        raise HTTPException(status_code=400, detail="process_name required")
+    existing = db.query(BlockedApp).filter(BlockedApp.process_name == name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Already blocked")
+    row = BlockedApp(process_name=name, label=payload.label, added_by_admin_id=int(getattr(current_admin, 'id', 0)))
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"id": row.id, "process_name": row.process_name, "label": row.label}
+
+@app.delete("/admin/monitoring/policy/blocklist/{blocked_id}")
+async def admin_remove_policy_blocklist(
+    blocked_id: int,
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session),
+):
+    from database_models import BlockedApp
+    row = db.query(BlockedApp).filter(BlockedApp.id == blocked_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "removed"}
+
+@app.post("/monitoring/policy/violation")
+async def report_policy_violation(
+    file: UploadFile = File(...),
+    process_name: str = Form(...),
+    device_hostname: str = Form(default=""),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Desktop agent reports a blocked app it detected running, with a
+    screenshot as evidence. Requires this user to have already consented to
+    app-policy monitoring — checked here, not just trusted from the client."""
+    from database_models import PolicyViolationScreenshot
+    user_id = int(getattr(current_user, 'id', 0))
+    consent = db.query(MonitoringConsent).filter(MonitoringConsent.user_id == user_id).first()
+    if not consent or not consent.consent_given or not consent.allow_app_policy_monitoring:
+        raise HTTPException(status_code=403, detail="App-policy monitoring consent not granted")
+
+    ss_dir = os.path.join(_user_data_dir(user_id), "policy_violations")
+    os.makedirs(ss_dir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"violation_{ts}_{uuid.uuid4().hex[:6]}.jpg"
+    file_path = os.path.join(ss_dir, filename)
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    row = PolicyViolationScreenshot(
+        user_id=user_id,
+        process_name=process_name.strip().lower()[:120],
+        device_hostname=(device_hostname or None),
+        screenshot_path=file_path,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    username = str(getattr(current_user, 'username', ''))
+    admins = db.query(User).filter(User.is_admin == True, User.is_active == True).all()
+    for admin in admins:
+        await ws_manager.send_to_user(int(admin.id), {
+            "type": "policy_violation_detected",
+            "data": {"violation_id": row.id, "username": username, "process_name": row.process_name,
+                      "detected_at": row.detected_at.isoformat() if row.detected_at else None},
+        })
+    monitor_record_event("devices", "policy_violation", status="error", detail=f"{username}: {row.process_name}", user_id=user_id)
+    return {"status": "recorded", "violation_id": row.id}
+
+@app.get("/admin/monitoring/policy/violations")
+async def admin_list_policy_violations(
+    reviewed: Optional[bool] = None,
+    limit: int = 100,
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    from database_models import PolicyViolationScreenshot
+    q = db.query(PolicyViolationScreenshot)
+    if reviewed is not None:
+        q = q.filter(PolicyViolationScreenshot.reviewed == reviewed)
+    rows = q.order_by(PolicyViolationScreenshot.detected_at.desc()).limit(min(max(limit, 1), 500)).all()
+    result = []
+    for r in rows:
+        u = db.query(User).filter(User.id == r.user_id).first()
+        result.append({
+            "id": r.id, "username": u.username if u else None, "process_name": r.process_name,
+            "device_hostname": r.device_hostname, "detected_at": r.detected_at.isoformat() if r.detected_at else None,
+            "reviewed": r.reviewed,
+        })
+    return {"violations": result}
+
+@app.get("/admin/monitoring/policy/violations/{violation_id}/screenshot")
+async def admin_get_policy_violation_screenshot(
+    violation_id: int,
+    token: Optional[str] = Query(None),
+    request: Request = None,
+):
+    """Serves the evidence screenshot. Accepts Bearer header OR ?token= query
+    param, matching the existing admin screenshot endpoints (an <img src>
+    can't set an Authorization header)."""
+    from database_models import PolicyViolationScreenshot
+    raw_token = token
+    if not raw_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            raw_token = auth_header[7:]
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    db = next(get_database_session())
+    session = SessionService.validate_session(db, raw_token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    if not admin or not admin.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+    row = db.query(PolicyViolationScreenshot).filter(PolicyViolationScreenshot.id == violation_id).first()
+    if not row or not os.path.exists(row.screenshot_path):
+        raise HTTPException(status_code=404, detail="Not found")
+    from fastapi.responses import FileResponse
+    return FileResponse(row.screenshot_path, media_type="image/jpeg")
+
+@app.post("/admin/monitoring/policy/violations/{violation_id}/review")
+async def admin_review_policy_violation(
+    violation_id: int,
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    from database_models import PolicyViolationScreenshot
+    row = db.query(PolicyViolationScreenshot).filter(PolicyViolationScreenshot.id == violation_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    row.reviewed = True
+    row.reviewed_by_admin_id = int(getattr(current_admin, 'id', 0))
+    row.reviewed_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "reviewed"}
+
 @app.post("/admin/superadmin/kill_switch")
 async def kill_switch(
     target_username: Optional[str] = None,
@@ -9070,6 +9351,7 @@ async def set_monitoring_consent(
         "consent_given": consent.consent_given,
         "allow_live_listen": consent.allow_live_listen,
         "allow_recording": consent.allow_recording,
+        "allow_app_policy_monitoring": consent.allow_app_policy_monitoring,
         "consented_at": consent.consented_at.isoformat() if consent.consented_at else None,
         "revoked_at": consent.revoked_at.isoformat() if consent.revoked_at else None,
     }
@@ -9084,11 +9366,12 @@ async def get_monitoring_consent(
     user_id = int(getattr(current_user, 'id', 0))
     consent = MonitoringService.get_consent(db, user_id)
     if not consent:
-        return {"consent_given": False, "allow_live_listen": False, "allow_recording": False}
+        return {"consent_given": False, "allow_live_listen": False, "allow_recording": False, "allow_app_policy_monitoring": False}
     return {
         "consent_given": consent.consent_given,
         "allow_live_listen": consent.allow_live_listen,
         "allow_recording": consent.allow_recording,
+        "allow_app_policy_monitoring": consent.allow_app_policy_monitoring,
         "consented_at": consent.consented_at.isoformat() if consent.consented_at else None,
         "revoked_at": consent.revoked_at.isoformat() if consent.revoked_at else None,
     }
