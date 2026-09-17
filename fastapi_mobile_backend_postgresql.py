@@ -439,11 +439,15 @@ class GroupMemberResponse(BaseModel):
 # Monitoring models
 class MonitoringConsentRequest(BaseModel):
     consent_given: bool
-    allow_live_listen: bool = False
-    allow_recording: bool = False
-    allow_video_recording: bool = False
-    allow_location_tracking: bool = False
-    allow_app_policy_monitoring: bool = False
+    # Optional so a caller updating just one flag (e.g. the app-policy toggle)
+    # doesn't blow away the others — None means "leave this one as it was",
+    # not "set it false". A full consent form (mobile) still passes real
+    # booleans for all of them, which behaves exactly as before.
+    allow_live_listen: Optional[bool] = None
+    allow_recording: Optional[bool] = None
+    allow_video_recording: Optional[bool] = None
+    allow_location_tracking: Optional[bool] = None
+    allow_app_policy_monitoring: Optional[bool] = None
     consent_version: str = "1.0"
 
 class LocationPoint(BaseModel):
@@ -1845,11 +1849,25 @@ class MonitoringService:
             consent = MonitoringConsent(user_id=user_id)
             db.add(consent)
         consent.consent_given = data.consent_given
-        consent.allow_live_listen = data.allow_live_listen if data.consent_given else False
-        consent.allow_recording = data.allow_recording if data.consent_given else False
-        consent.allow_video_recording = data.allow_video_recording if data.consent_given else False
-        consent.allow_location_tracking = data.allow_location_tracking if data.consent_given else False
-        consent.allow_app_policy_monitoring = data.allow_app_policy_monitoring if data.consent_given else False
+        if not data.consent_given:
+            # Revoking consent overall does turn everything off — that part
+            # of the old behavior was correct and stays.
+            consent.allow_live_listen = False
+            consent.allow_recording = False
+            consent.allow_video_recording = False
+            consent.allow_location_tracking = False
+            consent.allow_app_policy_monitoring = False
+        else:
+            if data.allow_live_listen is not None:
+                consent.allow_live_listen = data.allow_live_listen
+            if data.allow_recording is not None:
+                consent.allow_recording = data.allow_recording
+            if data.allow_video_recording is not None:
+                consent.allow_video_recording = data.allow_video_recording
+            if data.allow_location_tracking is not None:
+                consent.allow_location_tracking = data.allow_location_tracking
+            if data.allow_app_policy_monitoring is not None:
+                consent.allow_app_policy_monitoring = data.allow_app_policy_monitoring
         consent.consent_version = data.consent_version
         if data.consent_given:
             consent.consented_at = datetime.utcnow()
