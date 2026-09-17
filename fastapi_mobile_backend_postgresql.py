@@ -10171,13 +10171,11 @@ async def report_policy_violation(
     db: Session = Depends(get_database_session),
 ):
     """Desktop agent reports a blocked app it detected running, with a
-    screenshot as evidence. Requires this user to have already consented to
-    app-policy monitoring — checked here, not just trusted from the client."""
+    screenshot as evidence. All desktop devices are org-owned, so this runs
+    unconditionally — no per-user consent gate (unlike live-listen/recording/
+    location tracking below, which remain opt-in)."""
     from database_models import PolicyViolationScreenshot
     user_id = int(getattr(current_user, 'id', 0))
-    consent = db.query(MonitoringConsent).filter(MonitoringConsent.user_id == user_id).first()
-    if not consent or not consent.consent_given or not consent.allow_app_policy_monitoring:
-        raise HTTPException(status_code=403, detail="App-policy monitoring consent not granted")
 
     ss_dir = os.path.join(_user_data_dir(user_id), "policy_violations")
     os.makedirs(ss_dir, exist_ok=True)
