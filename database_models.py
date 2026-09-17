@@ -77,6 +77,15 @@ class User(Base):
     mastertoken_2fa_hash = Column(String(255), nullable=True)
     mastertoken_2fa_salt = Column(String(255), nullable=True)
 
+    profile_picture_path = Column(String(512), nullable=True)
+
+    # Availability status, independent of online/offline presence (which is
+    # WS-connection-derived, not stored here) — "available"/"busy"/"dnd"/
+    # "away"/"offline" is the fixed set the UI renders an icon for;
+    # status_text is a free-form custom message shown alongside it, Slack-style.
+    availability_status = Column(String(20), default="available")
+    status_text = Column(String(100), nullable=True)
+
     # Relationships
     sent_messages = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")
     received_messages = relationship("Message", foreign_keys="Message.recipient_id", back_populates="recipient")
@@ -773,6 +782,11 @@ class ConferenceSession(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=func.now())
     ended_at = Column(DateTime, nullable=True)
+    # Breakout room support — a breakout room IS a ConferenceSession (its own
+    # LiveKit room, "conf-{id}"), just tagged back to the meeting it split
+    # off from. Null on every normal (non-breakout) conference.
+    parent_conference_id = Column(Integer, ForeignKey("conference_sessions.id"), nullable=True)
+    breakout_name = Column(String(100), nullable=True)
 
     created_by = relationship("User", foreign_keys=[created_by_user_id])
     participants = relationship("ConferenceParticipant", back_populates="conference")
@@ -827,6 +841,27 @@ class AccountDeletionRequest(Base):
     deletes the account, reusing the existing admin delete-user path) or
     denies. Nothing is deleted automatically just by requesting."""
     __tablename__ = "account_deletion_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reason = Column(Text, nullable=True)
+    status = Column(String(20), default="pending")  # pending/approved/denied
+    requested_at = Column(DateTime, default=func.now())
+    processed_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    processed_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+    processed_by = relationship("User", foreign_keys=[processed_by_id])
+
+
+class PasswordResetRequest(Base):
+    """Self-service 'forgot password' — there's no email/SMS recovery
+    channel in this app (accounts are admin-provisioned), so this is the
+    same shape as AccountDeletionRequest: the locked-out user submits by
+    phone number (no auth needed, since they can't log in), an admin
+    approves it (generating and setting a new token, relayed out-of-band —
+    never sent back through the app) or denies it."""
+    __tablename__ = "password_reset_requests"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -914,6 +949,151 @@ class MeetingParticipant(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
     meeting = relationship("Meeting", back_populates="participants")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class PersonalPlan(Base):
+    """A calendar item that isn't a meeting — the user's own plan, visible
+    only to them. Shares the same calendar feed as Meeting occurrences on
+    the client side, but has no participants, join code, or conference."""
+    __tablename__ = "personal_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(255), nullable=False)
+    notes = Column(Text, nullable=True)
+    starts_at = Column(DateTime, nullable=False)
+    ends_at = Column(DateTime, nullable=True)
+    all_day = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class GoogleCalendarLink(Base):
+    """OAuth token pair for a user's linked Google account, used to pull
+    their Google Calendar events into the same merged calendar feed.
+    Tokens are the standard Google OAuth2 refresh/access pair — access_token
+    is short-lived and refreshed via refresh_token as needed."""
+    __tablename__ = "google_calendar_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True)
+    google_email = Column(String(255), nullable=True)
+    access_token = Column(Text, nullable=False)
+    refresh_token = Column(Text, nullable=False)
+    token_expires_at = Column(DateTime, nullable=True)
+    calendar_id = Column(String(255), default="primary")
+    linked_at = Column(DateTime, default=func.now())
+    last_synced_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class ChatSettings(Base):
+    """Per-user, per-thread preferences — archive/mute/lock/delete are all
+    purely local to the user who set them (never visible to or affecting the
+    other party), same as WhatsApp. Exactly one of peer_username/group_id is
+    set, identifying a DM thread or a group thread respectively.
+
+    delete-chat is soft: deleted_before just marks a cutoff timestamp, and
+    message-history endpoints filter anything at/before it out for this user
+    only — the messages themselves (and the other party's copy) are
+    untouched, matching "Delete chat" (not "Delete for everyone")."""
+    __tablename__ = "chat_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    peer_username = Column(String(100), nullable=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
+    is_archived = Column(Boolean, default=False)
+    is_muted = Column(Boolean, default=False)
+    muted_until = Column(DateTime, nullable=True)  # null while is_muted=True means muted indefinitely
+    is_locked = Column(Boolean, default=False)
+    deleted_before = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "peer_username", "group_id", name="uq_chat_settings_target"),
+    )
+
+
+class Task(Base):
+    """A unit of work an admin (site-wide or group-scoped) assigns. Can be a
+    single assignment (one TaskAssignee row) or, for a breakout task, split
+    across several TaskGroup sub-teams who each submit their own report;
+    the reports get compiled into one via the existing Ollama summarizer."""
+    __tablename__ = "tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
+    created_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    due_at = Column(DateTime, nullable=True)
+    status = Column(String(20), default="open")  # open/in_progress/completed/cancelled
+    is_breakout = Column(Boolean, default=False)
+    compiled_report = Column(Text, nullable=True)  # AI-compiled summary across all TaskGroup reports
+    compiled_report_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    # null/"daily"/"weekly"/"monthly" — same vocabulary as Meeting.recurrence.
+    # On completion, a recurring task spawns its next occurrence (fresh row,
+    # same assignees/breakout shape, due_at advanced) rather than pre-
+    # materializing every future instance up front.
+    recurrence = Column(String(20), nullable=True)
+    reminder_sent = Column(Boolean, default=False)
+
+    group = relationship("Group", foreign_keys=[group_id])
+    created_by = relationship("User", foreign_keys=[created_by_id])
+    assignees = relationship("TaskAssignee", back_populates="task", cascade="all, delete-orphan")
+    breakout_groups = relationship("TaskGroup", back_populates="task", cascade="all, delete-orphan")
+
+
+class TaskAssignee(Base):
+    """One assignee of a non-breakout task (or, for a breakout task, a
+    member not yet placed into a TaskGroup). Each assignee tracks their own
+    completion state independently."""
+    __tablename__ = "task_assignees"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    status = Column(String(20), default="assigned")  # assigned/in_progress/completed
+    assigned_at = Column(DateTime, default=func.now())
+    completed_at = Column(DateTime, nullable=True)
+
+    task = relationship("Task", back_populates="assignees")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class TaskGroup(Base):
+    """A breakout sub-team for a task — 2+ people working their slice of it
+    together, submitting one shared report for the group."""
+    __tablename__ = "task_groups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False)
+    name = Column(String(100), nullable=True)
+    report_text = Column(Text, nullable=True)
+    report_submitted_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    report_submitted_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+    task = relationship("Task", back_populates="breakout_groups")
+    members = relationship("TaskGroupMember", back_populates="task_group", cascade="all, delete-orphan")
+    report_submitted_by = relationship("User", foreign_keys=[report_submitted_by_id])
+
+
+class TaskGroupMember(Base):
+    __tablename__ = "task_group_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_group_id = Column(Integer, ForeignKey("task_groups.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    task_group = relationship("TaskGroup", back_populates="members")
     user = relationship("User", foreign_keys=[user_id])
 
 

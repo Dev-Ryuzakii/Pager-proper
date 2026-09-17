@@ -12,6 +12,8 @@ import hmac
 import logging
 import secrets
 import uuid
+import random
+import httpx
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -20,7 +22,7 @@ from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Fi
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 import uvicorn
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
@@ -53,7 +55,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, ChatSettings
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -66,6 +68,7 @@ from copilot_ollama import (
     compose_reply,
     answer_document_question,
     translate_text,
+    compile_task_reports,
 )
 from voice_transcribe import transcribe_audio
 from link_preview import fetch_link_preview
@@ -140,6 +143,7 @@ class GroupMessageSend(BaseModel):
     reply_to_message_id: Optional[int] = Field(None, description="Message this is a threaded reply to")
     forwarded_from_message_id: Optional[int] = Field(None, description="Original message this was forwarded from, for the UI label only")
     mentions: Optional[List[str]] = Field(None, description="Usernames @mentioned — cleartext, notification targeting only, never message content")
+    content_type: Optional[str] = Field(None, description="Omit for normal text — 'gif' or 'sticker' still go through the same encryption/decoy pipeline, just render differently client-side")
 
 class ConferenceMessageSend(BaseModel):
     conference_id: int = Field(..., description="ID of the meeting/conference to send message to")
@@ -158,6 +162,7 @@ class MessageSend(BaseModel):
     reply_to_message_id: Optional[int] = Field(None, description="Message this is a threaded reply to")
     forwarded_from_message_id: Optional[int] = Field(None, description="Original message this was forwarded from, for the UI label only")
     mentions: Optional[List[str]] = Field(None, description="Usernames @mentioned — cleartext, notification targeting only, never message content")
+    content_type: Optional[str] = Field(None, description="Omit for normal text — 'gif' or 'sticker' still go through the same encryption/decoy pipeline, just render differently client-side")
 
 class ReactionRequest(BaseModel):
     emoji: str = Field(..., min_length=1, max_length=16)
@@ -201,6 +206,18 @@ class CopilotTranslateRequest(BaseModel):
 
 class LinkPreviewRequest(BaseModel):
     url: str = Field(..., description="URL to unfurl — fetched server-side so the viewer's IP is never exposed to the linked site")
+
+class ChatSettingsUpdate(BaseModel):
+    peer_username: Optional[str] = Field(None, description="Exactly one of peer_username/group_id")
+    group_id: Optional[int] = Field(None, description="Exactly one of peer_username/group_id")
+    is_archived: Optional[bool] = None
+    is_muted: Optional[bool] = None
+    muted_until: Optional[datetime] = Field(None, description="Set alongside is_muted=true for a timed mute — omit for indefinite")
+    is_locked: Optional[bool] = None
+
+class ChatDeleteRequest(BaseModel):
+    peer_username: Optional[str] = Field(None, description="Exactly one of peer_username/group_id")
+    group_id: Optional[int] = Field(None, description="Exactly one of peer_username/group_id")
 
 class WhiteboardStrokeRequest(BaseModel):
     username: Optional[str] = Field(None, description="1:1 target — exactly one of username/group_id/conference_id")
@@ -246,9 +263,66 @@ class AccountDeletionRequestCreate(BaseModel):
 class AccountDeletionDecision(BaseModel):
     reason: Optional[str] = Field(None, description="Admin's note, e.g. why denied")
 
+class PasswordResetRequestCreate(BaseModel):
+    phone_number: str = Field(..., min_length=10, max_length=20, description="The locked-out account's phone number")
+    reason: Optional[str] = Field(None, max_length=1000)
+
+class PasswordResetDecision(BaseModel):
+    reason: Optional[str] = Field(None, description="Admin's note, e.g. why denied")
+
+class ProfilePictureUpdate(BaseModel):
+    image_base64: str = Field(..., description="Base64-encoded image (jpeg/png), no data: prefix")
+
+class AvailabilityStatusUpdate(BaseModel):
+    availability_status: str = Field(..., description="available/busy/dnd/away/offline")
+    status_text: Optional[str] = Field(None, max_length=100)
+
 class DecryptRequest(BaseModel):
     mastertoken: str = Field(..., description="Master token for decryption")
     message_id: int = Field(..., description="ID of the message to decrypt")
+
+# ─── Personal calendar plans ────────────────────────────────────────────────
+
+class PersonalPlanCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    notes: Optional[str] = Field(None, max_length=2000)
+    starts_at: datetime
+    ends_at: Optional[datetime] = None
+    all_day: bool = False
+
+class PersonalPlanUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=255)
+    notes: Optional[str] = Field(None, max_length=2000)
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    all_day: Optional[bool] = None
+
+# ─── Tasks ───────────────────────────────────────────────────────────────────
+
+class TaskCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(None, max_length=4000)
+    due_at: Optional[datetime] = None
+    group_id: Optional[int] = Field(None, description="Assign through a group — requires group-admin or site-admin. Omit for a direct assignment (site-admin only)")
+    assignee_usernames: List[str] = Field(default_factory=list, description="Direct assignees — ignored if breakout_groups is set")
+    is_breakout: bool = False
+    breakout_groups: Optional[List[Dict[str, Any]]] = Field(
+        None, description='For breakout tasks: [{"name": "Team A", "usernames": ["alice","bob"]}, ...]'
+    )
+    recurrence: Optional[str] = Field(None, description="null/daily/weekly/monthly — on completion, spawns the next occurrence")
+
+class TaskStatusUpdate(BaseModel):
+    status: str = Field(..., description="open/in_progress/completed/cancelled")
+
+class TaskGroupReportSubmit(BaseModel):
+    report_text: str = Field(..., min_length=1, max_length=20000)
+
+# ─── Meeting breakout rooms ──────────────────────────────────────────────────
+
+class BreakoutStartRequest(BaseModel):
+    groups: List[Dict[str, Any]] = Field(
+        ..., description='[{"name": "Room A", "usernames": ["alice","bob"]}, ...] — must be current active participants'
+    )
 
 class GroupReadReceipt(BaseModel):
     username: str
@@ -3044,6 +3118,19 @@ class AdminService:
             db.query(ConferenceParticipant).filter(
                 ConferenceParticipant.user_id == user_id
             ).delete()
+            # Breakout rooms self-reference conference_sessions — a room this
+            # user created could still be pointed at as a parent by another
+            # room (or vice versa if one of theirs is itself a breakout child).
+            # Detach before the delete below or that FK blocks it.
+            owned_conference_ids = [
+                c.id for c in db.query(ConferenceSession.id).filter(
+                    ConferenceSession.created_by_user_id == user_id
+                ).all()
+            ]
+            if owned_conference_ids:
+                db.query(ConferenceSession).filter(
+                    ConferenceSession.parent_conference_id.in_(owned_conference_ids)
+                ).update({"parent_conference_id": None}, synchronize_session=False)
             db.query(ConferenceSession).filter(
                 ConferenceSession.created_by_user_id == user_id
             ).delete()
@@ -3074,6 +3161,66 @@ class AdminService:
                 db.query(Group).filter(Group.id.in_(owned_group_ids)).delete(
                     synchronize_session=False
                 )
+
+            # ── 11c. Reactions/stars on messages that are about to be deleted ──
+            # Not just this user's own reactions/stars — ANYONE's reaction/star
+            # on a message this user sent or received also FK-references that
+            # message, so it has to go before the Message delete in step 9 runs
+            # (which already happened above — these two tables were added after
+            # delete_user was last touched, so they were never wired in, and a
+            # user with any reacted-to/starred message failed this whole delete
+            # with an FK violation, which rolled back the entire transaction —
+            # the actual cause of "admin can't delete this user" and "the old
+            # phone number still shows as taken" being the same bug).
+            db.query(MessageReaction).filter(
+                or_(MessageReaction.user_id == user_id,
+                    MessageReaction.message_id.in_(msg_ids) if msg_ids else False)
+            ).delete(synchronize_session=False)
+            db.query(StarredMessage).filter(
+                or_(StarredMessage.user_id == user_id,
+                    StarredMessage.message_id.in_(msg_ids) if msg_ids else False)
+            ).delete(synchronize_session=False)
+
+            # ── 11d. Org features (calendar/tasks/breakout) — also never wired
+            # into this function before now ────────────────────────────────────
+            db.query(PersonalPlan).filter(PersonalPlan.user_id == user_id).delete()
+            db.query(GoogleCalendarLink).filter(GoogleCalendarLink.user_id == user_id).delete()
+            db.query(AccountDeletionRequest).filter(AccountDeletionRequest.user_id == user_id).delete()
+            db.query(AccountDeletionRequest).filter(
+                AccountDeletionRequest.processed_by_id == user_id
+            ).update({"processed_by_id": None}, synchronize_session=False)
+            db.query(PasswordResetRequest).filter(PasswordResetRequest.user_id == user_id).delete()
+            db.query(PasswordResetRequest).filter(
+                PasswordResetRequest.processed_by_id == user_id
+            ).update({"processed_by_id": None}, synchronize_session=False)
+            db.query(RetentionPolicy).filter(
+                RetentionPolicy.updated_by_id == user_id
+            ).update({"updated_by_id": None}, synchronize_session=False)
+            db.query(Webhook).filter(Webhook.created_by_id == user_id).delete()
+            db.query(ChatSettings).filter(ChatSettings.user_id == user_id).delete()
+
+            owned_task_ids = [t.id for t in db.query(Task.id).filter(Task.created_by_id == user_id).all()]
+            if owned_task_ids:
+                owned_task_group_ids = [
+                    g.id for g in db.query(TaskGroup.id).filter(TaskGroup.task_id.in_(owned_task_ids)).all()
+                ]
+                if owned_task_group_ids:
+                    db.query(TaskGroupMember).filter(
+                        TaskGroupMember.task_group_id.in_(owned_task_group_ids)
+                    ).delete(synchronize_session=False)
+                    db.query(TaskGroup).filter(
+                        TaskGroup.id.in_(owned_task_group_ids)
+                    ).delete(synchronize_session=False)
+                db.query(TaskAssignee).filter(
+                    TaskAssignee.task_id.in_(owned_task_ids)
+                ).delete(synchronize_session=False)
+                db.query(Task).filter(Task.id.in_(owned_task_ids)).delete(synchronize_session=False)
+            # Tasks/breakout groups this user was assigned to (but didn't create)
+            db.query(TaskAssignee).filter(TaskAssignee.user_id == user_id).delete()
+            db.query(TaskGroupMember).filter(TaskGroupMember.user_id == user_id).delete()
+            db.query(TaskGroup).filter(
+                TaskGroup.report_submitted_by_id == user_id
+            ).update({"report_submitted_by_id": None}, synchronize_session=False)
 
             db.flush()
 
@@ -3190,6 +3337,45 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Meeting reminder error: {e}")
 
+    async def periodic_task_reminders():
+        while True:
+            try:
+                await asyncio.sleep(60)  # check every minute
+                db = next(get_database_session())
+                try:
+                    now = datetime.now(timezone.utc)
+                    soon = now + timedelta(hours=24)
+                    due = db.query(Task).filter(
+                        Task.status.in_(["open", "in_progress"]),
+                        Task.reminder_sent == False,
+                        Task.due_at.isnot(None),
+                        Task.due_at <= soon,
+                        Task.due_at >= now,
+                    ).all()
+                    for task in due:
+                        recipient_ids = set()
+                        for a in db.query(TaskAssignee).filter(TaskAssignee.task_id == task.id).all():
+                            recipient_ids.add(a.user_id)
+                        for g in db.query(TaskGroup).filter(TaskGroup.task_id == task.id).all():
+                            for m in db.query(TaskGroupMember).filter(TaskGroupMember.task_group_id == g.id).all():
+                                recipient_ids.add(m.user_id)
+                        title_text = task.title or "Task"
+                        for uid in recipient_ids:
+                            ws_sent = await ws_manager.send_to_user(uid, {
+                                "type": "task_due_soon",
+                                "data": {"task_id": task.id, "title": title_text, "due_at": task.due_at.isoformat()},
+                            })
+                            if not ws_sent:
+                                await push_to_user(db, uid, "Task due soon", f"{title_text} is due soon")
+                        task.reminder_sent = True
+                    if due:
+                        db.commit()
+                        logger.info(f"Task reminders: notified for {len(due)} upcoming task(s)")
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.error(f"Task reminder error: {e}")
+
     async def periodic_retention_enforcement():
         while True:
             try:
@@ -3223,6 +3409,7 @@ async def lifespan(app: FastAPI):
     deadmans_task = asyncio.create_task(DeadMansSwitchService.run_checker(None))
     cleanup_task = asyncio.create_task(periodic_message_cleanup())
     meeting_reminder_task = asyncio.create_task(periodic_meeting_reminders())
+    task_reminder_task = asyncio.create_task(periodic_task_reminders())
     retention_task = asyncio.create_task(periodic_retention_enforcement())
 
     yield
@@ -4185,6 +4372,14 @@ def _resolve_disappear_hours(sender: User, explicit: Optional[int], kind: str) -
         return explicit
     return getattr(sender, f"disappear_{kind}_hours", None)
 
+_CLIENT_CONTENT_TYPES = {"gif", "sticker"}
+
+def _client_content_type(value: Optional[str]) -> str:
+    """A client can only ever request one of a small allowlist — everything
+    else (e.g. "meeting", "private_tagged") is server-assigned only, never
+    something a client picks via this field."""
+    return value if value in _CLIENT_CONTENT_TYPES else "encrypted"
+
 @app.post("/messages/send")
 async def send_message(message_data: MessageSend, 
                       current_user: User = Depends(get_current_user),
@@ -4196,6 +4391,7 @@ async def send_message(message_data: MessageSend,
             db, user_id, message_data.username, message_data.message,
             _resolve_disappear_hours(current_user, message_data.disappear_after_hours, "text"),
             message_data.encrypted_key, message_data.iv, message_data.decoy_content,
+            content_type=_client_content_type(message_data.content_type),
             reply_to_message_id=message_data.reply_to_message_id,
             forwarded_from_message_id=message_data.forwarded_from_message_id,
             mentions=message_data.mentions,
@@ -4986,6 +5182,182 @@ async def conference_livekit_token(
     return {"url": LIVEKIT_URL, "token": token, "room": room_name}
 
 
+# ─── Meeting breakout rooms ──────────────────────────────────────────────────
+# A breakout room is just another ConferenceSession — it gets its own real
+# LiveKit room ("conf-{id}") for free via the existing token endpoint above,
+# tagged back to the meeting it split off from via parent_conference_id. No
+# new LiveKit-specific plumbing needed: assigned participants call the same
+# /calls/conference/{id}/livekit-token endpoint with the breakout's id.
+
+def _active_conference_participants(db: Session, conference_id: int) -> Dict[int, ConferenceParticipant]:
+    return {
+        p.user_id: p for p in db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.conference_id == conference_id,
+            ConferenceParticipant.is_active == True,
+            ConferenceParticipant.status == "admitted",
+        ).all()
+    }
+
+
+async def _create_breakout_rooms(
+    db: Session, conference_id: int, user_id: int,
+    groups: List[Dict[str, Any]], active_participants: Dict[int, ConferenceParticipant],
+) -> List[Dict[str, Any]]:
+    created = []
+    for grp in groups:
+        name = str(grp.get("name") or "Breakout")[:100]
+        usernames = grp.get("usernames", [])
+        if not usernames:
+            continue
+
+        room = ConferenceSession(
+            created_by_user_id=user_id, is_active=True,
+            parent_conference_id=conference_id, breakout_name=name,
+        )
+        db.add(room)
+        db.commit()
+        db.refresh(room)
+
+        moved = []
+        for uname in usernames:
+            u = db.query(User).filter(User.username == uname).first()
+            if not u or u.id not in active_participants:
+                continue
+            db.add(ConferenceParticipant(conference_id=room.id, user_id=u.id, status="admitted", is_active=True))
+            moved.append(u)
+        db.commit()
+
+        for u in moved:
+            await ws_manager.send_to_user(int(u.id), {
+                "type": "breakout_assigned",
+                "data": {
+                    "parent_conference_id": conference_id,
+                    "breakout_conference_id": room.id,
+                    "name": name,
+                },
+            })
+        created.append({"breakout_conference_id": room.id, "name": name, "usernames": [str(u.username) for u in moved]})
+    return created
+
+
+@app.post("/meetings/{conference_id}/breakout/start")
+async def start_breakout_rooms(
+    conference_id: int,
+    payload: BreakoutStartRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    if _conference_host_id(db, conference_id) != user_id:
+        raise HTTPException(status_code=403, detail="Only the host can start breakout rooms")
+
+    active_participants = _active_conference_participants(db, conference_id)
+    if not active_participants:
+        raise HTTPException(status_code=400, detail="No active participants to split into breakout rooms")
+
+    created = await _create_breakout_rooms(db, conference_id, user_id, payload.groups, active_participants)
+    AuditService.log_event(db, user_id, "breakout_started", f"{len(created)} breakout room(s) started for conference {conference_id}")
+    return {"rooms": created, "count": len(created)}
+
+
+@app.post("/meetings/{conference_id}/breakout/auto")
+async def auto_breakout_rooms(
+    conference_id: int,
+    num_rooms: int = Query(..., ge=2, le=50, description="How many rooms to randomly split active participants into"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Random split into N rooms — no manual group picking. Host-only."""
+    user_id = int(getattr(current_user, 'id', 0))
+    if _conference_host_id(db, conference_id) != user_id:
+        raise HTTPException(status_code=403, detail="Only the host can start breakout rooms")
+
+    active_participants = _active_conference_participants(db, conference_id)
+    if not active_participants:
+        raise HTTPException(status_code=400, detail="No active participants to split into breakout rooms")
+
+    users = [db.query(User).filter(User.id == uid).first() for uid in active_participants.keys()]
+    users = [u for u in users if u]
+    random.shuffle(users)
+    rooms = min(num_rooms, len(users)) or 1
+
+    groups: List[Dict[str, Any]] = [{"name": f"Room {i + 1}", "usernames": []} for i in range(rooms)]
+    for i, u in enumerate(users):
+        groups[i % rooms]["usernames"].append(str(u.username))
+
+    created = await _create_breakout_rooms(db, conference_id, user_id, groups, active_participants)
+    AuditService.log_event(db, user_id, "breakout_started_auto", f"{len(created)} auto-shuffled breakout room(s) for conference {conference_id}")
+    return {"rooms": created, "count": len(created)}
+
+
+@app.post("/meetings/{conference_id}/breakout/end")
+async def end_breakout_rooms(
+    conference_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    if _conference_host_id(db, conference_id) != user_id:
+        raise HTTPException(status_code=403, detail="Only the host can end breakout rooms")
+
+    rooms = db.query(ConferenceSession).filter(
+        ConferenceSession.parent_conference_id == conference_id,
+        ConferenceSession.is_active == True,
+    ).all()
+
+    notified_user_ids = set()
+    for room in rooms:
+        parts = db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.conference_id == room.id,
+            ConferenceParticipant.is_active == True,
+        ).all()
+        for p in parts:
+            notified_user_ids.add(p.user_id)
+            setattr(p, 'is_active', False)
+        setattr(room, 'is_active', False)
+        setattr(room, 'ended_at', datetime.now(timezone.utc))
+    db.commit()
+
+    for uid in notified_user_ids:
+        await ws_manager.send_to_user(int(uid), {
+            "type": "breakout_ended",
+            "data": {"parent_conference_id": conference_id},
+        })
+
+    AuditService.log_event(db, user_id, "breakout_ended", f"Breakout rooms ended for conference {conference_id}")
+    return {"ended": len(rooms)}
+
+
+@app.get("/meetings/{conference_id}/breakout")
+async def list_breakout_rooms(
+    conference_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    is_participant = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id, ConferenceParticipant.user_id == user_id,
+    ).first()
+    if not is_participant:
+        raise HTTPException(status_code=403, detail="Not a participant in this conference")
+
+    rooms = db.query(ConferenceSession).filter(
+        ConferenceSession.parent_conference_id == conference_id,
+        ConferenceSession.is_active == True,
+    ).all()
+    result = []
+    for room in rooms:
+        parts = db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.conference_id == room.id, ConferenceParticipant.is_active == True,
+        ).all()
+        usernames = []
+        for p in parts:
+            u = db.query(User).filter(User.id == p.user_id).first()
+            usernames.append(str(getattr(u, 'username', '')))
+        result.append({"breakout_conference_id": room.id, "name": room.breakout_name, "usernames": usernames})
+    return {"rooms": result, "count": len(result)}
+
+
 @app.post("/calls/conference/{conference_id}/recording/start")
 async def start_conference_recording(
     conference_id: int,
@@ -5300,6 +5672,176 @@ async def link_preview(
     return preview
 
 
+# ─── Per-user chat preferences: archive / mute / lock / delete-for-me ───────
+# All four are purely local to whoever set them — never visible to or
+# affecting the other party. "Delete chat" only sets a cutoff timestamp;
+# message-history endpoints filter anything at/before it for this user only.
+
+def _chat_settings_dict(cs: ChatSettings) -> Dict[str, Any]:
+    return {
+        "peer_username": cs.peer_username,
+        "group_id": cs.group_id,
+        "is_archived": bool(cs.is_archived),
+        "is_muted": bool(cs.is_muted),
+        "muted_until": cs.muted_until.isoformat() if cs.muted_until else None,
+        "is_locked": bool(cs.is_locked),
+        "deleted_before": cs.deleted_before.isoformat() if cs.deleted_before else None,
+    }
+
+
+@app.get("/chats/settings")
+async def get_chat_settings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    rows = db.query(ChatSettings).filter(ChatSettings.user_id == user_id).all()
+    return {"settings": [_chat_settings_dict(r) for r in rows]}
+
+
+@app.put("/chats/settings")
+async def update_chat_settings(
+    payload: ChatSettingsUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    if bool(payload.peer_username) == bool(payload.group_id):
+        raise HTTPException(status_code=400, detail="Provide exactly one of peer_username or group_id")
+    user_id = int(getattr(current_user, 'id', 0))
+
+    row = db.query(ChatSettings).filter(
+        ChatSettings.user_id == user_id,
+        ChatSettings.peer_username == payload.peer_username,
+        ChatSettings.group_id == payload.group_id,
+    ).first()
+    if not row:
+        row = ChatSettings(user_id=user_id, peer_username=payload.peer_username, group_id=payload.group_id)
+        db.add(row)
+
+    if payload.is_archived is not None:
+        setattr(row, 'is_archived', payload.is_archived)
+    if payload.is_muted is not None:
+        setattr(row, 'is_muted', payload.is_muted)
+        setattr(row, 'muted_until', payload.muted_until if payload.is_muted else None)
+    if payload.is_locked is not None:
+        setattr(row, 'is_locked', payload.is_locked)
+
+    db.commit()
+    db.refresh(row)
+    return _chat_settings_dict(row)
+
+
+@app.post("/chats/delete")
+async def delete_chat_for_me(
+    payload: ChatDeleteRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Clears the thread from this user's view only — same as WhatsApp's
+    "Delete chat" (not "Delete for everyone"). The other party's copy, and
+    the messages themselves, are untouched."""
+    if bool(payload.peer_username) == bool(payload.group_id):
+        raise HTTPException(status_code=400, detail="Provide exactly one of peer_username or group_id")
+    user_id = int(getattr(current_user, 'id', 0))
+
+    row = db.query(ChatSettings).filter(
+        ChatSettings.user_id == user_id,
+        ChatSettings.peer_username == payload.peer_username,
+        ChatSettings.group_id == payload.group_id,
+    ).first()
+    if not row:
+        row = ChatSettings(user_id=user_id, peer_username=payload.peer_username, group_id=payload.group_id)
+        db.add(row)
+
+    setattr(row, 'deleted_before', datetime.now(timezone.utc))
+    setattr(row, 'is_archived', False)
+    db.commit()
+    return {"success": True}
+
+
+# ─── GIF search (GIPHY) ──────────────────────────────────────────────────────
+# Proxied server-side so the GIPHY API key never ships inside the app bundle.
+# A picked GIF's URL then travels as normal E2E-encrypted message content
+# (content_type="gif") — this endpoint itself never touches message content,
+# it's just a search.
+
+GIPHY_API_KEY = os.getenv("GIPHY_API_KEY")
+
+@app.get("/integrations/giphy/search")
+async def giphy_search(
+    q: str = Query(..., min_length=1, max_length=100),
+    limit: int = Query(24, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+):
+    if not GIPHY_API_KEY:
+        raise HTTPException(status_code=503, detail="GIF search is not configured on this server")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://api.giphy.com/v1/gifs/search", params={
+                "api_key": GIPHY_API_KEY, "q": q, "limit": limit, "rating": "pg-13",
+            })
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="GIF search failed")
+        data = resp.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"GIPHY search error: {e}")
+        raise HTTPException(status_code=502, detail="GIF search failed")
+
+    results = []
+    for item in data.get("data", []):
+        images = item.get("images", {})
+        fixed = images.get("fixed_height", {}) or images.get("original", {})
+        preview = images.get("fixed_height_small", {}) or images.get("preview_gif", {}) or fixed
+        results.append({
+            "id": item.get("id"),
+            "title": item.get("title", ""),
+            "url": fixed.get("url"),
+            "preview_url": preview.get("url"),
+            "width": fixed.get("width"),
+            "height": fixed.get("height"),
+        })
+    return {"results": results}
+
+
+@app.get("/integrations/giphy/trending")
+async def giphy_trending(
+    limit: int = Query(24, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+):
+    if not GIPHY_API_KEY:
+        raise HTTPException(status_code=503, detail="GIF search is not configured on this server")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://api.giphy.com/v1/gifs/trending", params={
+                "api_key": GIPHY_API_KEY, "limit": limit, "rating": "pg-13",
+            })
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="GIF search failed")
+        data = resp.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"GIPHY trending error: {e}")
+        raise HTTPException(status_code=502, detail="GIF search failed")
+
+    results = []
+    for item in data.get("data", []):
+        images = item.get("images", {})
+        fixed = images.get("fixed_height", {}) or images.get("original", {})
+        preview = images.get("fixed_height_small", {}) or images.get("preview_gif", {}) or fixed
+        results.append({
+            "id": item.get("id"),
+            "title": item.get("title", ""),
+            "url": fixed.get("url"),
+            "preview_url": preview.get("url"),
+            "width": fixed.get("width"),
+            "height": fixed.get("height"),
+        })
+    return {"results": results}
+
+
 @app.post("/meetings/create")
 async def create_meeting(
     payload: MeetingCreateRequest,
@@ -5451,6 +5993,661 @@ def _meeting_calendar_dict(m: Meeting, occurrence_at: datetime, creator_username
     }
 
 
+def _personal_plan_dict(p: PersonalPlan) -> Dict[str, Any]:
+    return {
+        "plan_id": p.id,
+        "title": p.title,
+        "notes": p.notes,
+        "starts_at": p.starts_at.isoformat() if p.starts_at else None,
+        "ends_at": p.ends_at.isoformat() if p.ends_at else None,
+        "all_day": bool(p.all_day),
+    }
+
+
+@app.post("/calendar/plans")
+async def create_personal_plan(
+    payload: PersonalPlanCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """A calendar entry that's just the user's own plan — never shared,
+    never a meeting, doesn't touch conferences/participants at all."""
+    user_id = int(getattr(current_user, 'id', 0))
+    plan = PersonalPlan(
+        user_id=user_id, title=payload.title, notes=payload.notes,
+        starts_at=payload.starts_at, ends_at=payload.ends_at, all_day=payload.all_day,
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return _personal_plan_dict(plan)
+
+
+@app.put("/calendar/plans/{plan_id}")
+async def update_personal_plan(
+    plan_id: int,
+    payload: PersonalPlanUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    plan = db.query(PersonalPlan).filter(PersonalPlan.id == plan_id, PersonalPlan.user_id == user_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if payload.title is not None:
+        setattr(plan, 'title', payload.title)
+    if payload.notes is not None:
+        setattr(plan, 'notes', payload.notes)
+    if payload.starts_at is not None:
+        setattr(plan, 'starts_at', payload.starts_at)
+    if payload.ends_at is not None:
+        setattr(plan, 'ends_at', payload.ends_at)
+    if payload.all_day is not None:
+        setattr(plan, 'all_day', payload.all_day)
+    db.commit()
+    db.refresh(plan)
+    return _personal_plan_dict(plan)
+
+
+@app.delete("/calendar/plans/{plan_id}")
+async def delete_personal_plan(
+    plan_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    plan = db.query(PersonalPlan).filter(PersonalPlan.id == plan_id, PersonalPlan.user_id == user_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    db.delete(plan)
+    db.commit()
+    return {"success": True}
+
+
+# ─── Google Calendar linking ────────────────────────────────────────────────
+# Standard OAuth2 web flow. Inert until GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET/
+# GOOGLE_REDIRECT_URI are set (same "503 until configured" pattern as
+# LiveKit) — nothing here talks to Google until an admin sets those up in
+# Google Cloud Console (OAuth client + authorized redirect URI matching
+# GOOGLE_REDIRECT_URI exactly) and puts the client id/secret in the env.
+#
+# The client calls GET /calendar/google/authorize (normal bearer auth) to get
+# a URL, opens that in a system browser; Google redirects the browser to
+# GOOGLE_REDIRECT_URI (= this server's /calendar/google/callback) with no
+# auth header, so `state` is what ties that request back to a user_id.
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+GOOGLE_OAUTH_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+
+# Short-lived OAuth handshake state — ephemeral by nature (the whole flow is
+# under a minute), so an in-process dict is fine, same precedent as the
+# in-meeting whiteboard's _conference_whiteboard_strokes.
+_google_oauth_states: Dict[str, Dict[str, Any]] = {}
+_GOOGLE_OAUTH_STATE_TTL_SECONDS = 600
+
+
+def _google_oauth_configured() -> bool:
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
+
+
+@app.get("/calendar/google/authorize")
+async def google_calendar_authorize(
+    current_user: User = Depends(get_current_user),
+):
+    if not _google_oauth_configured():
+        raise HTTPException(status_code=503, detail="Google Calendar linking is not configured on this server")
+    user_id = int(getattr(current_user, 'id', 0))
+    state = secrets.token_urlsafe(32)
+    _google_oauth_states[state] = {"user_id": user_id, "created_at": time.time()}
+    # Sweep expired entries opportunistically rather than running a whole
+    # extra periodic task for a handful of short-lived dict rows.
+    for k, v in list(_google_oauth_states.items()):
+        if time.time() - v["created_at"] > _GOOGLE_OAUTH_STATE_TTL_SECONDS:
+            _google_oauth_states.pop(k, None)
+
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": GOOGLE_OAUTH_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    from urllib.parse import urlencode
+    authorize_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    return {"authorize_url": authorize_url}
+
+
+@app.get("/calendar/google/callback")
+async def google_calendar_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    db: Session = Depends(get_database_session),
+):
+    """Hit directly by the browser via Google's redirect — no auth header,
+    hence the state lookup instead of get_current_user."""
+    if error:
+        return HTMLResponse(f"<html><body>Google Calendar linking was cancelled ({error}). You can close this tab.</body></html>")
+    if not _google_oauth_configured():
+        raise HTTPException(status_code=503, detail="Google Calendar linking is not configured on this server")
+    if not code or not state or state not in _google_oauth_states:
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+
+    entry = _google_oauth_states.pop(state)
+    if time.time() - entry["created_at"] > _GOOGLE_OAUTH_STATE_TTL_SECONDS:
+        raise HTTPException(status_code=400, detail="OAuth session expired — try linking again")
+    user_id = entry["user_id"]
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        token_resp = await client.post("https://oauth2.googleapis.com/token", data={
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        })
+        if token_resp.status_code != 200:
+            logger.error(f"Google token exchange failed: {token_resp.status_code} {token_resp.text}")
+            return HTMLResponse("<html><body>Could not link Google Calendar — token exchange failed. You can close this tab and try again.</body></html>", status_code=502)
+        tokens = token_resp.json()
+
+        google_email = None
+        try:
+            userinfo_resp = await client.get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                headers={"Authorization": f"Bearer {tokens.get('access_token')}"},
+            )
+            if userinfo_resp.status_code == 200:
+                google_email = userinfo_resp.json().get("email")
+        except Exception:
+            pass
+
+    expires_in = tokens.get("expires_in", 3600)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
+    refresh_token = tokens.get("refresh_token")
+
+    link = db.query(GoogleCalendarLink).filter(GoogleCalendarLink.user_id == user_id).first()
+    if link:
+        setattr(link, 'access_token', tokens.get("access_token"))
+        if refresh_token:  # Google only sends this on first consent — keep the old one otherwise
+            setattr(link, 'refresh_token', refresh_token)
+        setattr(link, 'token_expires_at', expires_at)
+        if google_email:
+            setattr(link, 'google_email', google_email)
+    else:
+        if not refresh_token:
+            return HTMLResponse(
+                "<html><body>Google didn't return a refresh token — revoke Dilarion's access at "
+                "myaccount.google.com/permissions and try linking again (this only happens if you'd "
+                "linked before and Google is reusing an old consent). You can close this tab.</body></html>",
+                status_code=400,
+            )
+        link = GoogleCalendarLink(
+            user_id=user_id, google_email=google_email,
+            access_token=tokens.get("access_token"), refresh_token=refresh_token,
+            token_expires_at=expires_at,
+        )
+        db.add(link)
+    db.commit()
+
+    AuditService.log_event(db, user_id, "google_calendar_linked", f"Google Calendar linked ({google_email or 'unknown email'})")
+    return HTMLResponse("<html><body>Google Calendar linked! You can close this tab and go back to Dilarion.</body></html>")
+
+
+@app.get("/calendar/google/status")
+async def google_calendar_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    link = db.query(GoogleCalendarLink).filter(GoogleCalendarLink.user_id == user_id).first()
+    if not link:
+        return {"linked": False}
+    return {
+        "linked": True,
+        "google_email": link.google_email,
+        "last_synced_at": link.last_synced_at.isoformat() if link.last_synced_at else None,
+    }
+
+
+@app.post("/calendar/google/unlink")
+async def google_calendar_unlink(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    link = db.query(GoogleCalendarLink).filter(GoogleCalendarLink.user_id == user_id).first()
+    if not link:
+        return {"success": True}
+    db.delete(link)
+    db.commit()
+    return {"success": True}
+
+
+async def _refresh_google_token_if_needed(db: Session, link: GoogleCalendarLink) -> Optional[str]:
+    """Returns a valid access token, refreshing it first if it's expired
+    (or about to be). Returns None if the refresh itself fails — the caller
+    should treat that as 'skip Google events this fetch', not an error, so
+    one dead link doesn't break the rest of someone's calendar."""
+    if link.token_expires_at and link.token_expires_at > datetime.now(timezone.utc) + timedelta(minutes=2):
+        return link.access_token
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post("https://oauth2.googleapis.com/token", data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": link.refresh_token,
+                "grant_type": "refresh_token",
+            })
+        if resp.status_code != 200:
+            logger.warning(f"Google token refresh failed for user {link.user_id}: {resp.status_code} {resp.text}")
+            return None
+        data = resp.json()
+        setattr(link, 'access_token', data.get("access_token"))
+        setattr(link, 'token_expires_at', datetime.now(timezone.utc) + timedelta(seconds=int(data.get("expires_in", 3600))))
+        db.commit()
+        return link.access_token
+    except Exception as e:
+        logger.warning(f"Google token refresh error for user {link.user_id}: {e}")
+        return None
+
+
+async def _fetch_google_events(db: Session, link: GoogleCalendarLink, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    """Read-only fetch, [start, end] window — mirrors the shape of
+    _meeting_calendar_dict closely enough that the client can render both
+    in one merged list without special-casing the source."""
+    if not _google_oauth_configured():
+        return []
+    access_token = await _refresh_google_token_if_needed(db, link)
+    if not access_token:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://www.googleapis.com/calendar/v3/calendars/{link.calendar_id or 'primary'}/events",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={
+                    "timeMin": start.isoformat(), "timeMax": end.isoformat(),
+                    "singleEvents": "true", "orderBy": "startTime", "maxResults": 250,
+                },
+            )
+        if resp.status_code != 200:
+            logger.warning(f"Google events fetch failed for user {link.user_id}: {resp.status_code} {resp.text}")
+            return []
+        items = resp.json().get("items", [])
+    except Exception as e:
+        logger.warning(f"Google events fetch error for user {link.user_id}: {e}")
+        return []
+
+    setattr(link, 'last_synced_at', datetime.now(timezone.utc))
+    db.commit()
+
+    result = []
+    for ev in items:
+        start_info = ev.get("start", {})
+        end_info = ev.get("end", {})
+        result.append({
+            "google_event_id": ev.get("id"),
+            "title": ev.get("summary") or "(No title)",
+            "occurrence_start": start_info.get("dateTime") or start_info.get("date"),
+            "occurrence_end": end_info.get("dateTime") or end_info.get("date"),
+            "all_day": "date" in start_info and "dateTime" not in start_info,
+            "location": ev.get("location"),
+            "html_link": ev.get("htmlLink"),
+        })
+    return result
+
+
+# ─── Tasks ───────────────────────────────────────────────────────────────────
+# Assignable by a site admin (any group, or a direct assignment with no
+# group) or a group admin (their own group only — GroupMember.role=="admin",
+# separate from site-wide is_admin, so this can be done from inside the chat
+# without touching the admin website). Breakout tasks split the assignees
+# into TaskGroup sub-teams, each submitting their own report; the creator
+# can then have Ollama compile all sub-reports into one.
+
+def _is_group_admin(db: Session, group_id: int, user_id: int) -> bool:
+    m = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user_id).first()
+    return bool(m and m.role == "admin")
+
+
+def _task_dict(db: Session, task: Task) -> Dict[str, Any]:
+    creator = db.query(User).filter(User.id == task.created_by_id).first()
+    assignees = db.query(TaskAssignee).filter(TaskAssignee.task_id == task.id).all()
+    assignee_out = []
+    for a in assignees:
+        u = db.query(User).filter(User.id == a.user_id).first()
+        assignee_out.append({
+            "user_id": a.user_id, "username": str(getattr(u, 'username', '')),
+            "status": a.status, "assigned_at": a.assigned_at.isoformat() if a.assigned_at else None,
+            "completed_at": a.completed_at.isoformat() if a.completed_at else None,
+        })
+    groups = db.query(TaskGroup).filter(TaskGroup.task_id == task.id).all()
+    group_out = []
+    for g in groups:
+        members = db.query(TaskGroupMember).filter(TaskGroupMember.task_group_id == g.id).all()
+        member_usernames = []
+        for m in members:
+            u = db.query(User).filter(User.id == m.user_id).first()
+            member_usernames.append(str(getattr(u, 'username', '')))
+        submitter = db.query(User).filter(User.id == g.report_submitted_by_id).first() if g.report_submitted_by_id else None
+        group_out.append({
+            "group_id": g.id, "name": g.name, "member_usernames": member_usernames,
+            "report_text": g.report_text,
+            "report_submitted_by": str(getattr(submitter, 'username', '')) if submitter else None,
+            "report_submitted_at": g.report_submitted_at.isoformat() if g.report_submitted_at else None,
+        })
+    return {
+        "task_id": task.id,
+        "title": task.title,
+        "description": task.description,
+        "due_at": task.due_at.isoformat() if task.due_at else None,
+        "status": task.status,
+        "is_breakout": bool(task.is_breakout),
+        "group_id": task.group_id,
+        "created_by": str(getattr(creator, 'username', '')),
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "assignees": assignee_out,
+        "breakout_groups": group_out,
+        "compiled_report": task.compiled_report,
+        "compiled_report_at": task.compiled_report_at.isoformat() if task.compiled_report_at else None,
+        "recurrence": task.recurrence,
+    }
+
+
+def _advance_by_recurrence(dt: datetime, recurrence: str) -> datetime:
+    """Same increment rules as _expand_meeting_occurrences, single-step."""
+    if recurrence == "daily":
+        return dt + timedelta(days=1)
+    if recurrence == "weekly":
+        return dt + timedelta(weeks=1)
+    if recurrence == "monthly":
+        month = dt.month + 1
+        year = dt.year + (month - 1) // 12
+        month = ((month - 1) % 12) + 1
+        day = min(dt.day, 28)
+        return dt.replace(year=year, month=month, day=day)
+    return dt
+
+
+async def _spawn_next_task_occurrence(db: Session, task: Task) -> Optional[Task]:
+    """Called when a recurring task is marked completed — creates a fresh
+    row with the same shape (assignees, or breakout groups+membership, but
+    no reports/compiled summary) and an advanced due date, then notifies
+    everyone assigned to the new occurrence."""
+    if not task.recurrence:
+        return None
+    next_due = _advance_by_recurrence(task.due_at, task.recurrence) if task.due_at else None
+
+    new_task = Task(
+        group_id=task.group_id, created_by_id=task.created_by_id, title=task.title,
+        description=task.description, due_at=next_due, is_breakout=task.is_breakout,
+        recurrence=task.recurrence,
+    )
+    db.add(new_task)
+    db.commit()
+    db.refresh(new_task)
+
+    notify_user_ids: List[int] = []
+    if task.is_breakout:
+        old_groups = db.query(TaskGroup).filter(TaskGroup.task_id == task.id).all()
+        for g in old_groups:
+            new_group = TaskGroup(task_id=new_task.id, name=g.name)
+            db.add(new_group)
+            db.commit()
+            db.refresh(new_group)
+            members = db.query(TaskGroupMember).filter(TaskGroupMember.task_group_id == g.id).all()
+            for m in members:
+                db.add(TaskGroupMember(task_group_id=new_group.id, user_id=m.user_id))
+                notify_user_ids.append(m.user_id)
+        db.commit()
+    else:
+        old_assignees = db.query(TaskAssignee).filter(TaskAssignee.task_id == task.id).all()
+        for a in old_assignees:
+            db.add(TaskAssignee(task_id=new_task.id, user_id=a.user_id))
+            notify_user_ids.append(a.user_id)
+        db.commit()
+
+    for uid in set(notify_user_ids):
+        sent = await ws_manager.send_to_user(uid, {
+            "type": "task_assigned",
+            "data": {"task_id": new_task.id, "title": new_task.title, "assigned_by": "Recurring task"},
+        })
+        if not sent:
+            await push_to_user(db, uid, "New task", f"Recurring task: {new_task.title}")
+
+    return new_task
+
+
+@app.post("/tasks")
+async def create_task(
+    payload: TaskCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    is_site_admin = bool(getattr(current_user, 'is_admin', False))
+
+    if payload.group_id:
+        if not (is_site_admin or _is_group_admin(db, payload.group_id, user_id)):
+            raise HTTPException(status_code=403, detail="Only a group admin or site admin can assign tasks in this group")
+        group_member_ids = {
+            m.user_id for m in db.query(GroupMember).filter(GroupMember.group_id == payload.group_id).all()
+        }
+    else:
+        if not is_site_admin:
+            raise HTTPException(status_code=403, detail="Only a site admin can assign a task without a group")
+        group_member_ids = None
+
+    task = Task(
+        group_id=payload.group_id, created_by_id=user_id, title=payload.title,
+        description=payload.description, due_at=payload.due_at, is_breakout=payload.is_breakout,
+        recurrence=payload.recurrence,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+
+    notify_user_ids: List[int] = []
+
+    if payload.is_breakout and payload.breakout_groups:
+        for grp in payload.breakout_groups:
+            tg = TaskGroup(task_id=task.id, name=grp.get("name"))
+            db.add(tg)
+            db.commit()
+            db.refresh(tg)
+            for uname in grp.get("usernames", []):
+                u = db.query(User).filter(User.username == uname, User.is_active == True).first()
+                if not u:
+                    continue
+                if group_member_ids is not None and u.id not in group_member_ids:
+                    continue
+                db.add(TaskGroupMember(task_group_id=tg.id, user_id=u.id))
+                notify_user_ids.append(u.id)
+        db.commit()
+    else:
+        for uname in payload.assignee_usernames:
+            u = db.query(User).filter(User.username == uname, User.is_active == True).first()
+            if not u:
+                continue
+            if group_member_ids is not None and u.id not in group_member_ids:
+                continue
+            db.add(TaskAssignee(task_id=task.id, user_id=u.id))
+            notify_user_ids.append(u.id)
+        db.commit()
+
+    creator_username = str(getattr(current_user, 'username', ''))
+    for uid in set(notify_user_ids):
+        sent = await ws_manager.send_to_user(uid, {
+            "type": "task_assigned",
+            "data": {"task_id": task.id, "title": task.title, "assigned_by": creator_username},
+        })
+        if not sent:
+            await push_to_user(db, uid, "New task", f"{creator_username} assigned you: {task.title}")
+
+    AuditService.log_event(db, user_id, "task_created", f"Task '{task.title}' (ID {task.id}) created")
+    return _task_dict(db, task)
+
+
+@app.get("/tasks")
+async def list_tasks(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Tasks visible to the caller: created by them, directly assigned to
+    them, in a breakout group they're on, or in a group they belong to."""
+    user_id = int(getattr(current_user, 'id', 0))
+    my_group_ids = {m.group_id for m in db.query(GroupMember).filter(GroupMember.user_id == user_id).all()}
+    assigned_task_ids = {a.task_id for a in db.query(TaskAssignee).filter(TaskAssignee.user_id == user_id).all()}
+    my_group_task_group_ids = {g.task_group_id for g in db.query(TaskGroupMember).filter(TaskGroupMember.user_id == user_id).all()}
+    breakout_task_ids = set()
+    if my_group_task_group_ids:
+        breakout_task_ids = {
+            g.task_id for g in db.query(TaskGroup).filter(TaskGroup.id.in_(my_group_task_group_ids)).all()
+        }
+
+    tasks = db.query(Task).filter(
+        or_(
+            Task.created_by_id == user_id,
+            Task.id.in_(assigned_task_ids) if assigned_task_ids else False,
+            Task.id.in_(breakout_task_ids) if breakout_task_ids else False,
+            Task.group_id.in_(my_group_ids) if my_group_ids else False,
+        )
+    ).order_by(Task.created_at.desc()).all()
+
+    return {"tasks": [_task_dict(db, t) for t in tasks], "count": len(tasks)}
+
+
+@app.get("/tasks/{task_id}")
+async def get_task(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return _task_dict(db, task)
+
+
+@app.put("/tasks/{task_id}/status")
+async def update_task_status(
+    task_id: int,
+    payload: TaskStatusUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    is_site_admin = bool(getattr(current_user, 'is_admin', False))
+    is_creator = task.created_by_id == user_id
+    is_grp_admin = bool(task.group_id) and _is_group_admin(db, task.group_id, user_id)
+    if not (is_site_admin or is_creator or is_grp_admin):
+        raise HTTPException(status_code=403, detail="Only the task creator or an admin can change task status")
+    if payload.status not in ("open", "in_progress", "completed", "cancelled"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+    setattr(task, 'status', payload.status)
+    db.commit()
+
+    next_task = None
+    if payload.status == "completed" and task.recurrence:
+        next_task = await _spawn_next_task_occurrence(db, task)
+
+    result = _task_dict(db, task)
+    if next_task:
+        result["next_occurrence"] = _task_dict(db, next_task)
+    return result
+
+
+@app.put("/tasks/{task_id}/my-status")
+async def update_my_assignment_status(
+    task_id: int,
+    payload: TaskStatusUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """An assignee updating their own progress on a direct (non-breakout) task."""
+    user_id = int(getattr(current_user, 'id', 0))
+    assignee = db.query(TaskAssignee).filter(TaskAssignee.task_id == task_id, TaskAssignee.user_id == user_id).first()
+    if not assignee:
+        raise HTTPException(status_code=404, detail="You are not assigned to this task")
+    if payload.status not in ("assigned", "in_progress", "completed"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+    setattr(assignee, 'status', payload.status)
+    if payload.status == "completed":
+        setattr(assignee, 'completed_at', datetime.now(timezone.utc))
+    db.commit()
+    task = db.query(Task).filter(Task.id == task_id).first()
+    return _task_dict(db, task)
+
+
+@app.post("/tasks/{task_id}/groups/{group_id}/report")
+async def submit_breakout_report(
+    task_id: int,
+    group_id: int,
+    payload: TaskGroupReportSubmit,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    user_id = int(getattr(current_user, 'id', 0))
+    tg = db.query(TaskGroup).filter(TaskGroup.id == group_id, TaskGroup.task_id == task_id).first()
+    if not tg:
+        raise HTTPException(status_code=404, detail="Breakout group not found")
+    is_member = db.query(TaskGroupMember).filter(
+        TaskGroupMember.task_group_id == group_id, TaskGroupMember.user_id == user_id
+    ).first()
+    if not is_member:
+        raise HTTPException(status_code=403, detail="You are not a member of this breakout group")
+
+    setattr(tg, 'report_text', payload.report_text)
+    setattr(tg, 'report_submitted_by_id', user_id)
+    setattr(tg, 'report_submitted_at', datetime.now(timezone.utc))
+    db.commit()
+
+    task = db.query(Task).filter(Task.id == task_id).first()
+    return _task_dict(db, task)
+
+
+@app.post("/tasks/{task_id}/compile")
+async def compile_task(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Compiles every breakout sub-group's report into one via Ollama.
+    Task reports aren't E2E encrypted like chat — they're plain server-side
+    text — so this is safe to read directly, unlike message content."""
+    user_id = int(getattr(current_user, 'id', 0))
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.is_breakout:
+        raise HTTPException(status_code=400, detail="Only breakout tasks have sub-reports to compile")
+
+    is_site_admin = bool(getattr(current_user, 'is_admin', False))
+    is_creator = task.created_by_id == user_id
+    is_grp_admin = bool(task.group_id) and _is_group_admin(db, task.group_id, user_id)
+    if not (is_site_admin or is_creator or is_grp_admin):
+        raise HTTPException(status_code=403, detail="Only the task creator or an admin can compile the report")
+
+    groups = db.query(TaskGroup).filter(TaskGroup.task_id == task_id).all()
+    reports = [{"team_name": g.name or f"Group {g.id}", "report_text": g.report_text or ""} for g in groups]
+    compiled = await compile_task_reports(reports)
+    if not compiled:
+        raise HTTPException(status_code=422, detail="No submitted reports to compile yet, or the AI service is unavailable")
+
+    setattr(task, 'compiled_report', compiled)
+    setattr(task, 'compiled_report_at', datetime.now(timezone.utc))
+    db.commit()
+    return _task_dict(db, task)
+
+
 @app.get("/meetings/calendar")
 async def get_meeting_calendar(
     start: datetime = Query(..., description="Range start, ISO 8601"),
@@ -5483,7 +6680,20 @@ async def get_meeting_calendar(
             result.append(_meeting_calendar_dict(m, occ, creator_username))
 
     result.sort(key=lambda r: r["occurrence_start"])
-    return {"occurrences": result, "count": len(result)}
+
+    plans = db.query(PersonalPlan).filter(
+        PersonalPlan.user_id == user_id,
+        PersonalPlan.starts_at <= end,
+        or_(PersonalPlan.ends_at.is_(None), PersonalPlan.ends_at >= start),
+    ).all()
+    plan_result = [_personal_plan_dict(p) for p in plans]
+
+    google_events: List[Dict[str, Any]] = []
+    google_link = db.query(GoogleCalendarLink).filter(GoogleCalendarLink.user_id == user_id).first()
+    if google_link:
+        google_events = await _fetch_google_events(db, google_link, start, end)
+
+    return {"occurrences": result, "count": len(result), "plans": plan_result, "google_events": google_events}
 
 
 @app.get("/admin/calendar")
@@ -6012,12 +7222,18 @@ async def get_conversation(
             raise HTTPException(status_code=404, detail="Partner user not found")
         partner_id = int(getattr(partner, 'id', 0))
 
-        msgs = db.query(Message).filter(
+        msg_query = db.query(Message).filter(
             or_(
                 and_(Message.sender_id == user_id, Message.recipient_id == partner_id),
                 and_(Message.sender_id == partner_id, Message.recipient_id == user_id),
             )
-        ).order_by(Message.timestamp.asc()).limit(200).all()
+        )
+        chat_settings = db.query(ChatSettings).filter(
+            ChatSettings.user_id == user_id, ChatSettings.peer_username == partner_username,
+        ).first()
+        if chat_settings and chat_settings.deleted_before:
+            msg_query = msg_query.filter(Message.timestamp > chat_settings.deleted_before)
+        msgs = msg_query.order_by(Message.timestamp.asc()).limit(200).all()
 
         current_username = str(getattr(current_user, 'username', ''))
         reactions_map = _reactions_summary(db, [m.id for m in msgs], user_id)
@@ -6224,7 +7440,10 @@ async def get_users(current_user: User = Depends(get_current_user),
         for user in users:
             result.append({
                 "username": str(getattr(user, "username", "")),
-                "is_active": bool(getattr(user, "is_active", True))
+                "is_active": bool(getattr(user, "is_active", True)),
+                "availability_status": str(getattr(user, "availability_status", None) or "available"),
+                "status_text": getattr(user, "status_text", None),
+                "has_profile_picture": bool(getattr(user, "profile_picture_path", None)),
             })
         return result
     except Exception as e:
@@ -6364,6 +7583,7 @@ async def leave_group(
     except Exception as e:
         logger.error(f"Leave group error: {e}")
         raise HTTPException(status_code=500, detail="Failed to leave group")
+@app.post("/groups/{group_id}/members")
 async def add_group_member(
     group_id: int,
     username: str,
@@ -6383,6 +7603,88 @@ async def add_group_member(
     except Exception as e:
         logger.error(f"Add group member error: {e}")
         raise HTTPException(status_code=500, detail="Failed to add group member")
+
+
+@app.post("/groups/{group_id}/members/{username}/promote")
+async def promote_group_member(
+    group_id: int,
+    username: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Make an existing group member a group admin — lets them assign tasks
+    and manage membership in the chat itself, without needing site-wide
+    is_admin or the admin website."""
+    try:
+        actor_id = int(getattr(current_user, 'id', 0))
+        actor_member = db.query(GroupMember).filter(
+            GroupMember.group_id == group_id, GroupMember.user_id == actor_id
+        ).first()
+        if not actor_member or actor_member.role != "admin":
+            raise HTTPException(status_code=403, detail="Only group admins can promote members")
+
+        target = db.query(User).filter(User.username == username, User.is_active == True).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        target_member = db.query(GroupMember).filter(
+            GroupMember.group_id == group_id, GroupMember.user_id == target.id
+        ).first()
+        if not target_member:
+            raise HTTPException(status_code=404, detail=f"{username} is not a member of this group")
+
+        setattr(target_member, 'role', 'admin')
+        db.commit()
+        AuditService.log_event(db, actor_id, "group_member_promoted", f"{username} made admin of group {group_id}")
+        return {"message": f"{username} is now a group admin"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Promote group member error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to promote member")
+
+
+@app.post("/groups/{group_id}/members/{username}/demote")
+async def demote_group_member(
+    group_id: int,
+    username: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Revoke a group member's admin role — refuses to leave a group with zero admins."""
+    try:
+        actor_id = int(getattr(current_user, 'id', 0))
+        actor_member = db.query(GroupMember).filter(
+            GroupMember.group_id == group_id, GroupMember.user_id == actor_id
+        ).first()
+        if not actor_member or actor_member.role != "admin":
+            raise HTTPException(status_code=403, detail="Only group admins can demote members")
+
+        target = db.query(User).filter(User.username == username).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        target_member = db.query(GroupMember).filter(
+            GroupMember.group_id == group_id, GroupMember.user_id == target.id
+        ).first()
+        if not target_member or target_member.role != "admin":
+            raise HTTPException(status_code=400, detail=f"{username} is not a group admin")
+
+        admin_count = db.query(GroupMember).filter(
+            GroupMember.group_id == group_id, GroupMember.role == "admin"
+        ).count()
+        if admin_count <= 1:
+            raise HTTPException(status_code=400, detail="Cannot demote the last admin of a group")
+
+        setattr(target_member, 'role', 'member')
+        db.commit()
+        AuditService.log_event(db, actor_id, "group_member_demoted", f"{username} removed as admin of group {group_id}")
+        return {"message": f"{username} is no longer a group admin"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Demote group member error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to demote member")
 
 @app.get("/groups/{group_id}/messages", response_model=List[MessageResponse])
 async def get_group_messages(
@@ -6524,6 +7826,7 @@ async def send_group_message(
             db, user_id, payload.group_id, payload.message,
             _resolve_disappear_hours(current_user, payload.disappear_after_hours, "text"), addressed_to_id, is_announcement,
             payload.encrypted_key, payload.iv, payload.decoy_content,
+            content_type=_client_content_type(payload.content_type),
             reply_to_message_id=payload.reply_to_message_id,
             forwarded_from_message_id=payload.forwarded_from_message_id,
             mentions=payload.mentions,
@@ -7027,9 +8330,15 @@ async def get_group_conversation(
         membership = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user_id).first()
         if not membership:
             raise HTTPException(status_code=403, detail="Not a member of this group")
-            
-        msgs = db.query(Message).filter(Message.group_id == group_id).order_by(Message.timestamp.asc()).limit(200).all()
-        
+
+        msg_query = db.query(Message).filter(Message.group_id == group_id)
+        chat_settings = db.query(ChatSettings).filter(
+            ChatSettings.user_id == user_id, ChatSettings.group_id == group_id,
+        ).first()
+        if chat_settings and chat_settings.deleted_before:
+            msg_query = msg_query.filter(Message.timestamp > chat_settings.deleted_before)
+        msgs = msg_query.order_by(Message.timestamp.asc()).limit(200).all()
+
         result = []
         for msg in msgs:
             sender = db.query(User).filter(User.id == msg.sender_id).first()
@@ -7321,6 +8630,105 @@ async def get_user_voice_identity(
         raise HTTPException(status_code=404, detail="Voice file missing")
         
     return FileResponse(user.voice_identity_path)
+
+
+# ─── Profile picture ─────────────────────────────────────────────────────────
+
+_PROFILE_PICTURE_CONTENT_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+
+@app.post("/users/me/profile-picture")
+async def upload_profile_picture(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    ext = _PROFILE_PICTURE_CONTENT_TYPES.get(file.content_type)
+    if not ext:
+        raise HTTPException(status_code=400, detail="Only jpeg, png, or webp images are supported")
+
+    content = await file.read()
+    if len(content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image must be under 8MB")
+
+    user_id = int(getattr(current_user, 'id', 0))
+    user_dir = os.path.join(UPLOAD_DIR, f"user_{user_id}")
+    os.makedirs(user_dir, exist_ok=True)
+
+    # Remove any previous picture under a different extension before writing
+    # the new one, so switching from .png to .jpg doesn't leave a stale file.
+    old_path = getattr(current_user, 'profile_picture_path', None)
+    if old_path and os.path.exists(old_path):
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
+
+    file_path = os.path.join(user_dir, f"profile_picture.{ext}")
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    setattr(current_user, 'profile_picture_path', file_path)
+    db.commit()
+    return {"message": "Profile picture updated"}
+
+
+@app.get("/users/{username}/profile-picture")
+async def get_user_profile_picture(
+    username: str,
+    db: Session = Depends(get_database_session),
+):
+    user = db.query(User).filter(User.username == username).first()
+    if not user or not user.profile_picture_path:
+        raise HTTPException(status_code=404, detail="No profile picture set")
+    if not os.path.exists(user.profile_picture_path):
+        raise HTTPException(status_code=404, detail="Profile picture file missing")
+    return FileResponse(user.profile_picture_path)
+
+
+@app.delete("/users/me/profile-picture")
+async def delete_profile_picture(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    path = getattr(current_user, 'profile_picture_path', None)
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    setattr(current_user, 'profile_picture_path', None)
+    db.commit()
+    return {"message": "Profile picture removed"}
+
+
+# ─── Availability status (busy/DND/away — separate from WS online/offline) ──
+
+_VALID_AVAILABILITY_STATUSES = {"available", "busy", "dnd", "away", "offline"}
+
+@app.post("/users/me/availability")
+async def set_availability_status(
+    payload: AvailabilityStatusUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    if payload.availability_status not in _VALID_AVAILABILITY_STATUSES:
+        raise HTTPException(status_code=400, detail=f"availability_status must be one of {sorted(_VALID_AVAILABILITY_STATUSES)}")
+    setattr(current_user, 'availability_status', payload.availability_status)
+    setattr(current_user, 'status_text', payload.status_text)
+    db.commit()
+
+    # Best-effort broadcast so open chats update live instead of only on next
+    # contact-list refresh — matches the existing presence push pattern.
+    username = str(getattr(current_user, 'username', ''))
+    for contact in db.query(User).filter(User.is_active == True, User.id != current_user.id).all():
+        await ws_manager.send_to_user(contact.id, {
+            "type": "availability_changed",
+            "data": {"username": username, "availability_status": payload.availability_status, "status_text": payload.status_text},
+        })
+
+    return {"availability_status": payload.availability_status, "status_text": payload.status_text}
+
+
 @app.get("/media/decoy-file/{media_id}")
 async def get_decoy_file(
     media_id: str,
@@ -7812,6 +9220,154 @@ async def deny_account_deletion(
         "data": {"request_id": req.id, "reason": payload.reason},
     })
     return {"status": "denied"}
+
+
+# ─── Password reset requests ("Forgot Password") ────────────────────────────
+# No email/SMS on file for accounts (admin-provisioned), so this can't be a
+# real self-service reset — it's a request an admin has to act on, same
+# shape as account deletion requests. Unauthenticated (the whole point is
+# the user can't log in), and deliberately gives the same response whether
+# or not the phone number is registered, so this can't be used to check
+# which numbers have accounts.
+
+@app.post("/auth/forgot-password")
+async def request_password_reset(
+    payload: PasswordResetRequestCreate,
+    db: Session = Depends(get_database_session),
+):
+    generic_response = {"message": "If that phone number is registered, an administrator has been notified."}
+
+    user = db.query(User).filter(User.phone_number == payload.phone_number, User.is_active == True).first()
+    if not user:
+        return generic_response
+
+    user_id = int(getattr(user, 'id', 0))
+    existing = db.query(PasswordResetRequest).filter(
+        PasswordResetRequest.user_id == user_id,
+        PasswordResetRequest.status == "pending",
+    ).first()
+    if existing:
+        return generic_response
+
+    req = PasswordResetRequest(user_id=user_id, reason=payload.reason)
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+
+    username = str(getattr(user, 'username', ''))
+    admins = db.query(User).filter(User.is_admin == True, User.is_active == True).all()
+    for admin in admins:
+        ws_sent = await ws_manager.send_to_user(admin.id, {
+            "type": "password_reset_requested",
+            "data": {"request_id": req.id, "username": username, "reason": payload.reason},
+        })
+        if not ws_sent:
+            await push_to_user(db, admin.id, "Password reset request", f"{username} can't log in and requested a reset")
+
+    AuditService.log_event(db, user_id, "password_reset_requested", f"{username} requested a password/token reset")
+    return generic_response
+
+
+@app.get("/admin/password-reset-requests")
+async def list_password_reset_requests(
+    status: Optional[str] = Query(None, description="Filter by pending/approved/denied — omit for all"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    query = db.query(PasswordResetRequest)
+    if status:
+        query = query.filter(PasswordResetRequest.status == status)
+    rows = query.order_by(PasswordResetRequest.requested_at.desc()).all()
+
+    result = []
+    for r in rows:
+        requester = db.query(User).filter(User.id == r.user_id).first()
+        processor = db.query(User).filter(User.id == r.processed_by_id).first() if r.processed_by_id else None
+        result.append({
+            "id": r.id,
+            "username": str(getattr(requester, 'username', '')) if requester else "unknown",
+            "phone_number": str(getattr(requester, 'phone_number', '')) if requester else None,
+            "reason": r.reason,
+            "status": r.status,
+            "requested_at": r.requested_at.isoformat() if r.requested_at else None,
+            "processed_by": str(getattr(processor, 'username', '')) if processor else None,
+            "processed_at": r.processed_at.isoformat() if r.processed_at else None,
+        })
+    return {"requests": result, "count": len(result)}
+
+
+@app.post("/admin/password-reset-requests/{request_id}/approve")
+async def approve_password_reset(
+    request_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Generates a new random token and sets it on the account. The new
+    token is returned ONLY in this response, for the approving admin to
+    relay to the user out-of-band (call, in person) — same trust model as
+    the token an admin picks when first creating an account. It is never
+    emailed, pushed, or shown anywhere else."""
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    admin_id = int(getattr(current_user, 'id', 0))
+
+    req = db.query(PasswordResetRequest).filter(PasswordResetRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Request already {req.status}")
+
+    target = db.query(User).filter(User.id == req.user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User account no longer exists")
+
+    new_token = secrets.token_urlsafe(9)
+    setattr(target, 'token', new_token)
+    setattr(req, 'status', 'approved')
+    setattr(req, 'processed_by_id', admin_id)
+    setattr(req, 'processed_at', datetime.now(timezone.utc))
+    db.commit()
+
+    # Every existing session for this account is now stale intentionally —
+    # a reset should log out anyone using the old (possibly compromised or
+    # simply forgotten) credential on every device.
+    db.query(UserSession).filter(UserSession.user_id == target.id).delete()
+    db.commit()
+
+    AuditService.log_event(db, admin_id, "password_reset_approved", f"Token reset for {target.username}, all sessions invalidated")
+    return {"status": "approved", "username": str(target.username), "new_token": new_token}
+
+
+@app.post("/admin/password-reset-requests/{request_id}/deny")
+async def deny_password_reset(
+    request_id: int,
+    payload: PasswordResetDecision,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    admin_id = int(getattr(current_user, 'id', 0))
+
+    req = db.query(PasswordResetRequest).filter(PasswordResetRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Request already {req.status}")
+
+    setattr(req, 'status', 'denied')
+    setattr(req, 'processed_by_id', admin_id)
+    setattr(req, 'processed_at', datetime.now(timezone.utc))
+    db.commit()
+
+    await ws_manager.send_to_user(req.user_id, {
+        "type": "password_reset_denied",
+        "data": {"request_id": req.id, "reason": payload.reason},
+    })
+    return {"status": "denied"}
+
 
 @app.post("/messages/cleanup")
 async def cleanup_expired_messages(

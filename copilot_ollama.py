@@ -241,3 +241,27 @@ async def translate_text(text: str, target_language: str) -> Optional[str]:
     system_prompt = _TRANSLATE_PROMPT_TEMPLATE.format(language=lang)
     result = await _ollama_generate(system_prompt, trimmed)
     return result.strip() if result else None
+
+
+_COMPILE_TASK_REPORTS_PROMPT = """You compile several sub-team reports on the same task into one combined report for the task owner. Each sub-team's report is labeled with their team name. Produce a single coherent report that:
+- Summarizes what each team covered, without just concatenating them verbatim
+- Calls out overlaps, contradictions, or gaps between teams' findings if any exist
+- Ends with a short overall summary
+
+Respond with ONLY the compiled report — no preamble, no meta-commentary about this instruction."""
+
+
+async def compile_task_reports(reports: List[Dict[str, str]]) -> Optional[str]:
+    """
+    Compiles breakout sub-team reports for a task into one combined report.
+    `reports` is a list of {"team_name": ..., "report_text": ...} the caller
+    has already gathered server-side (task reports aren't E2E encrypted,
+    unlike chat, so this can read them directly). Returns None on failure.
+    """
+    usable = [r for r in reports if r.get("report_text", "").strip()]
+    if not usable:
+        return None
+    parts = [f"[{r.get('team_name') or 'Team'}]\n{r['report_text'].strip()}" for r in usable]
+    combined = "\n\n".join(parts)[:_MAX_INPUT_CHARS]
+    result = await _ollama_generate(_COMPILE_TASK_REPORTS_PROMPT, combined)
+    return result.strip() if result else None
