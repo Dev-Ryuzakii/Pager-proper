@@ -9778,57 +9778,6 @@ async def cleanup_expired_media(
         logger.error(f"Media cleanup error: {e}")
         raise HTTPException(status_code=500, detail="Failed to cleanup expired media files")
 
-@app.get("/admin/media/{media_id}")
-async def admin_get_media(
-    media_id: str,
-    current_admin: User = Depends(get_admin_only),
-    db: Session = Depends(get_database_session),
-):
-    """Admin access to a media file's actual bytes — unlike GET /media/{id},
-    this never marks the file downloaded and never burns a one-time-view
-    file, so it doesn't affect the sender/recipient's own ability to view it.
-
-    Today every desktop upload is plaintext on disk (watermarked, but not
-    client-side encrypted — /media/upload_raw never receives encryption
-    metadata), so most of the time this just reads and returns the file. If
-    encryption_metadata does carry an admin-wrapped key (future clients, or
-    mobile if it turns out to encrypt uploads), that gets unwrapped first."""
-    media = db.query(Media).filter(Media.media_id == media_id).first()
-    if not media:
-        raise HTTPException(status_code=404, detail="Media not found")
-    if not os.path.exists(media.encrypted_file_path):
-        raise HTTPException(status_code=404, detail="Media file not found on server")
-
-    with open(media.encrypted_file_path, "rb") as f:
-        raw = f.read()
-
-    was_encrypted = False
-    meta = media.encryption_metadata
-    if isinstance(meta, dict):
-        keys = meta.get("encrypted_keys") or meta.get("encryptedKeys") or {}
-        wrapped = keys.get("__admin__") if isinstance(keys, dict) else None
-        iv = meta.get("iv")
-        if wrapped and iv:
-            try:
-                raw = _admin_unwrap_and_decrypt_bytes(base64.b64encode(raw).decode(), wrapped, iv)
-                was_encrypted = True
-            except Exception as e:
-                logger.warning(f"Admin media decrypt failed for {media_id}: {e}")
-                raise HTTPException(status_code=500, detail="Failed to decrypt media")
-
-    _log_admin_decrypt(db, current_admin, int(media.sender_id), {
-        "media_id": media_id, "was_encrypted": was_encrypted, "content_type": media.content_type,
-    })
-    return {
-        "media_id": media.media_id,
-        "filename": media.filename,
-        "media_type": media.media_type,
-        "content_type": media.content_type,
-        "file_size": len(raw),
-        "was_encrypted": was_encrypted,
-        "content": base64.b64encode(raw).decode(),
-    }
-
 # ── RBAC auth dependencies ────────────────────────────────────────────────────
 
 async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -10053,6 +10002,57 @@ async def admin_decrypt_group_messages(
         "group_id": group_id, "total": len(results), "decrypted": decrypted_count,
     })
     return {"messages": results, "total": len(results), "decrypted": decrypted_count}
+
+@app.get("/admin/media/{media_id}")
+async def admin_get_media(
+    media_id: str,
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session),
+):
+    """Admin access to a media file's actual bytes — unlike GET /media/{id},
+    this never marks the file downloaded and never burns a one-time-view
+    file, so it doesn't affect the sender/recipient's own ability to view it.
+
+    Today every desktop upload is plaintext on disk (watermarked, but not
+    client-side encrypted — /media/upload_raw never receives encryption
+    metadata), so most of the time this just reads and returns the file. If
+    encryption_metadata does carry an admin-wrapped key (future clients, or
+    mobile if it turns out to encrypt uploads), that gets unwrapped first."""
+    media = db.query(Media).filter(Media.media_id == media_id).first()
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
+    if not os.path.exists(media.encrypted_file_path):
+        raise HTTPException(status_code=404, detail="Media file not found on server")
+
+    with open(media.encrypted_file_path, "rb") as f:
+        raw = f.read()
+
+    was_encrypted = False
+    meta = media.encryption_metadata
+    if isinstance(meta, dict):
+        keys = meta.get("encrypted_keys") or meta.get("encryptedKeys") or {}
+        wrapped = keys.get("__admin__") if isinstance(keys, dict) else None
+        iv = meta.get("iv")
+        if wrapped and iv:
+            try:
+                raw = _admin_unwrap_and_decrypt_bytes(base64.b64encode(raw).decode(), wrapped, iv)
+                was_encrypted = True
+            except Exception as e:
+                logger.warning(f"Admin media decrypt failed for {media_id}: {e}")
+                raise HTTPException(status_code=500, detail="Failed to decrypt media")
+
+    _log_admin_decrypt(db, current_admin, int(media.sender_id), {
+        "media_id": media_id, "was_encrypted": was_encrypted, "content_type": media.content_type,
+    })
+    return {
+        "media_id": media.media_id,
+        "filename": media.filename,
+        "media_type": media.media_type,
+        "content_type": media.content_type,
+        "file_size": len(raw),
+        "was_encrypted": was_encrypted,
+        "content": base64.b64encode(raw).decode(),
+    }
 
 # ── Operator management endpoints ─────────────────────────────────────────────
 
