@@ -10162,7 +10162,7 @@ async def delete_operator(
 ADMIN_PAGE_KEYS = [
     "users", "groups", "emergency", "field-ops", "wipe-approvals",
     "account-deletions", "recordings", "operators", "service-health",
-    "device-policy", "kill-switch", "data-purge", "settings",
+    "device-policy", "kill-switch", "data-purge", "settings", "audit",
 ]
 
 class SetServiceAccessRequest(BaseModel):
