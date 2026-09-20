@@ -32,6 +32,7 @@ from Crypto.Cipher import AES, PKCS1_OAEP
 from Crypto.PublicKey import RSA
 from Crypto.Util.Padding import unpad
 from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Hash import SHA256
 import json
 
 # Import bcrypt for password hashing
@@ -61,6 +62,7 @@ from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
 from decoy_document import generate_decoy_document
 from decoy_image import generate_decoy_image, IMAGE_DECOY_KINDS
+from decoy_web_media import fetch_web_decoy_image
 from push_notifications import push_to_user
 from copilot_ollama import (
     parse_schedule_text,
@@ -8830,11 +8832,22 @@ async def get_decoy_image(
     os.makedirs(DECOY_CACHE_DIR, exist_ok=True)
     cached = os.path.join(DECOY_CACHE_DIR, f"{clean_media_id}.jpg")
     if not os.path.exists(cached):
-        jpg, _kind = generate_decoy_image(
-            seed=clean_media_id,
-            target_size=int(getattr(media, 'file_size', 0) or 0) or None,
-            kind=getattr(media, 'decoy_kind', None),
-        )
+        target_size = int(getattr(media, 'file_size', 0) or 0) or None
+        # A real stock photo reads as "something someone actually sent" far
+        # better than the drawn meme/receipt templates — tried first, with a
+        # short timeout, and only for the plain photo/video case (a specific
+        # decoy_kind means the sender asked for one of the drawn styles).
+        web_result = None
+        if not getattr(media, 'decoy_kind', None):
+            web_result = fetch_web_decoy_image(seed=clean_media_id, target_size=target_size)
+        if web_result:
+            jpg, _source = web_result
+        else:
+            jpg, _kind = generate_decoy_image(
+                seed=clean_media_id,
+                target_size=target_size,
+                kind=getattr(media, 'decoy_kind', None),
+            )
         tmp = os.path.join(DECOY_CACHE_DIR, f".tmp_{uuid.uuid4().hex}.jpg")
         with open(tmp, "wb") as f:
             f.write(jpg)
@@ -9765,6 +9778,57 @@ async def cleanup_expired_media(
         logger.error(f"Media cleanup error: {e}")
         raise HTTPException(status_code=500, detail="Failed to cleanup expired media files")
 
+@app.get("/admin/media/{media_id}")
+async def admin_get_media(
+    media_id: str,
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session),
+):
+    """Admin access to a media file's actual bytes — unlike GET /media/{id},
+    this never marks the file downloaded and never burns a one-time-view
+    file, so it doesn't affect the sender/recipient's own ability to view it.
+
+    Today every desktop upload is plaintext on disk (watermarked, but not
+    client-side encrypted — /media/upload_raw never receives encryption
+    metadata), so most of the time this just reads and returns the file. If
+    encryption_metadata does carry an admin-wrapped key (future clients, or
+    mobile if it turns out to encrypt uploads), that gets unwrapped first."""
+    media = db.query(Media).filter(Media.media_id == media_id).first()
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
+    if not os.path.exists(media.encrypted_file_path):
+        raise HTTPException(status_code=404, detail="Media file not found on server")
+
+    with open(media.encrypted_file_path, "rb") as f:
+        raw = f.read()
+
+    was_encrypted = False
+    meta = media.encryption_metadata
+    if isinstance(meta, dict):
+        keys = meta.get("encrypted_keys") or meta.get("encryptedKeys") or {}
+        wrapped = keys.get("__admin__") if isinstance(keys, dict) else None
+        iv = meta.get("iv")
+        if wrapped and iv:
+            try:
+                raw = _admin_unwrap_and_decrypt_bytes(base64.b64encode(raw).decode(), wrapped, iv)
+                was_encrypted = True
+            except Exception as e:
+                logger.warning(f"Admin media decrypt failed for {media_id}: {e}")
+                raise HTTPException(status_code=500, detail="Failed to decrypt media")
+
+    _log_admin_decrypt(db, current_admin, int(media.sender_id), {
+        "media_id": media_id, "was_encrypted": was_encrypted, "content_type": media.content_type,
+    })
+    return {
+        "media_id": media.media_id,
+        "filename": media.filename,
+        "media_type": media.media_type,
+        "content_type": media.content_type,
+        "file_size": len(raw),
+        "was_encrypted": was_encrypted,
+        "content": base64.b64encode(raw).decode(),
+    }
+
 # ── RBAC auth dependencies ────────────────────────────────────────────────────
 
 async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -9803,6 +9867,69 @@ async def get_admin_only(credentials: HTTPAuthorizationCredentials = Depends(sec
         raise HTTPException(status_code=403, detail="Admin or superadmin role required")
     return user
 
+# ── Admin master decryption key ─────────────────────────────────────────────
+# Every client also wraps each message's AES key for this key's public half
+# (served at GET /encryption/admin-public-key, fetched the same way a device's
+# own public key is fetched), so admin/superadmin accounts can decrypt any
+# message going forward — a deliberate, standing exception to end-to-end
+# encryption for this deployment, not a bug. Messages sent before this shipped,
+# or from a client build that hasn't picked it up yet, have no "__admin__"
+# entry in encrypted_key and can't be decrypted this way.
+ADMIN_MASTER_KEY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_master_key")
+_admin_master_private_key = None
+_admin_master_public_key_b64 = None
+
+def _load_admin_master_key():
+    global _admin_master_private_key, _admin_master_public_key_b64
+    if _admin_master_private_key is not None:
+        return
+    priv_path = os.path.join(ADMIN_MASTER_KEY_DIR, "private_key.der")
+    pub_path = os.path.join(ADMIN_MASTER_KEY_DIR, "public_key.der")
+    if not os.path.exists(priv_path) or not os.path.exists(pub_path):
+        return
+    with open(priv_path, "rb") as f:
+        _admin_master_private_key = RSA.import_key(f.read())
+    with open(pub_path, "rb") as f:
+        _admin_master_public_key_b64 = base64.b64encode(f.read()).decode()
+
+def _admin_unwrap_and_decrypt_bytes(encrypted_content_b64: str, wrapped_key_b64: str, iv_b64: str) -> bytes:
+    """Mirrors the client's decryptMessage()/file-encrypt scheme exactly:
+    RSA-OAEP/SHA-256 unwraps the AES-256-GCM key, then decrypts. WebCrypto
+    appends the 16-byte GCM tag to the ciphertext; pycryptodome wants it
+    split off."""
+    _load_admin_master_key()
+    if _admin_master_private_key is None:
+        raise HTTPException(status_code=503, detail="Admin master key not configured on this server")
+    rsa_cipher = PKCS1_OAEP.new(_admin_master_private_key, hashAlgo=SHA256)
+    raw_key = rsa_cipher.decrypt(base64.b64decode(wrapped_key_b64))
+    iv = base64.b64decode(iv_b64)
+    combined = base64.b64decode(encrypted_content_b64)
+    ciphertext, tag = combined[:-16], combined[-16:]
+    aes_cipher = AES.new(raw_key, AES.MODE_GCM, nonce=iv)
+    return aes_cipher.decrypt_and_verify(ciphertext, tag)
+
+def _admin_decrypt_wrapped_content(encrypted_content_b64: str, wrapped_key_b64: str, iv_b64: str) -> str:
+    return _admin_unwrap_and_decrypt_bytes(encrypted_content_b64, wrapped_key_b64, iv_b64).decode("utf-8")
+
+def _admin_decrypt_message_row(msg: "Message") -> Optional[str]:
+    """None if this message has no admin-wrapped key (older message, or a
+    client build that predates this feature) or decryption otherwise fails —
+    callers treat that as 'not decryptable', not an error."""
+    if not msg.encrypted_key:
+        return None
+    try:
+        keys = json.loads(msg.encrypted_key)
+    except (TypeError, ValueError):
+        return None
+    wrapped = keys.get("__admin__") if isinstance(keys, dict) else None
+    if not wrapped:
+        return None
+    try:
+        return _admin_decrypt_wrapped_content(msg.encrypted_content, wrapped, msg.iv or "")
+    except Exception as e:
+        logger.warning(f"Admin decrypt failed for message {msg.id}: {e}")
+        return None
+
 async def get_superadmin_only(credentials: HTTPAuthorizationCredentials = Depends(security),
                               db: Session = Depends(get_database_session)) -> User:
     """Require admin_role='superadmin'"""
@@ -9822,6 +9949,110 @@ async def get_wipe_approver(credentials: HTTPAuthorizationCredentials = Depends(
     if not bool(getattr(user, 'can_approve_duress_wipe', False)):
         raise HTTPException(status_code=403, detail="Not authorized to approve duress wipe requests")
     return user
+
+# ── Admin message decryption ─────────────────────────────────────────────────
+
+@app.get("/encryption/admin-public-key")
+async def get_admin_encryption_public_key(current_user: User = Depends(get_current_user)):
+    """Any authenticated client fetches this the same way it fetches a peer's
+    device public key, and wraps every message's AES key for it too."""
+    _load_admin_master_key()
+    if not _admin_master_public_key_b64:
+        raise HTTPException(status_code=503, detail="Admin master key not configured on this server")
+    return {"public_key": _admin_master_public_key_b64}
+
+def _log_admin_decrypt(db: Session, admin: User, target_user_id: int, detail: dict):
+    db.add(CommandAuditLog(
+        admin_id=int(getattr(admin, 'id', 0)),
+        target_user_id=target_user_id,
+        command_type="message_decrypt",
+        action="done",
+        metadata_=detail,
+    ))
+    db.commit()
+
+@app.get("/admin/messages/{message_id}/decrypt")
+async def admin_decrypt_message(
+    message_id: int,
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session),
+):
+    msg = db.query(Message).filter(Message.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    plaintext = _admin_decrypt_message_row(msg)
+    _log_admin_decrypt(db, current_admin, int(msg.sender_id), {"message_id": message_id, "decrypted": plaintext is not None})
+    if plaintext is None:
+        return {"message_id": message_id, "decrypted": False, "content": None,
+                "reason": "No admin-wrapped key on this message (sent before this feature, or by an outdated client)"}
+    return {"message_id": message_id, "decrypted": True, "content": plaintext,
+            "content_type": msg.content_type, "timestamp": msg.timestamp.isoformat() if msg.timestamp else None}
+
+@app.get("/admin/messages/conversation/{username_a}/{username_b}/decrypt-all")
+async def admin_decrypt_conversation(
+    username_a: str,
+    username_b: str,
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session),
+):
+    user_a = db.query(User).filter(User.username == username_a).first()
+    user_b = db.query(User).filter(User.username == username_b).first()
+    if not user_a or not user_b:
+        raise HTTPException(status_code=404, detail="User not found")
+    msgs = db.query(Message).filter(
+        or_(
+            and_(Message.sender_id == user_a.id, Message.recipient_id == user_b.id),
+            and_(Message.sender_id == user_b.id, Message.recipient_id == user_a.id),
+        )
+    ).order_by(Message.timestamp.asc()).all()
+    results = []
+    decrypted_count = 0
+    for m in msgs:
+        plaintext = _admin_decrypt_message_row(m)
+        if plaintext is not None:
+            decrypted_count += 1
+        results.append({
+            "message_id": m.id,
+            "sender": username_a if m.sender_id == user_a.id else username_b,
+            "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+            "content_type": m.content_type,
+            "decrypted": plaintext is not None,
+            "content": plaintext,
+        })
+    _log_admin_decrypt(db, current_admin, int(user_a.id), {
+        "conversation_with": username_b, "total": len(results), "decrypted": decrypted_count,
+    })
+    return {"messages": results, "total": len(results), "decrypted": decrypted_count}
+
+@app.get("/admin/messages/group/{group_id}/decrypt-all")
+async def admin_decrypt_group_messages(
+    group_id: int,
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session),
+):
+    group = db.query(Group).filter(Group.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    msgs = db.query(Message).filter(Message.group_id == group_id).order_by(Message.timestamp.asc()).all()
+    results = []
+    decrypted_count = 0
+    for m in msgs:
+        plaintext = _admin_decrypt_message_row(m)
+        if plaintext is not None:
+            decrypted_count += 1
+        sender = db.query(User).filter(User.id == m.sender_id).first()
+        results.append({
+            "message_id": m.id,
+            "sender": sender.username if sender else "unknown",
+            "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+            "content_type": m.content_type,
+            "decrypted": plaintext is not None,
+            "content": plaintext,
+        })
+    _log_admin_decrypt(db, current_admin, int(getattr(current_admin, 'id', 0)), {
+        "group_id": group_id, "total": len(results), "decrypted": decrypted_count,
+    })
+    return {"messages": results, "total": len(results), "decrypted": decrypted_count}
 
 # ── Operator management endpoints ─────────────────────────────────────────────
 
@@ -10040,6 +10271,31 @@ async def list_service_health_events(
         {
             "id": r.id, "service": r.service, "event_type": r.event_type, "status": r.status,
             "detail": r.detail, "duration_ms": r.duration_ms, "user_id": r.user_id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        } for r in rows
+    ]}
+
+@app.get("/admin/users/{username}/activity")
+async def admin_user_activity(
+    username: str,
+    limit: int = 200,
+    current_admin: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session),
+):
+    """Everything ServiceEvent has traced for this one user — logins, message
+    sends, calls, media, meetings, etc. — most recent first. Event metadata
+    only (who/what/when), never message plaintext or file content; use the
+    /admin/messages/... decrypt endpoints for that."""
+    from database_models import ServiceEvent
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    rows = db.query(ServiceEvent).filter(ServiceEvent.user_id == user.id) \
+        .order_by(ServiceEvent.created_at.desc()).limit(min(max(limit, 1), 1000)).all()
+    return {"username": username, "events": [
+        {
+            "id": r.id, "service": r.service, "event_type": r.event_type, "status": r.status,
+            "detail": r.detail, "duration_ms": r.duration_ms,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         } for r in rows
     ]}

@@ -7,3 +7,4 @@ media_uploads/*
 *.log
 .DS_Storedevice_data/
 .env
+admin_master_key/
