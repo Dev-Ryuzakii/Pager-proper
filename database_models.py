@@ -30,6 +30,10 @@ class User(Base):
     # Authentication tokens
     token = Column(String(255), unique=True, index=True, nullable=True)  # TLS safetoken or API token
     session_token = Column(String(255), nullable=True)
+    # Self-service account recovery — bcrypt hash only, never the plaintext code.
+    # Issued once at account creation and whenever regenerated; consuming it via
+    # reset-with-recovery-code immediately replaces it with a fresh one.
+    recovery_code_hash = Column(String(255), nullable=True)
     
     # Registration and login tracking
     registered = Column(DateTime, default=func.now())

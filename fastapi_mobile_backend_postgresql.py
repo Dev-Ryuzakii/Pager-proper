@@ -100,16 +100,32 @@ def verify_password(password: str, hashed: str) -> bool:
     """Verify a password against its hash using bcrypt"""
     return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
 
+def _generate_recovery_code() -> str:
+    """XXXX-XXXX-XXXX, uppercase hex — 48 bits of entropy, short enough to type
+    by hand, shown to the user exactly once (at issue time) and never again."""
+    raw = secrets.token_hex(6).upper()
+    return f"{raw[0:4]}-{raw[4:8]}-{raw[8:12]}"
+
+def _issue_recovery_code(user: "User") -> str:
+    """Generates a fresh recovery code, stores only its bcrypt hash on the
+    user, and returns the plaintext for the caller to show/return exactly
+    once. Caller is responsible for committing the session."""
+    code = _generate_recovery_code()
+    setattr(user, 'recovery_code_hash', hash_password(code))
+    return code
+
 # Pydantic Models
 class UserAuth(BaseModel):
     username: str = Field(..., min_length=3, max_length=50, description="User's username")
     token: str = Field(..., description="User authentication token")
 
 class UserRegistration(BaseModel):
-    """Deprecated - Users can only be created by admin"""
+    """Self-service signup — open to anyone, no phone/identity verification
+    (deliberate choice for this deployment: an internal org tool, not a
+    consumer product exposed to the public internet)."""
     username: str = Field(..., min_length=3, max_length=50)
     phone_number: str = Field(..., min_length=10, max_length=20, description="User's phone number")
-    token: str = Field(..., description="User authentication token")
+    token: str = Field(..., min_length=6, description="Access token the user chooses — this is their login credential")
 
 # Add new Pydantic models for admin functionality
 class AdminLogin(BaseModel):
@@ -593,12 +609,40 @@ class UserService:
     """Service class for user operations"""
     
     @staticmethod
-    def create_user(db: Session, user_data: UserRegistration, ip_address: Optional[str] = None) -> User:
-        """Create a new user - DEPRECATED: Only admin can create users now"""
-        raise HTTPException(
-            status_code=403, 
-            detail="User registration is disabled. Only administrators can create user accounts."
+    def create_user(db: Session, user_data: UserRegistration, ip_address: Optional[str] = None):
+        """Self-service signup — open, no verification. Returns (User, recovery_code);
+        the recovery code is shown to the caller exactly once."""
+        existing_phone = db.query(User).filter(User.phone_number == user_data.phone_number).first()
+        if existing_phone:
+            raise HTTPException(status_code=400, detail="Phone number already registered")
+        existing_username = db.query(User).filter(User.username == user_data.username).first()
+        if existing_username:
+            raise HTTPException(status_code=400, detail="Username already taken")
+        existing_token = db.query(User).filter(User.token == user_data.token).first()
+        if existing_token:
+            raise HTTPException(status_code=400, detail="Token already in use by another user")
+
+        user = User(
+            phone_number=user_data.phone_number,
+            username=user_data.username,
+            token=user_data.token,
+            registration_ip=ip_address,
+            is_active=True,
+            is_verified=True,
+            user_type='mobile',
+            is_admin=False,
         )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        recovery_code = _issue_recovery_code(user)
+        db.commit()
+
+        AuditService.log_event(db, getattr(user, 'id', None), "user_self_registered",
+                               f"User {user_data.username} self-registered", ip_address=ip_address)
+        logger.info(f"✅ User self-registered: {user_data.username}")
+        return user, recovery_code
     
     @staticmethod
     def authenticate_user(db: Session, phone_number: str, token: str, ip_address: Optional[str] = None) -> Optional[User]:
@@ -2900,7 +2944,7 @@ class AdminService:
         return True
     
     @staticmethod
-    def create_user(db: Session, admin_user_id: int, user_data: AdminCreateUser, ip_address: Optional[str] = None) -> User:
+    def create_user(db: Session, admin_user_id: int, user_data: AdminCreateUser, ip_address: Optional[str] = None):
         """Create a new user (admin only)"""
         # Check if requesting user is admin
         if not AdminService.is_admin(db, admin_user_id):
@@ -2931,21 +2975,24 @@ class AdminService:
             user_type='mobile',
             is_admin=False  # New users are not admins by default
         )
-        
+
         db.add(user)
         db.commit()
         db.refresh(user)
-        
+
+        recovery_code = _issue_recovery_code(user)
+        db.commit()
+
         # Log registration
         user_id = getattr(user, 'id', None)
         AuditService.log_event(
-            db, admin_user_id, "user_registration_by_admin", 
-            f"User {user_data.phone_number} registered by admin user {admin_user_id}", 
+            db, admin_user_id, "user_registration_by_admin",
+            f"User {user_data.phone_number} registered by admin user {admin_user_id}",
             ip_address=ip_address
         )
-        
+
         logger.info(f"✅ User registered by admin: {user_data.phone_number}")
-        return user
+        return user, recovery_code
 
     @staticmethod
     def update_user(db: Session, admin_user_id: int, phone_number: str, user_data: AdminUpdateUser) -> User:
@@ -7365,24 +7412,24 @@ class AdminUserRegistrationDetails(BaseModel):
     message: str = Field(..., description="Instructional message for sharing with user")
 
 @app.post("/register")
-async def register_user(user_data: UserRegistration,
+async def register_user(user_data: UserRegistration, request: Request,
                        db: Session = Depends(get_database_session)):
-    """Register new user"""
+    """Self-service signup. Returns a one-time recovery_code the client MUST
+    show the user immediately and tell them to save it — it is never
+    retrievable again, and is the only way to self-reset later without an
+    admin (see POST /auth/reset-with-recovery-code)."""
     try:
-        user = UserService.register_user(db, user_data.username,
-                                       user_data.phone_number,
-                                       user_data.password,
-                                       user_data.public_key,
-                                       user_data.token)
-
-        if user:
-            return {
-                "username": user.username,
-                "phone_number": user.phone_number,
-                "registered": user.registered.isoformat(),
-                "last_login": user.last_login.isoformat() if user.last_login else None
-            }
-
+        client_ip = request.client.host if request.client else None
+        user, recovery_code = UserService.create_user(db, user_data, ip_address=client_ip)
+        monitor_record_event("auth", "signup", user_id=getattr(user, 'id', None))
+        return {
+            "username": user.username,
+            "phone_number": user.phone_number,
+            "registered": user.registered.isoformat(),
+            "recovery_code": recovery_code,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Registration error: {e}")
         raise HTTPException(status_code=400, detail="Failed to register user")
@@ -8749,6 +8796,45 @@ async def set_availability_status(
     return {"availability_status": payload.availability_status, "status_text": payload.status_text}
 
 
+class UsernameUpdate(BaseModel):
+    new_username: str = Field(..., min_length=3, max_length=50)
+
+
+@app.put("/users/me/username")
+async def update_my_username(
+    payload: UsernameUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Self-service username change. Safe to do freely — messages/keys are
+    keyed by user id / device_uuid everywhere, never by username string, so
+    renaming doesn't touch history, encryption, or any existing FK."""
+    new_username = payload.new_username.strip()
+    if not new_username:
+        raise HTTPException(status_code=400, detail="Username cannot be empty")
+    if new_username == str(getattr(current_user, 'username', '')):
+        return {"username": new_username}
+    existing = db.query(User).filter(User.username == new_username).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already taken")
+
+    old_username = str(getattr(current_user, 'username', ''))
+    setattr(current_user, 'username', new_username)
+    db.commit()
+
+    AuditService.log_event(db, int(getattr(current_user, 'id', 0)), "username_changed",
+                            f"Changed username from '{old_username}' to '{new_username}'")
+
+    # Best-effort broadcast so open chats/contact lists update live.
+    for contact in db.query(User).filter(User.is_active == True, User.id != current_user.id).all():
+        await ws_manager.send_to_user(contact.id, {
+            "type": "username_changed",
+            "data": {"old_username": old_username, "new_username": new_username},
+        })
+
+    return {"username": new_username}
+
+
 @app.get("/media/decoy-file/{media_id}")
 async def get_decoy_file(
     media_id: str,
@@ -9297,6 +9383,63 @@ async def request_password_reset(
 
     AuditService.log_event(db, user_id, "password_reset_requested", f"{username} requested a password/token reset")
     return generic_response
+
+
+class RecoveryCodeReset(BaseModel):
+    username: str
+    recovery_code: str
+    new_token: str = Field(..., min_length=6, description="New access token/password to log in with")
+
+
+@app.post("/auth/reset-with-recovery-code")
+async def reset_with_recovery_code(
+    payload: RecoveryCodeReset,
+    db: Session = Depends(get_database_session),
+):
+    """Fully self-service — no admin involved. Requires the one-time recovery
+    code issued at signup (or last regenerated). Consuming it replaces both
+    the login token and the recovery code itself, and invalidates every
+    existing session so a lost/stolen old token stops working immediately."""
+    generic_error = HTTPException(status_code=400, detail="Invalid username or recovery code")
+
+    user = db.query(User).filter(User.username == payload.username, User.is_active == True).first()
+    if not user or not user.recovery_code_hash:
+        raise generic_error
+    if not verify_password(payload.recovery_code.strip().upper(), user.recovery_code_hash):
+        raise generic_error
+
+    existing_token_user = db.query(User).filter(User.token == payload.new_token, User.id != user.id).first()
+    if existing_token_user:
+        raise HTTPException(status_code=400, detail="That token is already in use by another account")
+
+    setattr(user, 'token', payload.new_token)
+    new_recovery_code = _issue_recovery_code(user)
+    db.commit()
+
+    # Force every device to re-authenticate — the old token/session no longer
+    # applies once someone's had to recover the account this way.
+    db.query(UserSession).filter(UserSession.user_id == user.id).delete()
+    db.query(LinkedDevice).filter(LinkedDevice.user_id == user.id).update({"session_token": None})
+    db.commit()
+
+    AuditService.log_event(db, int(getattr(user, 'id', 0)), "self_password_reset",
+                           f"{payload.username} self-reset their password via recovery code")
+    monitor_record_event("auth", "self_reset", user_id=int(getattr(user, 'id', 0)))
+
+    return {"username": payload.username, "recovery_code": new_recovery_code}
+
+
+@app.post("/users/me/recovery-code/regenerate")
+async def regenerate_recovery_code(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Generates a fresh recovery code while still logged in — the safety
+    valve for 'I lost my old one but I'm still signed in somewhere'. Old
+    code (if any) stops working immediately."""
+    code = _issue_recovery_code(current_user)
+    db.commit()
+    return {"recovery_code": code}
 
 
 @app.get("/admin/password-reset-requests")
@@ -10632,14 +10775,18 @@ async def admin_change_password(password_data: AdminChangePassword,
 async def admin_create_user(user_data: AdminCreateUser,
                            current_user: User = Depends(get_admin_user),
                            db: Session = Depends(get_database_session)):
-    """Create a new user account (admin only)"""
+    """Create a new user account (admin only). Response includes a one-time
+    recovery_code — relay it to the user out-of-band; it's never retrievable
+    again after this response (they can self-reset their password with it
+    later, see POST /auth/reset-with-recovery-code)."""
     try:
         user_id = int(getattr(current_user, 'id', 0))
-        new_user = AdminService.create_user(db, user_id, user_data, ip_address="admin_api")
-        
+        new_user, recovery_code = AdminService.create_user(db, user_id, user_data, ip_address="admin_api")
+
         return {
             "username": str(getattr(new_user, 'username', '')),
             "phone_number": str(getattr(new_user, 'phone_number', '')),
+            "recovery_code": recovery_code,
             "message": "User created successfully"
         }
         
