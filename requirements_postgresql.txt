@@ -27,6 +27,7 @@ livekit-api==1.2.0
 Mako==1.2.4
 MarkupSafe==2.1.2
 packaging==21.3
+Pillow>=10.0.0
 passlib==1.7.4
 pluggy==1.6.0
 prompt_toolkit==3.0.39

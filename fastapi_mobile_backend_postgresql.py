@@ -14,6 +14,11 @@ import secrets
 import uuid
 import random
 import httpx
+import re
+import smtplib
+import io
+from email.message import EmailMessage
+from urllib.parse import quote_plus
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -37,6 +42,7 @@ import json
 
 # Import bcrypt for password hashing
 import bcrypt
+from PIL import Image
 
 # LiveKit (group video, Phase C). Optional at import time so a server that
 # hasn't run `pip install livekit-api` yet still starts — the token endpoint
@@ -56,7 +62,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, ChatSettings, HiddenMessage
+from database_models import User, Organization, OrganizationAccessRequest, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, ChatSettings, HiddenMessage
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -114,6 +120,136 @@ def _issue_recovery_code(user: "User") -> str:
     setattr(user, 'recovery_code_hash', hash_password(code))
     return code
 
+
+def _invitation_digest(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _valid_email(value: str) -> bool:
+    return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", (value or "").strip()))
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug[:100] or "organization"
+
+
+def _username_from_email(db: Session, email: str) -> str:
+    base = re.sub(r"[^a-zA-Z0-9_.-]", "", email.split("@", 1)[0]).lower()[:40] or "user"
+    if len(base) < 3:
+        base = f"user-{base}"
+    candidate = base
+    suffix = 1
+    while db.query(User.id).filter(User.username == candidate).first():
+        suffix += 1
+        candidate = f"{base[:44]}-{suffix}"
+    return candidate
+
+
+def _same_organization(actor: User, target: User) -> bool:
+    """Admins are platform operators; regular accounts are tenant isolated."""
+    if bool(getattr(actor, "is_admin", False)):
+        return True
+    actor_org = getattr(actor, "organization_id", None)
+    return actor_org is not None and actor_org == getattr(target, "organization_id", None)
+
+
+def _require_same_organization(actor: User, target: User) -> None:
+    if not _same_organization(actor, target):
+        # Deliberately indistinguishable from a missing account to avoid tenant
+        # enumeration.
+        raise HTTPException(status_code=404, detail="User not found")
+
+
+def _decode_camera_image(value: str) -> tuple[bytes, str]:
+    """Validate and normalize a directly captured onboarding portrait."""
+    try:
+        content = base64.b64decode(value, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid camera image encoding")
+    if len(content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Camera image must be under 8MB")
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            image.verify()
+            fmt = (image.format or "").lower()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Camera capture is not a valid image")
+    ext = {"jpeg": "jpg", "png": "png", "webp": "webp"}.get(fmt)
+    if not ext:
+        raise HTTPException(status_code=400, detail="Camera capture must be jpeg, png, or webp")
+    return content, ext
+
+
+async def _deliver_invitation(user_id: int, invitation_code: str, purpose: str = "invite") -> None:
+    """Send both channels and persist channel-level status. Provider secrets
+    come exclusively from environment variables and never enter API responses."""
+    db = db_config.get_session()
+    if not db:
+        return
+    errors: Dict[str, str] = {}
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            return
+        organization = db.query(Organization).filter(Organization.id == user.organization_id).first()
+        org_name = organization.name if organization else "your organization"
+        base_url = os.getenv("DILARION_APP_URL", "dilarion://activate").rstrip("/")
+        link = f"{base_url}?code={quote_plus(invitation_code)}"
+        action = "asked you to reset your Dilarion login" if purpose == "reset" else "invited you to Dilarion"
+        body = (
+            f"Hello {user.full_name or user.username},\n\n{org_name} {action}. "
+            f"Open {link} and create your private login token. "
+            "Administrators cannot view that token. This link expires in 72 hours."
+        )
+
+        smtp_host = os.getenv("SMTP_HOST")
+        if smtp_host:
+            try:
+                msg = EmailMessage()
+                msg["Subject"] = f"Your {org_name} Dilarion {'password reset' if purpose == 'reset' else 'invitation'}"
+                msg["From"] = os.getenv("SMTP_FROM", "no-reply@dilarion.app")
+                msg["To"] = user.email
+                msg.set_content(body)
+                port = int(os.getenv("SMTP_PORT", "587"))
+                with smtplib.SMTP(smtp_host, port, timeout=15) as server:
+                    if os.getenv("SMTP_STARTTLS", "1") == "1":
+                        server.starttls()
+                    smtp_user = os.getenv("SMTP_USERNAME")
+                    if smtp_user:
+                        server.login(smtp_user, os.getenv("SMTP_PASSWORD", ""))
+                    server.send_message(msg)
+                user.email_invite_sent_at = datetime.now(timezone.utc)
+            except Exception as exc:
+                logger.error("Invitation email failed for user %s: %s", user_id, exc)
+                errors["email"] = "delivery_failed"
+        else:
+            errors["email"] = "smtp_not_configured"
+
+        twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
+        twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
+        twilio_from = os.getenv("TWILIO_FROM_NUMBER")
+        if twilio_sid and twilio_token and twilio_from:
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    response = await client.post(
+                        f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json",
+                        auth=(twilio_sid, twilio_token),
+                        data={"From": twilio_from, "To": user.phone_number, "Body": body},
+                    )
+                    response.raise_for_status()
+                user.sms_invite_sent_at = datetime.now(timezone.utc)
+            except Exception as exc:
+                logger.error("Invitation SMS failed for user %s: %s", user_id, exc)
+                errors["sms"] = "delivery_failed"
+        else:
+            errors["sms"] = "twilio_not_configured"
+
+        user.invitation_delivery_errors = errors or None
+        db.commit()
+    finally:
+        db.close()
+
 # Pydantic Models
 class UserAuth(BaseModel):
     username: str = Field(..., min_length=3, max_length=50, description="User's username")
@@ -139,13 +275,66 @@ class AdminChangePassword(BaseModel):
 class AdminCreateUser(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     phone_number: str = Field(..., min_length=10, max_length=20, description="User's phone number")
-    token: str = Field(..., description="User authentication token")
+    email: str = Field(..., min_length=3, max_length=255)
+    full_name: str = Field(..., min_length=2, max_length=255)
+    department: str = Field(..., min_length=1, max_length=120)
+    organization_id: int
 
 class AdminUpdateUser(BaseModel):
     username: Optional[str] = Field(None, min_length=3, max_length=50)
     phone_number: Optional[str] = Field(None, min_length=10, max_length=20)
-    token: Optional[str] = Field(None)
     is_active: Optional[bool] = Field(None)
+
+
+class OrganizationRequestedUser(BaseModel):
+    email: str = Field(..., min_length=3, max_length=255)
+    full_name: str = Field(..., min_length=2, max_length=255)
+    phone_number: str = Field(..., min_length=10, max_length=20)
+    department: str = Field(..., min_length=1, max_length=120)
+
+
+class OrganizationRequestCreate(BaseModel):
+    organization_name: str = Field(..., min_length=2, max_length=255)
+    contact_name: str = Field(..., min_length=2, max_length=255)
+    contact_email: str = Field(..., min_length=3, max_length=255)
+    contact_phone: str = Field(..., min_length=10, max_length=20)
+    username: str = Field(..., min_length=3, max_length=50, description="Requested login name for the read-only organization account")
+    password: str = Field(..., min_length=8, max_length=128, description="Requested organization account password; hashed immediately")
+
+
+class OrganizationAccountLogin(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=128)
+
+
+class OrganizationRequestDecision(BaseModel):
+    admin_note: Optional[str] = Field(None, max_length=2000)
+
+
+class AdminCreateOrganization(BaseModel):
+    name: str = Field(..., min_length=2, max_length=255)
+    contact_name: str = Field(..., min_length=2, max_length=255)
+    contact_email: str = Field(..., min_length=3, max_length=255)
+    contact_phone: Optional[str] = Field(None, min_length=10, max_length=20)
+
+
+class AdminOrganizationStaffBatch(BaseModel):
+    users: List[OrganizationRequestedUser] = Field(..., min_items=1, max_items=500)
+
+
+class InvitationActivation(BaseModel):
+    invitation_code: str = Field(..., min_length=20)
+    token: str = Field(..., min_length=8, max_length=128, description="A private login token chosen by the user")
+
+
+class OnboardingProfile(BaseModel):
+    job_title: str = Field(..., min_length=1, max_length=120)
+    address: str = Field(..., min_length=5, max_length=1000)
+    emergency_contact_name: str = Field(..., min_length=2, max_length=255)
+    emergency_contact_phone: str = Field(..., min_length=10, max_length=20)
+    camera_image_base64: str = Field(..., min_length=100, description="A fresh camera capture; file/gallery uploads are not accepted")
+    captured_at: datetime
+    camera_attestation: bool = Field(..., description="Client attests that image came directly from the camera")
 
 class UserLogin(UserAuth):
     pass  # Same as auth - just username and token
@@ -624,48 +813,17 @@ class UserService:
     
     @staticmethod
     def create_user(db: Session, user_data: UserRegistration, ip_address: Optional[str] = None):
-        """Self-service signup — open, no verification. Returns (User, recovery_code);
-        the recovery code is shown to the caller exactly once."""
-        existing_phone = db.query(User).filter(User.phone_number == user_data.phone_number).first()
-        if existing_phone:
-            raise HTTPException(status_code=400, detail="Phone number already registered")
-        existing_username = db.query(User).filter(User.username == user_data.username).first()
-        if existing_username:
-            raise HTTPException(status_code=400, detail="Username already taken")
-        existing_token = db.query(User).filter(User.token == user_data.token).first()
-        if existing_token:
-            raise HTTPException(status_code=400, detail="Token already in use by another user")
-
-        user = User(
-            phone_number=user_data.phone_number,
-            username=user_data.username,
-            token=user_data.token,
-            registration_ip=ip_address,
-            is_active=True,
-            is_verified=True,
-            user_type='mobile',
-            is_admin=False,
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-
-        recovery_code = _issue_recovery_code(user)
-        db.commit()
-
-        AuditService.log_event(db, getattr(user, 'id', None), "user_self_registered",
-                               f"User {user_data.username} self-registered", ip_address=ip_address)
-        logger.info(f"✅ User self-registered: {user_data.username}")
-        return user, recovery_code
+        raise HTTPException(status_code=403, detail="Self-registration is disabled")
     
     @staticmethod
     def authenticate_user(db: Session, phone_number: str, token: str, ip_address: Optional[str] = None) -> Optional[User]:
         """Authenticate user with phone number and token, update last login"""
-        user = db.query(User).filter(
-            User.phone_number == phone_number, 
-            User.token == token,
-            User.is_active == True
-        ).first()
+        user = db.query(User).filter(User.phone_number == phone_number, User.is_active == True).first()
+        if user:
+            valid_hash = bool(user.password_hash and verify_password(token, user.password_hash))
+            valid_legacy = bool(user.token and hmac.compare_digest(str(user.token), token))
+            if not (valid_hash or valid_legacy):
+                user = None
         
         if user:
             # Use setattr for SQLAlchemy models
@@ -692,9 +850,12 @@ class UserService:
         return db.query(User).filter(User.username == username, User.is_active == True).first()
     
     @staticmethod
-    def get_all_users(db: Session) -> List[User]:
-        """Get all active users"""
-        return db.query(User).filter(User.is_active == True).all()
+    def get_all_users(db: Session, organization_id: Optional[int] = None) -> List[User]:
+        """Get active users, optionally restricted to one tenant."""
+        query = db.query(User).filter(User.is_active == True)
+        if organization_id is not None:
+            query = query.filter(User.organization_id == organization_id)
+        return query.all()
     
     @staticmethod
     def delete_user(db: Session, phone_number: str) -> bool:
@@ -710,8 +871,9 @@ class MessageService:
     @staticmethod
     def send_message_by_username(db: Session, sender_id: int, recipient_username: str, message_content: str, disappear_after_hours: Optional[int] = 12, encrypted_key: Optional[str] = None, iv: Optional[str] = None, decoy_content: Optional[str] = None, content_type: str = "encrypted", reply_to_message_id: Optional[int] = None, forwarded_from_message_id: Optional[int] = None, mentions: Optional[List[str]] = None) -> Message:
         """Send a message to a specific user by username"""
+        sender = db.query(User).filter(User.id == sender_id, User.is_active == True).first()
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
-        if not recipient:
+        if not sender or not recipient or not _same_organization(sender, recipient):
             raise HTTPException(status_code=404, detail="Recipient not found")
 
         decoy_text = decoy_content if decoy_content else FakeTextGenerator.generate_decoy_text_for_message(message_content)
@@ -839,12 +1001,14 @@ class MessageService:
         # Get IDs of groups the user is in
         group_ids = [m.group_id for m in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()]
         
+        hidden = db.query(HiddenMessage.message_id).filter(HiddenMessage.user_id == user_id)
         return db.query(Message).filter(
             or_(
                 Message.recipient_id == user_id,
                 Message.sender_id == user_id,
                 Message.group_id.in_(group_ids) if group_ids else False
-            )
+            ),
+            ~Message.id.in_(hidden),  # "deleted for me"
         ).order_by(Message.timestamp.desc()).limit(limit).all()
     
     @staticmethod
@@ -909,6 +1073,15 @@ class GroupService:
     def create_group(db: Session, creator_id: int, name: str, description: Optional[str], member_usernames: List[str], disappear_after_hours: Optional[int] = None) -> Group:
         """Create a new group and add initial members. Any user can do this —
         the creator becomes the group's first admin."""
+        creator = db.query(User).filter(User.id == creator_id, User.is_active == True).first()
+        if not creator or not creator.organization_id:
+            raise HTTPException(status_code=403, detail="An organization membership is required")
+        requested_members = []
+        for username in member_usernames:
+            member_user = db.query(User).filter(User.username == username, User.is_active == True).first()
+            if not member_user or not _same_organization(creator, member_user):
+                raise HTTPException(status_code=404, detail=f"User not found: {username}")
+            requested_members.append(member_user)
         group = Group(name=name, description=description, created_by=creator_id, disappear_after_hours=disappear_after_hours)
         db.add(group)
         db.commit()
@@ -919,9 +1092,8 @@ class GroupService:
         db.add(creator_member)
         
         # Add other members
-        for username in member_usernames:
-            user = db.query(User).filter(User.username == username, User.is_active == True).first()
-            if user and user.id != creator_id:
+        for user in requested_members:
+            if user.id != creator_id:
                 member = GroupMember(group_id=group.id, user_id=user.id, role="member")
                 db.add(member)
         
@@ -961,6 +1133,9 @@ class GroupService:
         user = db.query(User).filter(User.username == username, User.is_active == True).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+        actor = db.query(User).filter(User.id == actor_id, User.is_active == True).first()
+        if not actor or not _same_organization(actor, user):
+            raise HTTPException(status_code=404, detail="User not found")
             
         # Check if already a member
         existing = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user.id).first()
@@ -972,7 +1147,6 @@ class GroupService:
         db.commit()
         
         # Send notification message
-        actor = db.query(User).filter(User.id == actor_id).first()
         actor_name = str(getattr(actor, 'username', 'Admin'))
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
         
@@ -1062,20 +1236,26 @@ class GroupService:
             group.description = description
             
         if member_usernames is not None:
+            creator = db.query(User).filter(User.id == group.created_by).first()
+            organization_id = getattr(creator, "organization_id", None)
+            resolved_members = []
+            for username in member_usernames:
+                user = db.query(User).filter(User.username == username, User.is_active == True).first()
+                if not user or organization_id is None or user.organization_id != organization_id:
+                    raise HTTPException(status_code=404, detail=f"User not found in this organization: {username}")
+                resolved_members.append(user)
             # Sync members: remove existing, add new list
             # Skip creator preservation if admin is doing the sync, unless desired
             db.query(GroupMember).filter(GroupMember.group_id == group_id).delete()
             
             # Re-add members from the new list
-            for username in member_usernames:
-                user = db.query(User).filter(User.username == username, User.is_active == True).first()
-                if user:
-                    # Check if they were already added in this loop (usernames might not be unique in input)
-                    existing = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user.id).first()
-                    if not existing:
-                        role = "admin" if user.id == group.created_by else "member"
-                        member = GroupMember(group_id=group_id, user_id=user.id, role=role)
-                        db.add(member)
+            for user in resolved_members:
+                # Check if they were already added in this loop (usernames might not be unique in input)
+                existing = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user.id).first()
+                if not existing:
+                    role = "admin" if user.id == group.created_by else "member"
+                    member = GroupMember(group_id=group_id, user_id=user.id, role=role)
+                    db.add(member)
             
         db.commit()
         AuditService.log_event(db, actor_id, "group_updated", f"Group '{group.name}' (ID {group_id}) updated by admin")
@@ -1093,8 +1273,7 @@ class SessionService:
     def create_session(db: Session, user_id: int, session_type: str = "api", ip_address: Optional[str] = None) -> UserSession:
         """Create a new session"""
         # Generate session token
-        session_data = f"{user_id}:{int(time.time())}:{session_type}"
-        session_token = base64.b64encode(session_data.encode()).decode()
+        session_token = secrets.token_urlsafe(48)
         
         # Set expiration (24 hours)
         expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
@@ -1259,7 +1438,8 @@ class MediaService:
         """Upload encrypted media file (photo, video, or document) by username"""
         # Get recipient by username
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
-        if not recipient:
+        sender = db.query(User).filter(User.id == sender_id, User.is_active == True).first()
+        if not recipient or not sender or not _same_organization(sender, recipient):
             raise HTTPException(status_code=404, detail="Recipient not found")
         
         # Generate unique media ID
@@ -1337,7 +1517,8 @@ class MediaService:
         """Upload simple (unencrypted) media file (photo, video, or document)"""
         # Get recipient by username
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
-        if not recipient:
+        sender = db.query(User).filter(User.id == sender_id, User.is_active == True).first()
+        if not recipient or not sender or not _same_organization(sender, recipient):
             raise HTTPException(status_code=404, detail="Recipient not found")
         
         # Generate unique media ID
@@ -1424,7 +1605,8 @@ class MediaService:
         """Upload simple (unencrypted) media file (photo, video, or document) by username"""
         # Get recipient by username
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
-        if not recipient:
+        sender = db.query(User).filter(User.id == sender_id, User.is_active == True).first()
+        if not recipient or not sender or not _same_organization(sender, recipient):
             raise HTTPException(status_code=404, detail="Recipient not found")
         
         # Generate unique media ID
@@ -1708,7 +1890,8 @@ class CallService:
     async def initiate_call(db: Session, caller_id: int, recipient_username: str, call_type: str, offer_sdp: Optional[str] = None) -> Call:
         """Create a new call record and notify the recipient"""
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
-        if not recipient:
+        caller = db.query(User).filter(User.id == caller_id, User.is_active == True).first()
+        if not recipient or not caller or not _same_organization(caller, recipient):
             raise HTTPException(status_code=404, detail="Recipient not found")
         
         if recipient.id == caller_id:
@@ -1727,7 +1910,6 @@ class CallService:
         db.refresh(call)
         
         # Send WebSocket notification to recipient
-        caller = db.query(User).filter(User.id == caller_id).first()
         notification = {
             "type": "incoming_call",
             "data": {
@@ -2892,15 +3074,16 @@ class AdminService:
     
     @staticmethod
     def authenticate_user(db: Session, username: str, token: str, ip_address: Optional[str] = None) -> Optional[User]:
-        """Authenticate user by username and token, or admin by password (passed as token)"""
-        # 1. Try token authentication first
-        user = db.query(User).filter(
-            User.username == username, 
-            User.token == token,
-            User.is_active == True
-        ).first()
+        """Authenticate a user without ever storing their new login token in
+        plaintext.  User.token remains a read-only legacy fallback."""
+        user = db.query(User).filter(User.username == username, User.is_active == True).first()
+        if user and not bool(getattr(user, "is_admin", False)):
+            valid_hash = bool(user.password_hash and verify_password(token, user.password_hash))
+            valid_legacy = bool(user.token and hmac.compare_digest(str(user.token), token))
+            if not (valid_hash or valid_legacy):
+                user = None
         
-        # 2. If token fails, try treating the 'token' as an admin password
+        # Admins continue to use the dedicated password flow.
         if not user:
             user = AdminService.authenticate_admin(db, username, token, ip_address)
             
@@ -2969,33 +3152,50 @@ class AdminService:
     
     @staticmethod
     def create_user(db: Session, admin_user_id: int, user_data: AdminCreateUser, ip_address: Optional[str] = None):
-        """Create a new user (admin only)"""
+        """Provision a user and issue a one-time invitation (admin only)."""
         # Check if requesting user is admin
         if not AdminService.is_admin(db, admin_user_id):
             raise HTTPException(status_code=403, detail="Only admin users can create new accounts")
         
         # Check if user already exists by phone number
-        existing_user = db.query(User).filter(User.phone_number == user_data.phone_number).first()
+        normalized_phone = normalize_phone_number(user_data.phone_number)
+        existing_user = db.query(User).filter(User.phone_number == normalized_phone).first()
         if existing_user:
             raise HTTPException(status_code=400, detail="Phone number already registered")
         
-        # Use provided token and username
-        token = user_data.token
-        username = user_data.username
+        organization = db.query(Organization).filter(
+            Organization.id == user_data.organization_id,
+            Organization.is_active == True,
+        ).first()
+        if not organization:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        if not _valid_email(user_data.email):
+            raise HTTPException(status_code=400, detail="Invalid email address")
+        if db.query(User.id).filter(User.email == user_data.email.lower()).first():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        if db.query(User.id).filter(User.username == user_data.username).first():
+            raise HTTPException(status_code=400, detail="Username already taken")
 
-        # Enforce token uniqueness (prevents one token working across multiple accounts)
-        existing_token_user = db.query(User).filter(User.token == token).first()
-        if existing_token_user:
-            raise HTTPException(status_code=400, detail="Token already in use by another user")
+        invitation_code = secrets.token_urlsafe(32)
+        now = datetime.now(timezone.utc)
         
         # Create user
         user = User(
-            phone_number=user_data.phone_number,
-            username=username,
-            token=token,
+            phone_number=normalized_phone,
+            username=user_data.username,
+            email=user_data.email.lower(),
+            full_name=user_data.full_name.strip(),
+            department=user_data.department.strip(),
+            organization_id=organization.id,
+            organization_role="member",
+            token=None,
+            password_hash=None,
+            invitation_token_hash=_invitation_digest(invitation_code),
+            invitation_expires_at=now + timedelta(hours=72),
+            invited_at=now,
             registration_ip=ip_address,
             is_active=True,
-            is_verified=True,
+            is_verified=False,
             user_type='mobile',
             is_admin=False  # New users are not admins by default
         )
@@ -3003,9 +3203,6 @@ class AdminService:
         db.add(user)
         db.commit()
         db.refresh(user)
-
-        recovery_code = _issue_recovery_code(user)
-        db.commit()
 
         # Log registration
         user_id = getattr(user, 'id', None)
@@ -3016,7 +3213,7 @@ class AdminService:
         )
 
         logger.info(f"✅ User registered by admin: {user_data.phone_number}")
-        return user, recovery_code
+        return user, invitation_code
 
     @staticmethod
     def update_user(db: Session, admin_user_id: int, phone_number: str, user_data: AdminUpdateUser) -> User:
@@ -3040,12 +3237,6 @@ class AdminService:
                 if existing:
                     raise HTTPException(status_code=400, detail="New phone number already in use")
             user.phone_number = user_data.phone_number
-        if user_data.token is not None:
-            # Enforce token uniqueness
-            existing_token_user = db.query(User).filter(User.token == user_data.token, User.id != user.id).first()
-            if existing_token_user:
-                raise HTTPException(status_code=400, detail="Token already in use by another user")
-            user.token = user_data.token
         if user_data.is_active is not None:
             user.is_active = user_data.is_active
             
@@ -3668,7 +3859,8 @@ class ConnectionManager:
     async def handle_typing(self, sender_id: int, recipient_username: str, is_typing: bool, db: Session):
         """Send typing status to the recipient."""
         recipient = db.query(User).filter(User.username == recipient_username, User.is_active == True).first()
-        if not recipient:
+        sender = db.query(User).filter(User.id == sender_id, User.is_active == True).first()
+        if not recipient or not sender or not _same_organization(sender, recipient):
             return
         sender_username = self._usernames.get(sender_id, "Unknown")
         await self.send_to_user(recipient.id, {
@@ -3718,6 +3910,15 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
                 detail="User not found",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        if getattr(user, "organization_role", None) == "viewer":
+            raise HTTPException(status_code=403, detail="Use the read-only organization portal")
+        if (not user.is_admin and user.organization_id is not None
+                and user.invitation_accepted_at is not None
+                and user.onboarding_completed_at is None):
+            raise HTTPException(
+                status_code=428,
+                detail="Complete your required profile and live camera capture before using Dilarion",
+            )
         
         return user
         
@@ -3730,6 +3931,40 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             detail="Authentication failed",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+async def get_onboarding_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_database_session),
+) -> User:
+    """Authenticate an activated user while allowing the one mandatory
+    onboarding endpoint before their profile is complete."""
+    token = credentials.credentials
+    session = SessionService.validate_session(db, token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+async def get_organization_viewer(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_database_session),
+) -> User:
+    """Authenticate the read-only account belonging to one organization."""
+    session = SessionService.validate_session(db, credentials.credentials)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    user = db.query(User).filter(
+        User.id == session.user_id,
+        User.is_active == True,
+        User.organization_role == "viewer",
+    ).first()
+    if not user or not user.organization_id:
+        raise HTTPException(status_code=403, detail="Organization account access required")
+    return user
 
 # Add admin authentication dependency
 async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
@@ -3804,6 +4039,11 @@ async def websocket_chat(
         if not user:
             await websocket.close(code=4001)
             return
+        if (not user.is_admin and user.organization_id is not None
+                and user.invitation_accepted_at is not None
+                and user.onboarding_completed_at is None):
+            await websocket.close(code=4003, reason="onboarding_required")
+            return
         user_id = int(getattr(user, "id", 0))
         username = str(getattr(user, "username", "Unknown"))
         # Auto-generate device_id if client didn't send one (older app versions)
@@ -3857,6 +4097,8 @@ async def websocket_chat(
                             recipient = op_db.query(User).filter(
                                 User.username == recipient_username, User.is_active == True
                             ).first()
+                            if recipient and not _same_organization(user, recipient):
+                                recipient = None
                         finally:
                             if op_db:
                                 op_db.close()
@@ -4146,6 +4388,392 @@ async def get_status(db: Session = Depends(get_database_session)):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.post("/organization-requests", status_code=202)
+async def submit_organization_request(
+    payload: OrganizationRequestCreate,
+    db: Session = Depends(get_database_session),
+):
+    """Public intake for a read-only organization portal account."""
+    if not _valid_email(payload.contact_email):
+        raise HTTPException(status_code=400, detail="Invalid contact email address")
+    username = payload.username.strip().lower()
+    existing_user = db.query(User.id).filter(User.username == username).first()
+    pending_username = db.query(OrganizationAccessRequest.id).filter(
+        OrganizationAccessRequest.requested_admin_username == username,
+        OrganizationAccessRequest.status == "pending",
+    ).first()
+    if existing_user or pending_username:
+        raise HTTPException(status_code=409, detail="That organization username is unavailable")
+    existing_org = db.query(Organization.id).filter(Organization.name == payload.organization_name.strip()).first()
+    if existing_org:
+        raise HTTPException(status_code=409, detail="An organization with this name already exists")
+    request_row = OrganizationAccessRequest(
+        organization_name=payload.organization_name.strip(),
+        contact_name=payload.contact_name.strip(),
+        contact_email=payload.contact_email.strip().lower(),
+        contact_phone=payload.contact_phone.strip(),
+        requested_admin_username=username,
+        requested_admin_password_hash=hash_password(payload.password),
+        requested_users=[],
+        status="pending",
+    )
+    db.add(request_row)
+    db.commit()
+    db.refresh(request_row)
+    return {"request_id": int(request_row.id), "status": "pending", "message": "Organization account request submitted for review"}
+
+
+@app.get("/admin/organization-requests")
+async def list_organization_requests(
+    request_status: Optional[str] = Query(None, alias="status"),
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    query = db.query(OrganizationAccessRequest)
+    if request_status:
+        query = query.filter(OrganizationAccessRequest.status == request_status)
+    rows = query.order_by(OrganizationAccessRequest.submitted_at.desc()).all()
+    return [{
+        "id": int(row.id),
+        "organization_name": row.organization_name,
+        "contact_name": row.contact_name,
+        "contact_email": row.contact_email,
+        "contact_phone": row.contact_phone,
+        "requested_username": row.requested_admin_username,
+        "status": row.status,
+        "admin_note": row.admin_note,
+        "submitted_at": row.submitted_at,
+        "reviewed_at": row.reviewed_at,
+        "organization_id": row.organization_id,
+    } for row in rows]
+
+
+@app.post("/admin/organization-requests/{request_id}/approve")
+async def approve_organization_request(
+    request_id: int,
+    decision: OrganizationRequestDecision,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    row = db.query(OrganizationAccessRequest).filter(OrganizationAccessRequest.id == request_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Organization request not found")
+    if row.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Organization request is already {row.status}")
+
+    if not row.requested_admin_username or not row.requested_admin_password_hash:
+        raise HTTPException(status_code=409, detail="This legacy request has no organization account credentials")
+    account_conflict = db.query(User).filter(or_(
+        User.username == row.requested_admin_username,
+        User.email == row.contact_email,
+        User.phone_number == normalize_phone_number(row.contact_phone or ""),
+    )).first()
+    if account_conflict:
+        raise HTTPException(status_code=409, detail="The requested organization account conflicts with an existing account")
+
+    if db.query(Organization.id).filter(Organization.name == row.organization_name).first():
+        raise HTTPException(status_code=409, detail="An organization with this name already exists")
+    slug_base = _slugify(row.organization_name)
+    slug, suffix = slug_base, 1
+    while db.query(Organization.id).filter(Organization.slug == slug).first():
+        suffix += 1
+        slug = f"{slug_base[:110]}-{suffix}"
+    organization = Organization(
+        name=row.organization_name,
+        slug=slug,
+        contact_name=row.contact_name,
+        contact_email=row.contact_email,
+        contact_phone=row.contact_phone,
+    )
+    db.add(organization)
+    db.flush()
+
+    now = datetime.now(timezone.utc)
+    organization_account = User(
+        username=row.requested_admin_username,
+        phone_number=normalize_phone_number(row.contact_phone or ""),
+        email=row.contact_email.lower(),
+        full_name=row.contact_name,
+        department="Organization account",
+        organization_id=organization.id,
+        organization_role="viewer",
+        password_hash=row.requested_admin_password_hash,
+        token=None,
+        is_active=True,
+        is_verified=True,
+        user_type="organization",
+        is_admin=False,
+        onboarding_completed_at=now,
+    )
+    db.add(organization_account)
+    db.flush()
+
+    row.status = "approved"
+    row.admin_note = decision.admin_note
+    row.reviewed_at = now
+    row.reviewed_by_admin_id = current_user.id
+    row.organization_id = organization.id
+    db.commit()
+    AuditService.log_event(db, int(current_user.id), "organization_approved", f"Approved organization request {request_id}")
+    return {
+        "status": "approved",
+        "organization": {"id": int(organization.id), "name": organization.name, "slug": organization.slug},
+        "organization_account": {"username": organization_account.username, "access": "read_only"},
+        "message": "Organization account approved. Platform admins/operators can now add staff to this organization.",
+    }
+
+
+@app.post("/admin/organization-requests/{request_id}/reject")
+async def reject_organization_request(
+    request_id: int,
+    decision: OrganizationRequestDecision,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    row = db.query(OrganizationAccessRequest).filter(OrganizationAccessRequest.id == request_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Organization request not found")
+    if row.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Organization request is already {row.status}")
+    row.status = "rejected"
+    row.admin_note = decision.admin_note
+    row.reviewed_at = datetime.now(timezone.utc)
+    row.reviewed_by_admin_id = current_user.id
+    db.commit()
+    return {"status": "rejected"}
+
+
+@app.post("/organization/auth/login")
+async def organization_account_login(
+    payload: OrganizationAccountLogin,
+    db: Session = Depends(get_database_session),
+):
+    account = db.query(User).filter(
+        User.username == payload.username.strip().lower(),
+        User.organization_role == "viewer",
+        User.is_active == True,
+    ).first()
+    if not account or not account.password_hash or not verify_password(payload.password, account.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid organization username or password")
+    session = SessionService.create_session(db, int(account.id), "organization_portal", "web")
+    organization = db.query(Organization).filter(Organization.id == account.organization_id).first()
+    return {
+        "token": session.session_token,
+        "access": "read_only",
+        "organization": {"id": int(organization.id), "name": organization.name} if organization else None,
+    }
+
+
+@app.get("/organization/me")
+async def get_organization_portal_account(
+    current_user: User = Depends(get_organization_viewer),
+    db: Session = Depends(get_database_session),
+):
+    organization = db.query(Organization).filter(Organization.id == current_user.organization_id).first()
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return {
+        "id": int(organization.id),
+        "name": organization.name,
+        "contact_name": organization.contact_name,
+        "contact_email": organization.contact_email,
+        "contact_phone": organization.contact_phone,
+        "access": "read_only",
+    }
+
+
+@app.get("/organization/users")
+async def get_organization_users_read_only(
+    current_user: User = Depends(get_organization_viewer),
+    db: Session = Depends(get_database_session),
+):
+    users = db.query(User).filter(
+        User.organization_id == current_user.organization_id,
+        User.organization_role != "viewer",
+    ).order_by(User.full_name.asc(), User.username.asc()).all()
+    return {
+        "access": "read_only",
+        "users": [{
+            "id": int(user.id),
+            "username": user.username,
+            "full_name": user.full_name,
+            "email": user.email,
+            "phone_number": user.phone_number,
+            "department": user.department,
+            "is_active": bool(user.is_active),
+            "invitation_status": "accepted" if user.invitation_accepted_at else ("pending" if user.invitation_token_hash else "legacy"),
+            "onboarding_complete": bool(user.onboarding_completed_at),
+        } for user in users],
+        "count": len(users),
+    }
+
+
+@app.get("/admin/organizations")
+async def admin_list_organizations(
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    organizations = db.query(Organization).order_by(Organization.name.asc()).all()
+    return [{
+        "id": int(org.id),
+        "name": org.name,
+        "slug": org.slug,
+        "contact_name": org.contact_name,
+        "contact_email": org.contact_email,
+        "contact_phone": org.contact_phone,
+        "is_active": bool(org.is_active),
+        "staff_count": db.query(User).filter(User.organization_id == org.id, User.organization_role != "viewer").count(),
+        "has_portal_account": db.query(User.id).filter(User.organization_id == org.id, User.organization_role == "viewer").first() is not None,
+    } for org in organizations]
+
+
+@app.post("/admin/organizations", status_code=201)
+async def admin_create_organization(
+    payload: AdminCreateOrganization,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    if not _valid_email(payload.contact_email):
+        raise HTTPException(status_code=400, detail="Invalid contact email address")
+    if db.query(Organization.id).filter(Organization.name == payload.name.strip()).first():
+        raise HTTPException(status_code=409, detail="Organization already exists")
+    slug_base = _slugify(payload.name)
+    slug, suffix = slug_base, 1
+    while db.query(Organization.id).filter(Organization.slug == slug).first():
+        suffix += 1
+        slug = f"{slug_base[:110]}-{suffix}"
+    organization = Organization(
+        name=payload.name.strip(),
+        slug=slug,
+        contact_name=payload.contact_name.strip(),
+        contact_email=payload.contact_email.strip().lower(),
+        contact_phone=payload.contact_phone.strip() if payload.contact_phone else None,
+    )
+    db.add(organization)
+    db.commit()
+    db.refresh(organization)
+    AuditService.log_event(db, int(current_user.id), "organization_created", f"Created organization {organization.id}")
+    return {"id": int(organization.id), "name": organization.name, "slug": organization.slug}
+
+
+@app.post("/admin/organizations/{organization_id}/users", status_code=202)
+async def admin_add_organization_staff(
+    organization_id: int,
+    payload: AdminOrganizationStaffBatch,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    organization = db.query(Organization).filter(Organization.id == organization_id, Organization.is_active == True).first()
+    if not organization:
+        raise HTTPException(status_code=404, detail="Create the organization before adding staff")
+    seen_emails, seen_phones = set(), set()
+    prepared = []
+    for item in payload.users:
+        email = item.email.strip().lower()
+        phone = normalize_phone_number(item.phone_number)
+        if not _valid_email(email):
+            raise HTTPException(status_code=400, detail=f"Invalid user email: {item.email}")
+        if email in seen_emails or phone in seen_phones:
+            raise HTTPException(status_code=400, detail="Duplicate email or phone number in staff list")
+        if db.query(User.id).filter(or_(User.email == email, User.phone_number == phone)).first():
+            raise HTTPException(status_code=409, detail=f"A user already exists for {email} or {item.phone_number}")
+        seen_emails.add(email)
+        seen_phones.add(phone)
+        prepared.append((item, email, phone))
+
+    invitations = []
+    now = datetime.now(timezone.utc)
+    for item, email, phone in prepared:
+        code = secrets.token_urlsafe(32)
+        user = User(
+            username=_username_from_email(db, email),
+            phone_number=phone,
+            email=email,
+            full_name=item.full_name.strip(),
+            department=item.department.strip(),
+            organization_id=organization.id,
+            organization_role="member",
+            invitation_token_hash=_invitation_digest(code),
+            invitation_expires_at=now + timedelta(hours=72),
+            invited_at=now,
+            is_active=True,
+            is_verified=False,
+            user_type="mobile",
+            is_admin=False,
+        )
+        db.add(user)
+        db.flush()
+        invitations.append((int(user.id), code))
+    db.commit()
+    for user_id, code in invitations:
+        background_tasks.add_task(_deliver_invitation, user_id, code)
+    AuditService.log_event(db, int(current_user.id), "organization_staff_added", f"Added {len(invitations)} staff to organization {organization_id}")
+    return {"organization_id": organization_id, "invited_user_count": len(invitations), "message": "Staff invitations queued by email and SMS"}
+
+
+@app.post("/auth/activate")
+async def activate_invitation(payload: InvitationActivation, db: Session = Depends(get_database_session)):
+    """Consume an invite and let the user privately choose their login token."""
+    digest = _invitation_digest(payload.invitation_code.strip())
+    user = db.query(User).filter(User.invitation_token_hash == digest, User.is_active == True).first()
+    if not user or user.invitation_accepted_at:
+        raise HTTPException(status_code=400, detail="Invitation is invalid or has already been used")
+    expires_at = user.invitation_expires_at
+    if expires_at and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if not expires_at or expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Invitation has expired")
+    user.password_hash = hash_password(payload.token)
+    user.token = None
+    user.invitation_token_hash = None
+    user.invitation_accepted_at = datetime.now(timezone.utc)
+    user.is_verified = True
+    recovery_code = _issue_recovery_code(user)
+    db.commit()
+    session = SessionService.create_session(db, int(user.id), "mobile", "invitation_activation")
+    AuditService.log_event(db, int(user.id), "invitation_accepted", "User accepted organization invitation")
+    return {
+        "username": user.username,
+        "token": session.session_token,
+        "onboarding_required": not bool(user.onboarding_completed_at),
+        "recovery_code": recovery_code,
+    }
+
+
+@app.post("/auth/onboarding/profile")
+async def complete_onboarding_profile(
+    payload: OnboardingProfile,
+    current_user: User = Depends(get_onboarding_user),
+    db: Session = Depends(get_database_session),
+):
+    if current_user.onboarding_completed_at:
+        raise HTTPException(status_code=409, detail="Onboarding has already been completed")
+    if not payload.camera_attestation:
+        raise HTTPException(status_code=400, detail="A live camera capture is required; gallery/file uploads are not accepted")
+    captured_at = payload.captured_at
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - captured_at.astimezone(timezone.utc)
+    if age < timedelta(minutes=-5) or age > timedelta(minutes=15):
+        raise HTTPException(status_code=400, detail="Camera capture must be taken during onboarding")
+    content, ext = _decode_camera_image(payload.camera_image_base64)
+    user_dir = os.path.join(UPLOAD_DIR, f"user_{int(current_user.id)}")
+    os.makedirs(user_dir, exist_ok=True)
+    file_path = os.path.join(user_dir, f"profile_picture.{ext}")
+    with open(file_path, "wb") as file_handle:
+        file_handle.write(content)
+    current_user.job_title = payload.job_title.strip()
+    current_user.address = payload.address.strip()
+    current_user.emergency_contact_name = payload.emergency_contact_name.strip()
+    current_user.emergency_contact_phone = payload.emergency_contact_phone.strip()
+    current_user.profile_picture_path = file_path
+    current_user.onboarding_completed_at = datetime.now(timezone.utc)
+    db.commit()
+    AuditService.log_event(db, int(current_user.id), "onboarding_completed", "User completed mandatory profile onboarding")
+    return {"message": "Profile setup complete", "onboarding_required": False}
+
+
 
 @app.post("/auth/login")
 async def login_user(login_data: UserLogin, db: Session = Depends(get_database_session)):
@@ -4160,6 +4788,8 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
         if not user:
             monitor_record_event("auth", "login", status="error", detail="Invalid username, token, or password")
             raise HTTPException(status_code=401, detail="Invalid username, token, or password")
+        if getattr(user, "organization_role", None) == "viewer":
+            raise HTTPException(status_code=403, detail="Use the organization portal login")
 
         # Create session
         user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
@@ -4169,7 +4799,9 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
         return {
             "username": str(getattr(user, 'username', '')),
             "token": str(getattr(session, 'session_token', '')),
-            "is_admin": bool(getattr(user, 'is_admin', False))
+            "is_admin": bool(getattr(user, 'is_admin', False)),
+            "organization_id": getattr(user, "organization_id", None),
+            "onboarding_required": not bool(getattr(user, "onboarding_completed_at", None)),
         }
 
     except HTTPException:
@@ -5591,9 +6223,10 @@ async def _send_meeting_card(
     meeting_payload: dict,
     group_id: Optional[int] = None,
     dm_usernames: Optional[List[str]] = None,
+    decoy: str = "📅 Meeting update",
+    push_offline: bool = True,
 ):
     content = json.dumps(meeting_payload)
-    decoy = "📅 Meeting update"
 
     if group_id:
         message = MessageService.send_message_to_group(
@@ -5615,7 +6248,7 @@ async def _send_meeting_card(
         for member in members:
             if member.user_id != sender_id:
                 sent = await ws_manager.send_to_user(member.user_id, notification)
-                if not sent:
+                if not sent and push_offline:
                     await push_to_user(db, member.user_id, "Meeting", f"{sender_username} scheduled a meeting", sound="beep.caf")
 
     for uname in (dm_usernames or []):
@@ -7243,6 +7876,7 @@ async def respond_remote_control(
     requester = db.query(User).filter(User.username == payload.requester_username, User.is_active == True).first()
     if not requester:
         raise HTTPException(status_code=404, detail="Requester not found")
+    _require_same_organization(current_user, requester)
     if not _both_active_in_conference(db, conference_id, responder_id, int(requester.id)):
         raise HTTPException(status_code=403, detail="Both parties must be active in this meeting")
     await ws_manager.send_to_user(int(requester.id), {
@@ -7265,6 +7899,7 @@ async def end_remote_control(
     other = db.query(User).filter(User.username == payload.other_username, User.is_active == True).first()
     if not other:
         raise HTTPException(status_code=404, detail="User not found")
+    _require_same_organization(current_user, other)
     await ws_manager.send_to_user(int(other.id), {
         "type": "remote_control_ended",
         "data": {"conference_id": conference_id},
@@ -7285,6 +7920,9 @@ async def get_inbox(current_user: User = Depends(get_current_user),
         for msg in messages:
             sender = db.query(User).filter(User.id == msg.sender_id).first()
             recipient = db.query(User).filter(User.id == msg.recipient_id).first()
+            other = recipient if msg.sender_id == user_id else sender
+            if other and not _same_organization(current_user, other):
+                continue
             result.append({
                 "id": int(getattr(msg, 'id', 0)),
                 "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
@@ -7323,6 +7961,7 @@ async def get_conversation(
         partner = db.query(User).filter(User.username == partner_username, User.is_active == True).first()
         if not partner:
             raise HTTPException(status_code=404, detail="Partner user not found")
+        _require_same_organization(current_user, partner)
         partner_id = int(getattr(partner, 'id', 0))
 
         msg_query = db.query(Message).filter(
@@ -7442,34 +8081,22 @@ async def mark_message_read(message_id: int,
 
 
 class AdminUserRegistrationDetails(BaseModel):
-    """Model for admin user registration details response"""
+    """Non-secret provisioning status visible to administrators."""
     username: str = Field(..., description="Username for the user account")
     phone_number: str = Field(..., description="Phone number for the user account")
-    token: str = Field(..., description="Authentication token for the user")
-    message: str = Field(..., description="Instructional message for sharing with user")
+    email: Optional[str] = None
+    organization_id: Optional[int] = None
+    invitation_status: str
+    message: str
 
 @app.post("/register")
 async def register_user(user_data: UserRegistration, request: Request,
                        db: Session = Depends(get_database_session)):
-    """Self-service signup. Returns a one-time recovery_code the client MUST
-    show the user immediately and tell them to save it — it is never
-    retrievable again, and is the only way to self-reset later without an
-    admin (see POST /auth/reset-with-recovery-code)."""
-    try:
-        client_ip = request.client.host if request.client else None
-        user, recovery_code = UserService.create_user(db, user_data, ip_address=client_ip)
-        monitor_record_event("auth", "signup", user_id=getattr(user, 'id', None))
-        return {
-            "username": user.username,
-            "phone_number": user.phone_number,
-            "registered": user.registered.isoformat(),
-            "recovery_code": recovery_code,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Registration error: {e}")
-        raise HTTPException(status_code=400, detail="Failed to register user")
+    """Dilarion is organization-only; consumer self-registration is closed."""
+    raise HTTPException(
+        status_code=403,
+        detail="Self-registration is disabled. Submit an organization request and use the invitation sent by email/SMS.",
+    )
 
 
 
@@ -7522,7 +8149,7 @@ async def get_conversations(
         result = []
         for pid in partner_ids:
             partner = db.query(User).filter(User.id == pid, User.is_active == True).first()
-            if partner:
+            if partner and _same_organization(current_user, partner):
                 result.append({
                     "username": str(getattr(partner, 'username', '')),
                     "is_active": bool(getattr(partner, 'is_active', False)),
@@ -7536,9 +8163,12 @@ async def get_conversations(
 @app.get("/users")
 async def get_users(current_user: User = Depends(get_current_user),
                    db: Session = Depends(get_database_session)):
-    """Get list of users"""
+    """Get users in the caller's organization only."""
     try:
-        users = UserService.get_all_users(db)
+        organization_id = getattr(current_user, "organization_id", None)
+        if not organization_id and not bool(getattr(current_user, "is_admin", False)):
+            return []
+        users = UserService.get_all_users(db, None if current_user.is_admin else organization_id)
         
         result = []
         for user in users:
@@ -7806,6 +8436,12 @@ def _group_by_invite(db: Session, code: str) -> Group:
     return g
 
 
+def _require_group_organization(db: Session, group: Group, user: User) -> None:
+    creator = db.query(User).filter(User.id == group.created_by).first()
+    if not creator or not _same_organization(user, creator):
+        raise HTTPException(status_code=404, detail="Invite link is invalid or has been reset")
+
+
 @app.get("/groups/invite/{code:path}")
 async def preview_group_invite(
     code: str,
@@ -7814,6 +8450,7 @@ async def preview_group_invite(
 ):
     """What a user sees before joining via link: name, description, size."""
     g = _group_by_invite(db, code)
+    _require_group_organization(db, g, current_user)
     user_id = int(getattr(current_user, 'id', 0))
     is_member = db.query(GroupMember).filter(GroupMember.group_id == g.id, GroupMember.user_id == user_id).first() is not None
     return {
@@ -7834,6 +8471,7 @@ async def join_group_via_invite(
 ):
     """Join a group through its invite link / QR code."""
     g = _group_by_invite(db, code)
+    _require_group_organization(db, g, current_user)
     user_id = int(getattr(current_user, 'id', 0))
     username = str(getattr(current_user, 'username', ''))
     existing = db.query(GroupMember).filter(GroupMember.group_id == g.id, GroupMember.user_id == user_id).first()
@@ -7857,10 +8495,11 @@ async def start_group_call(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
-    """Voice or video call to the whole group, WhatsApp-style. Stands up a
-    LiveKit conference with the caller in it, rings every other member
-    (pending until they accept — joining never opens a mic without consent),
-    and posts a join card in the group so late joiners can still get in."""
+    """Voice or video call to the whole group, WhatsApp-style — a call, not a
+    meeting (no lobby, recording, breakouts). Stands up a LiveKit conference
+    with the caller in it, rings every other member (pending until they
+    accept — joining never opens a mic without consent), and posts a
+    group_call card in the group so late joiners can still get in."""
     caller_id = int(getattr(current_user, 'id', 0))
     caller_username = str(getattr(current_user, 'username', ''))
     if not db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == caller_id).first():
@@ -7906,8 +8545,12 @@ async def start_group_call(
 
     await _send_meeting_card(
         db, caller_id, caller_username,
-        {"kind": "instant", "conference_id": int(conf.id), "title": f"Group {label} call", "call_type": data.call_type},
+        {"kind": "group_call", "conference_id": int(conf.id), "call_type": data.call_type,
+         "group_id": int(group_id), "group_name": str(group.name)},
         group_id=group_id,
+        decoy=f"📞 Group {label} call",
+        # Everyone offline was already pushed a ring above.
+        push_offline=False,
     )
     monitor_record_event("conference", "group_call", user_id=caller_id, detail=f"group={group_id} type={data.call_type}")
     return {
@@ -8847,6 +9490,7 @@ async def get_user_public_key(username: str,
         user = UserService.get_user_by_username(db, username)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+        _require_same_organization(current_user, user)
         
         return {
             "username": str(getattr(user, 'username', '')),
@@ -8956,13 +9600,22 @@ async def admin_get_user_registration_details(username: str,
                     logger.info(f"  Similar: '{u.username}'")
             raise HTTPException(status_code=404, detail="User not found")
         
-        # Return registration details that can be shared with the user
+        # Return provisioning status only. Invitation codes and login tokens
+        # are deliberately never exposed to administrators.
         logger.info(f"Returning registration details for user ID: {user.id}")
+        if getattr(user, "invitation_accepted_at", None):
+            invitation_status = "accepted"
+        elif getattr(user, "invitation_token_hash", None):
+            invitation_status = "pending"
+        else:
+            invitation_status = "legacy"
         return {
             "username": str(getattr(user, 'username', '')),
             "phone_number": str(getattr(user, 'phone_number', '')),
-            "token": str(getattr(user, 'token', '')),
-            "message": "Share these details with the user for registration"
+            "email": getattr(user, "email", None),
+            "organization_id": getattr(user, "organization_id", None),
+            "invitation_status": invitation_status,
+            "message": "Credentials are private to the user and are not available to administrators",
         }
         
     except HTTPException:
@@ -9089,6 +9742,8 @@ async def upload_profile_picture(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
 ):
+    if not getattr(current_user, "onboarding_completed_at", None):
+        raise HTTPException(status_code=403, detail="Complete onboarding with a live camera capture first")
     ext = _PROFILE_PICTURE_CONTENT_TYPES.get(file.content_type)
     if not ext:
         raise HTTPException(status_code=400, detail="Only jpeg, png, or webp images are supported")
@@ -9122,11 +9777,13 @@ async def upload_profile_picture(
 @app.get("/users/{username}/profile-picture")
 async def get_user_profile_picture(
     username: str,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
 ):
     user = db.query(User).filter(User.username == username).first()
     if not user or not user.profile_picture_path:
         raise HTTPException(status_code=404, detail="No profile picture set")
+    _require_same_organization(current_user, user)
     if not os.path.exists(user.profile_picture_path):
         raise HTTPException(status_code=404, detail="Profile picture file missing")
     return FileResponse(user.profile_picture_path)
@@ -9789,11 +10446,10 @@ async def reset_with_recovery_code(
     if not verify_password(payload.recovery_code.strip().upper(), user.recovery_code_hash):
         raise generic_error
 
-    existing_token_user = db.query(User).filter(User.token == payload.new_token, User.id != user.id).first()
-    if existing_token_user:
-        raise HTTPException(status_code=400, detail="That token is already in use by another account")
-
-    setattr(user, 'token', payload.new_token)
+    # New credentials are hashed. Unlike the legacy plaintext User.token
+    # column, they can never be read back by an administrator.
+    setattr(user, 'password_hash', hash_password(payload.new_token))
+    setattr(user, 'token', None)
     new_recovery_code = _issue_recovery_code(user)
     db.commit()
 
@@ -9856,14 +10512,12 @@ async def list_password_reset_requests(
 @app.post("/admin/password-reset-requests/{request_id}/approve")
 async def approve_password_reset(
     request_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
 ):
-    """Generates a new random token and sets it on the account. The new
-    token is returned ONLY in this response, for the approving admin to
-    relay to the user out-of-band (call, in person) — same trust model as
-    the token an admin picks when first creating an account. It is never
-    emailed, pushed, or shown anywhere else."""
+    """Approve a reset without exposing a credential to the administrator.
+    The user receives a one-time setup link over email and SMS."""
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Admin only")
     admin_id = int(getattr(current_user, 'id', 0))
@@ -9878,8 +10532,13 @@ async def approve_password_reset(
     if not target:
         raise HTTPException(status_code=404, detail="User account no longer exists")
 
-    new_token = secrets.token_urlsafe(9)
-    setattr(target, 'token', new_token)
+    invitation_code = secrets.token_urlsafe(32)
+    setattr(target, 'token', None)
+    setattr(target, 'password_hash', None)
+    setattr(target, 'invitation_token_hash', _invitation_digest(invitation_code))
+    setattr(target, 'invitation_expires_at', datetime.now(timezone.utc) + timedelta(hours=72))
+    setattr(target, 'invited_at', datetime.now(timezone.utc))
+    setattr(target, 'invitation_accepted_at', None)
     setattr(req, 'status', 'approved')
     setattr(req, 'processed_by_id', admin_id)
     setattr(req, 'processed_at', datetime.now(timezone.utc))
@@ -9891,8 +10550,10 @@ async def approve_password_reset(
     db.query(UserSession).filter(UserSession.user_id == target.id).delete()
     db.commit()
 
+    background_tasks.add_task(_deliver_invitation, int(target.id), invitation_code, "reset")
+
     AuditService.log_event(db, admin_id, "password_reset_approved", f"Token reset for {target.username}, all sessions invalidated")
-    return {"status": "approved", "username": str(target.username), "new_token": new_token}
+    return {"status": "approved", "username": str(target.username), "message": "Private reset links were queued by email and SMS"}
 
 
 @app.post("/admin/password-reset-requests/{request_id}/deny")
@@ -11154,21 +11815,22 @@ async def admin_change_password(password_data: AdminChangePassword,
 
 @app.post("/admin/users")
 async def admin_create_user(user_data: AdminCreateUser,
+                           background_tasks: BackgroundTasks,
                            current_user: User = Depends(get_admin_user),
                            db: Session = Depends(get_database_session)):
-    """Create a new user account (admin only). Response includes a one-time
-    recovery_code — relay it to the user out-of-band; it's never retrievable
-    again after this response (they can self-reset their password with it
-    later, see POST /auth/reset-with-recovery-code)."""
+    """Provision one organization user and queue email/SMS invitations."""
     try:
         user_id = int(getattr(current_user, 'id', 0))
-        new_user, recovery_code = AdminService.create_user(db, user_id, user_data, ip_address="admin_api")
+        new_user, invitation_code = AdminService.create_user(db, user_id, user_data, ip_address="admin_api")
+        background_tasks.add_task(_deliver_invitation, int(new_user.id), invitation_code)
 
         return {
             "username": str(getattr(new_user, 'username', '')),
             "phone_number": str(getattr(new_user, 'phone_number', '')),
-            "recovery_code": recovery_code,
-            "message": "User created successfully"
+            "email": getattr(new_user, "email", None),
+            "organization_id": getattr(new_user, "organization_id", None),
+            "invitation_status": "pending",
+            "message": "User provisioned; email and SMS invitations were queued. Credentials are not visible to administrators.",
         }
         
     except HTTPException:
@@ -11382,23 +12044,35 @@ async def admin_get_all_users(current_user: User = Depends(get_admin_user),
         users = UserService.get_all_users(db)
         
         result = []
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
         for user in users:
             last_login = getattr(user, 'last_login', None)
             registered = getattr(user, 'registered', datetime.now(timezone.utc))
-            result.append({
+            organization = db.query(Organization).filter(Organization.id == user.organization_id).first() if user.organization_id else None
+            item = {
                 "id": int(getattr(user, 'id', 0)),
                 "phone_number": str(getattr(user, 'phone_number', '')),
                 "username": str(getattr(user, 'username', '')),
+                "email": getattr(user, "email", None),
+                "full_name": getattr(user, "full_name", None),
+                "department": getattr(user, "department", None),
+                "organization_id": getattr(user, "organization_id", None),
+                "organization_name": organization.name if organization else None,
                 "registered": registered.isoformat() if registered else datetime.now(timezone.utc).isoformat(),
                 "last_login": last_login.isoformat() if last_login else None,
                 "is_active": bool(getattr(user, 'is_active', False)),
                 "is_admin": bool(getattr(user, 'is_admin', False)),
-                "user_type": str(getattr(user, 'user_type', ''))
-            })
+                "user_type": str(getattr(user, 'user_type', '')),
+                "invitation_status": "accepted" if getattr(user, "invitation_accepted_at", None) else ("pending" if getattr(user, "invitation_token_hash", None) else "legacy"),
+                "onboarding_complete": bool(getattr(user, "onboarding_completed_at", None)),
+            }
+            result.append(item)
+            grouped.setdefault(organization.name if organization else "Platform / unassigned", []).append(item)
         
         return {
             "users": result,
-            "count": len(result)
+            "count": len(result),
+            "organizations": grouped,
         }
         
     except HTTPException:

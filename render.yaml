@@ -3,7 +3,7 @@ services:
     name: secure-messaging-api
     runtime: python
     buildCommand: "pip install -r requirements_postgresql.txt"
-    preDeployCommand: "python init_db.py"
+    preDeployCommand: "python init_db.py && python migrate_organization_tenancy.py"
     startCommand: "./start_render.sh"
     envVars:
       - key: PYTHON_VERSION

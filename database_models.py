@@ -23,12 +23,27 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), unique=True, index=True, nullable=False)  # Kept for backward compatibility
     phone_number = Column(String(20), unique=True, index=True, nullable=False)  # Primary identifier
+    email = Column(String(255), unique=True, index=True, nullable=True)
+    full_name = Column(String(255), nullable=True)
+    department = Column(String(120), nullable=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
+    organization_role = Column(String(20), nullable=True)  # "owner" / "admin" / "member"
     public_key = Column(Text, nullable=True)  # Make this optional - RSA public key in PEM format
     password_hash = Column(String(255), nullable=True)  # Optional password hash
     must_change_password = Column(Boolean, default=False)  # Flag to force password change on first login
     
     # Authentication tokens
     token = Column(String(255), unique=True, index=True, nullable=True)  # TLS safetoken or API token
+    # Provisioned accounts receive an opaque one-time invitation.  Only its
+    # SHA-256 digest is persisted; an administrator can never retrieve either
+    # the invitation or the login token chosen by the user.
+    invitation_token_hash = Column(String(64), unique=True, index=True, nullable=True)
+    invitation_expires_at = Column(DateTime, nullable=True)
+    invited_at = Column(DateTime, nullable=True)
+    invitation_accepted_at = Column(DateTime, nullable=True)
+    email_invite_sent_at = Column(DateTime, nullable=True)
+    sms_invite_sent_at = Column(DateTime, nullable=True)
+    invitation_delivery_errors = Column(JSON, nullable=True)
     session_token = Column(String(255), nullable=True)
     # Self-service account recovery — bcrypt hash only, never the plaintext code.
     # Issued once at account creation and whenever regenerated; consuming it via
@@ -82,6 +97,11 @@ class User(Base):
     mastertoken_2fa_salt = Column(String(255), nullable=True)
 
     profile_picture_path = Column(String(512), nullable=True)
+    onboarding_completed_at = Column(DateTime, nullable=True)
+    job_title = Column(String(120), nullable=True)
+    address = Column(Text, nullable=True)
+    emergency_contact_name = Column(String(255), nullable=True)
+    emergency_contact_phone = Column(String(20), nullable=True)
 
     # Availability status, independent of online/offline presence (which is
     # WS-connection-derived, not stored here) — "available"/"busy"/"dnd"/
@@ -98,9 +118,51 @@ class User(Base):
     master_tokens = relationship("MasterToken", back_populates="user")
     group_memberships = relationship("GroupMember", back_populates="user")
     mdm_profile = relationship("MDMDeviceProfile", back_populates="user", uselist=False)
+    organization = relationship("Organization", back_populates="users", foreign_keys=[organization_id])
     
     def __repr__(self):
         return f"<User(phone='{self.phone_number}', username='{self.username}', type='{self.user_type}', admin={self.is_admin})>"
+
+
+class Organization(Base):
+    """A tenant boundary. Regular users can only discover and communicate
+    with other users attached to the same organization."""
+    __tablename__ = "organizations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), unique=True, nullable=False)
+    slug = Column(String(120), unique=True, index=True, nullable=False)
+    contact_name = Column(String(255), nullable=False)
+    contact_email = Column(String(255), nullable=False)
+    contact_phone = Column(String(20), nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+    users = relationship("User", back_populates="organization", foreign_keys="User.organization_id")
+
+
+class OrganizationAccessRequest(Base):
+    """An organization's request for Dilarion access and its proposed roster.
+    The roster is immutable JSON until an admin approves or rejects it."""
+    __tablename__ = "organization_access_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    organization_name = Column(String(255), nullable=False)
+    contact_name = Column(String(255), nullable=False)
+    contact_email = Column(String(255), nullable=False)
+    contact_phone = Column(String(20), nullable=True)
+    requested_admin_username = Column(String(50), nullable=True)
+    requested_admin_password_hash = Column(String(255), nullable=True)
+    requested_users = Column(JSON, nullable=False, default=list)
+    status = Column(String(20), default="pending", nullable=False, index=True)
+    admin_note = Column(Text, nullable=True)
+    submitted_at = Column(DateTime, default=func.now(), nullable=False)
+    reviewed_at = Column(DateTime, nullable=True)
+    reviewed_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True)
+
+    organization = relationship("Organization", foreign_keys=[organization_id])
+    reviewed_by = relationship("User", foreign_keys=[reviewed_by_admin_id])
 
 class Message(Base):
     """Message table for storing encrypted messages between users"""
