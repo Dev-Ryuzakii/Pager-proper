@@ -56,7 +56,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, ChatSettings
+from database_models import User, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, ChatSettings, HiddenMessage
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -1031,7 +1031,9 @@ class GroupService:
         if not group:
             return False
             
-        # Delete messages in the group
+        # Delete per-user "deleted for me" markers, then messages in the group
+        msg_ids = db.query(Message.id).filter(Message.group_id == group_id)
+        db.query(HiddenMessage).filter(HiddenMessage.message_id.in_(msg_ids)).delete(synchronize_session=False)
         db.query(Message).filter(Message.group_id == group_id).delete()
         
         # Delete media in the group
@@ -7334,6 +7336,7 @@ async def get_conversation(
         ).first()
         if chat_settings and chat_settings.deleted_before:
             msg_query = msg_query.filter(Message.timestamp > chat_settings.deleted_before)
+        msg_query = _exclude_hidden(db, msg_query, user_id)
         msgs = msg_query.order_by(Message.timestamp.asc()).limit(200).all()
 
         current_username = str(getattr(current_user, 'username', ''))
@@ -7843,6 +7846,78 @@ async def join_group_via_invite(
         await _notify_group_updated(db, int(g.id), {"event": "member_joined", "username": username})
     return _group_dict(db, g, user_id)
 
+class GroupCallStart(BaseModel):
+    call_type: str = Field("voice", pattern="^(voice|video)$")
+
+
+@app.post("/groups/{group_id}/call")
+async def start_group_call(
+    group_id: int,
+    data: GroupCallStart,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Voice or video call to the whole group, WhatsApp-style. Stands up a
+    LiveKit conference with the caller in it, rings every other member
+    (pending until they accept — joining never opens a mic without consent),
+    and posts a join card in the group so late joiners can still get in."""
+    caller_id = int(getattr(current_user, 'id', 0))
+    caller_username = str(getattr(current_user, 'username', ''))
+    if not db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == caller_id).first():
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+    group = db.query(Group).filter(Group.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    conf = ConferenceSession(created_by_user_id=caller_id, is_active=True)
+    db.add(conf)
+    db.flush()
+    db.add(ConferenceParticipant(conference_id=conf.id, user_id=caller_id))
+
+    others = [m.user_id for m in db.query(GroupMember).filter(
+        GroupMember.group_id == group_id, GroupMember.user_id != caller_id
+    ).order_by(GroupMember.joined_at.asc()).all()]
+    # Capacity counts the caller; anyone past the cap can't be rung.
+    ring_ids = others[:max(0, CONFERENCE_MAX_PARTICIPANTS - 1)]
+    for uid in ring_ids:
+        db.add(ConferenceParticipant(conference_id=conf.id, user_id=uid, is_active=False))
+    db.commit()
+    db.refresh(conf)
+
+    invite = {
+        "type": "conference_invite",
+        "data": {
+            "conference_id": int(conf.id),
+            "invited_by": caller_username,
+            "existing_participants": [caller_username],
+            "group_id": int(group_id),
+            "group_name": str(group.name),
+            "call_type": data.call_type,
+        },
+    }
+    label = "video" if data.call_type == "video" else "voice"
+    for uid in ring_ids:
+        sent = await ws_manager.send_to_user(uid, invite)
+        if not sent:
+            try:
+                await push_to_user(db, uid, str(group.name), f"{caller_username} started a group {label} call", sound="ringingtone.caf")
+            except Exception as e:
+                logger.warning(f"Group call push failed: {e}")
+
+    await _send_meeting_card(
+        db, caller_id, caller_username,
+        {"kind": "instant", "conference_id": int(conf.id), "title": f"Group {label} call", "call_type": data.call_type},
+        group_id=group_id,
+    )
+    monitor_record_event("conference", "group_call", user_id=caller_id, detail=f"group={group_id} type={data.call_type}")
+    return {
+        "conference_id": int(conf.id),
+        "call_type": data.call_type,
+        "rung": len(ring_ids),
+        "not_rung": len(others) - len(ring_ids),
+    }
+
+
 @app.get("/groups/{group_id}", response_model=GroupResponse)
 async def get_group_details(
     group_id: int,
@@ -8037,9 +8112,9 @@ async def get_group_messages(
     if not membership:
         raise HTTPException(status_code=403, detail="You are not a member of this group")
         
-    messages = db.query(Message).filter(
+    messages = _exclude_hidden(db, db.query(Message).filter(
         Message.group_id == group_id
-    ).order_by(Message.timestamp.desc()).limit(limit).all()
+    ), user_id).order_by(Message.timestamp.desc()).limit(limit).all()
 
     reactions_map = _reactions_summary(db, [m.id for m in messages], user_id)
 
@@ -8210,6 +8285,12 @@ async def send_group_message(
 
 # ─── Chat collaboration: reactions, edit, delete, pin, star ────────────────────
 
+def _exclude_hidden(db: Session, query, user_id: int):
+    """Drop messages this user deleted "for me" from a Message query."""
+    hidden = db.query(HiddenMessage.message_id).filter(HiddenMessage.user_id == user_id)
+    return query.filter(~Message.id.in_(hidden))
+
+
 def _message_targets(db: Session, msg: Message) -> List[int]:
     """User ids who should be notified about a change to this message —
     the other DM participant, or every group member."""
@@ -8325,33 +8406,64 @@ async def edit_message(
     return {"status": "edited"}
 
 
+def _can_delete_for_everyone(db: Session, msg: Message, user: User) -> bool:
+    """The sender can always unsend; in a group, the group's own admins can
+    remove anyone's message too (self-service moderation, no site admin)."""
+    user_id = int(getattr(user, 'id', 0))
+    if msg.sender_id == user_id or bool(getattr(user, 'is_admin', False)):
+        return True
+    if msg.group_id:
+        return _is_group_admin(db, int(msg.group_id), user_id)
+    return False
+
+
 @app.delete("/messages/{message_id}")
 async def delete_message(
     message_id: int,
+    scope: str = Query("everyone", pattern="^(everyone|me)$"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
 ):
-    """Soft delete — sender or a system admin only. Content stays in the row
-    (nothing is un-sendable once delivered) but list endpoints replace it
-    with a tombstone once is_deleted is set."""
+    """scope=everyone (default, unchanged for older clients): tombstone the
+    message for the whole conversation — the sender, a group admin for group
+    messages, or a site admin. Any attached media file is removed from disk.
+    scope=me: hide it for the caller only; anyone in the conversation can."""
     user_id = int(getattr(current_user, 'id', 0))
-    is_admin = bool(getattr(current_user, 'is_admin', False))
     msg = db.query(Message).filter(Message.id == message_id).first()
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
-    if msg.sender_id != user_id and not is_admin:
-        raise HTTPException(status_code=403, detail="Only the sender can delete this message")
+    if not bool(getattr(current_user, 'is_admin', False)):
+        _assert_can_access_message(db, msg, user_id)
+
+    if scope == "me":
+        exists = db.query(HiddenMessage).filter(
+            HiddenMessage.user_id == user_id, HiddenMessage.message_id == message_id
+        ).first()
+        if not exists:
+            db.add(HiddenMessage(user_id=user_id, message_id=message_id))
+            db.commit()
+        return {"status": "hidden", "scope": "me"}
+
+    if not _can_delete_for_everyone(db, msg, current_user):
+        raise HTTPException(status_code=403, detail="Only the sender or a group admin can delete this for everyone")
+
+    media = db.query(Media).filter(Media.message_id == msg.id).first()
+    if media and media.encrypted_file_path and os.path.exists(media.encrypted_file_path):
+        MediaService.delete_media_file_from_disk(media.encrypted_file_path)
 
     setattr(msg, 'is_deleted', True)
     setattr(msg, 'deleted_at', datetime.now(timezone.utc))
     db.commit()
 
-    notification = {"type": "message_deleted", "data": {"message_id": message_id, "group_id": msg.group_id}}
+    notification = {"type": "message_deleted", "data": {
+        "message_id": message_id, "group_id": msg.group_id,
+        "deleted_by": str(getattr(current_user, 'username', '')),
+    }}
     for uid in _message_targets(db, msg):
         if uid != user_id:
             await ws_manager.send_to_user(uid, notification)
 
-    return {"status": "deleted"}
+    return {"status": "deleted", "scope": "everyone"}
 
 
 @app.post("/messages/clear/{other_username}")
@@ -8671,6 +8783,7 @@ async def get_group_conversation(
         ).first()
         if chat_settings and chat_settings.deleted_before:
             msg_query = msg_query.filter(Message.timestamp > chat_settings.deleted_before)
+        msg_query = _exclude_hidden(db, msg_query, user_id)
         msgs = msg_query.order_by(Message.timestamp.asc()).limit(200).all()
 
         result = []
@@ -9479,6 +9592,7 @@ async def export_messages(
     )
     if after_id is not None:
         query = query.filter(Message.id > after_id)
+    query = _exclude_hidden(db, query, user_id)
     msgs = query.order_by(Message.id.asc()).limit(limit + 1).all()
 
     has_more = len(msgs) > limit

@@ -218,6 +218,18 @@ class StarredMessage(Base):
 
     __table_args__ = (UniqueConstraint("user_id", "message_id", name="uq_starred_message"),)
 
+class HiddenMessage(Base):
+    """"Delete for me" — the message stays for everyone else in the
+    conversation, it just no longer appears for this one user."""
+    __tablename__ = "hidden_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, default=func.now())
+
+    __table_args__ = (UniqueConstraint("user_id", "message_id", name="uq_hidden_message"),)
+
 class UserKey(Base):
     """User encryption keys and master salts storage"""
     __tablename__ = "user_keys"
