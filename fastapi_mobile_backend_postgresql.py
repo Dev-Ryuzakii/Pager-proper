@@ -150,6 +150,9 @@ class AdminUpdateUser(BaseModel):
 class UserLogin(UserAuth):
     pass  # Same as auth - just username and token
 
+# 90 days — longest group disappearing-message timer a client can pick.
+MAX_GROUP_DISAPPEAR_HOURS = 24 * 90
+
 class GroupMessageSend(BaseModel):
     group_id: int = Field(..., description="ID of the group to send message to")
     message: str = Field(..., min_length=1, description="Message content")
@@ -430,8 +433,17 @@ class MediaResponse(BaseModel):
 # Group Chat Models
 class GroupCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    description: Optional[str] = Field(None, max_length=255)
-    members: List[str] = Field(..., description="List of participant usernames")
+    description: Optional[str] = Field(None, max_length=500)
+    members: List[str] = Field(default_factory=list, description="List of participant usernames")
+    disappear_after_hours: Optional[int] = Field(None, ge=1, le=MAX_GROUP_DISAPPEAR_HOURS, description="Group-wide disappearing-message timer in hours. Null = off.")
+
+class GroupUpdate(BaseModel):
+    """Group-admin edit from inside the chat. Omitted fields are left alone;
+    set clear_disappear=true to turn the disappearing timer off."""
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
+    disappear_after_hours: Optional[int] = Field(None, ge=1, le=MAX_GROUP_DISAPPEAR_HOURS)
+    clear_disappear: bool = False
 
 class AdminGroupUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
@@ -445,6 +457,8 @@ class GroupResponse(BaseModel):
     created_at: datetime
     created_by: int
     member_count: int
+    disappear_after_hours: Optional[int] = None
+    my_role: Optional[str] = None
 
 class GroupMemberResponse(BaseModel):
     user_id: int
@@ -892,9 +906,10 @@ class GroupService:
     """Service class for group operations"""
     
     @staticmethod
-    def create_group(db: Session, creator_id: int, name: str, description: Optional[str], member_usernames: List[str]) -> Group:
-        """Create a new group and add initial members"""
-        group = Group(name=name, description=description, created_by=creator_id)
+    def create_group(db: Session, creator_id: int, name: str, description: Optional[str], member_usernames: List[str], disappear_after_hours: Optional[int] = None) -> Group:
+        """Create a new group and add initial members. Any user can do this —
+        the creator becomes the group's first admin."""
+        group = Group(name=name, description=description, created_by=creator_id, disappear_after_hours=disappear_after_hours)
         db.add(group)
         db.commit()
         db.refresh(group)
@@ -915,7 +930,7 @@ class GroupService:
         
         # Send notification message in the group
         creator = db.query(User).filter(User.id == creator_id).first()
-        creator_name = str(getattr(creator, 'username', 'Admin'))
+        creator_name = str(getattr(creator, 'username', 'User'))
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
         
         notification_text = f"📢 Group '{name}' created by {creator_name}.\nWelcome all members! (Created on {now_str})"
@@ -987,6 +1002,13 @@ class GroupService:
         
         db.delete(membership)
         db.commit()
+
+        # Self-managed groups must never be left without an admin: hand the
+        # role to the longest-standing remaining member.
+        remaining = db.query(GroupMember).filter(GroupMember.group_id == group_id).order_by(GroupMember.joined_at.asc(), GroupMember.id.asc()).all()
+        if remaining and not any(m.role == "admin" for m in remaining):
+            setattr(remaining[0], 'role', 'admin')
+            db.commit()
         
         # Send notification message (using system/ghost sender if possible, otherwise use user_id before deletion? No, user is gone from members).
         # We can use the user_id even if they left.
@@ -4439,6 +4461,18 @@ def _resolve_disappear_hours(sender: User, explicit: Optional[int], kind: str) -
         return explicit
     return getattr(sender, f"disappear_{kind}_hours", None)
 
+def _resolve_group_disappear_hours(db: Session, sender: User, group_id: int, explicit: Optional[int], kind: str) -> Optional[int]:
+    """Group messages: a per-message override still wins, then the group-wide
+    timer (Group.disappear_after_hours, set by group admins), then the
+    sender's own default for that content kind."""
+    if explicit is not None:
+        return explicit
+    group = db.query(Group).filter(Group.id == group_id).first()
+    group_hours = getattr(group, "disappear_after_hours", None) if group else None
+    if group_hours:
+        return group_hours
+    return getattr(sender, f"disappear_{kind}_hours", None)
+
 _CLIENT_CONTENT_TYPES = {"gif", "sticker"}
 
 def _client_content_type(value: Optional[str]) -> str:
@@ -7519,27 +7553,76 @@ async def get_users(current_user: User = Depends(get_current_user),
 
 # --- Group Chat Endpoints ---
 
+def _group_dict(db: Session, g: Group, viewer_id: Optional[int] = None) -> Dict[str, Any]:
+    my_role = None
+    if viewer_id is not None:
+        m = db.query(GroupMember).filter(GroupMember.group_id == g.id, GroupMember.user_id == viewer_id).first()
+        my_role = m.role if m else None
+    return {
+        "id": int(g.id),
+        "name": str(g.name),
+        "description": g.description,
+        "created_at": g.created_at,
+        "created_by": int(g.created_by),
+        "member_count": len(g.members),
+        "disappear_after_hours": getattr(g, "disappear_after_hours", None),
+        "my_role": my_role,
+    }
+
+
+def _require_group_admin(db: Session, group_id: int, user_id: int) -> GroupMember:
+    m = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user_id).first()
+    if not m:
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+    if m.role != "admin":
+        raise HTTPException(status_code=403, detail="Only group admins can do this")
+    return m
+
+
+def _fmt_disappear(hours: Optional[int]) -> str:
+    if not hours:
+        return "off"
+    if hours % 24 == 0:
+        days = hours // 24
+        return f"{days} day{'s' if days != 1 else ''}"
+    return f"{hours} hour{'s' if hours != 1 else ''}"
+
+
+def _group_notice(db: Session, actor_id: int, group_id: int, text: str) -> None:
+    try:
+        MessageService.send_message_to_group(db, actor_id, group_id, text, None, is_admin_announcement=True)
+    except Exception as e:
+        logger.warning(f"Group notice failed for group {group_id}: {e}")
+
+
+async def _notify_group_updated(db: Session, group_id: int, extra: Optional[Dict[str, Any]] = None) -> None:
+    members = db.query(GroupMember).filter(GroupMember.group_id == group_id).all()
+    payload = {"type": "group_updated", "data": {"group_id": group_id, **(extra or {})}}
+    for m in members:
+        try:
+            await ws_manager.send_to_user(m.user_id, payload)
+        except Exception:
+            pass
+
+
 @app.post("/groups/create", response_model=GroupResponse)
 async def create_group_route(
     group_data: GroupCreate,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
-    """Create a new group chat (admin only)"""
+    """Create a new group chat. Open to every user — the creator becomes the
+    group's admin and manages it from inside the chat."""
     try:
-        admin_user_id = int(getattr(current_user, 'id', 0))
+        creator_id = int(getattr(current_user, 'id', 0))
         group = GroupService.create_group(
-            db, admin_user_id, group_data.name, group_data.description, group_data.members
+            db, creator_id, group_data.name.strip(), group_data.description,
+            group_data.members, group_data.disappear_after_hours,
         )
-        
-        return {
-            "id": int(group.id),
-            "name": str(group.name),
-            "description": group.description,
-            "created_at": group.created_at,
-            "created_by": int(group.created_by),
-            "member_count": len(group.members)
-        }
+        await _notify_group_updated(db, int(group.id), {"event": "created"})
+        return _group_dict(db, group, creator_id)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Group creation error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create group: {str(e)}")
@@ -7553,21 +7636,212 @@ async def get_groups(
     try:
         user_id = int(getattr(current_user, 'id', 0))
         groups = GroupService.get_user_groups(db, user_id)
-        
-        result = []
-        for g in groups:
-            result.append({
-                "id": int(g.id),
-                "name": str(g.name),
-                "description": g.description,
-                "created_at": g.created_at,
-                "created_by": int(g.created_by),
-                "member_count": len(g.members)
-            })
-        return result
+        return [_group_dict(db, g, user_id) for g in groups]
     except Exception as e:
         logger.error(f"Get groups error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve groups")
+
+
+# ─── Self-service group management ──────────────────────────────────────────
+# Everything that used to need the admin website — editing name/description,
+# removing members, deleting the group, invite links, the disappearing timer —
+# is done by the group's own admins (GroupMember.role == "admin") from inside
+# the chat. Invite links are opaque codes; the client renders the link and QR.
+
+def _new_invite_code() -> str:
+    return secrets.token_urlsafe(12)
+
+
+def _invite_payload(g: Group) -> Dict[str, Any]:
+    code = g.invite_code
+    return {
+        "group_id": int(g.id),
+        "invite_code": code,
+        "invite_link": f"dilarion://join/{code}" if code else None,
+        "qr_payload": f"dilarion:join:{code}" if code else None,
+    }
+
+
+@app.put("/groups/{group_id}", response_model=GroupResponse)
+async def update_group_route(
+    group_id: int,
+    data: GroupUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Edit group name, description or disappearing-message timer (group admins)."""
+    actor_id = int(getattr(current_user, 'id', 0))
+    actor_name = str(getattr(current_user, 'username', ''))
+    _require_group_admin(db, group_id, actor_id)
+    g = db.query(Group).filter(Group.id == group_id).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    notices = []
+    if data.name is not None and data.name.strip() and data.name.strip() != g.name:
+        g.name = data.name.strip()
+        notices.append(f"✏️ {actor_name} renamed the group to '{g.name}'.")
+    if data.description is not None and data.description != (g.description or ""):
+        g.description = data.description.strip() or None
+        notices.append(f"📝 {actor_name} updated the group description.")
+    new_timer = None if data.clear_disappear else data.disappear_after_hours
+    if (data.clear_disappear or data.disappear_after_hours is not None) and new_timer != g.disappear_after_hours:
+        g.disappear_after_hours = new_timer
+        if new_timer:
+            notices.append(f"⏱️ {actor_name} turned on disappearing messages. New messages will disappear after {_fmt_disappear(new_timer)}.")
+        else:
+            notices.append(f"⏱️ {actor_name} turned off disappearing messages.")
+    db.commit()
+    db.refresh(g)
+
+    for n in notices:
+        _group_notice(db, actor_id, group_id, n)
+    if notices:
+        AuditService.log_event(db, actor_id, "group_updated", f"Group {group_id} updated by group admin {actor_name}")
+        await _notify_group_updated(db, group_id, {"event": "updated"})
+    return _group_dict(db, g, actor_id)
+
+
+@app.delete("/groups/{group_id}")
+async def delete_group_route(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Delete the group for everyone (group admins)."""
+    actor_id = int(getattr(current_user, 'id', 0))
+    _require_group_admin(db, group_id, actor_id)
+    member_ids = [m.user_id for m in db.query(GroupMember).filter(GroupMember.group_id == group_id).all()]
+    if not GroupService.delete_group(db, group_id, actor_id):
+        raise HTTPException(status_code=404, detail="Group not found")
+    for uid in member_ids:
+        try:
+            await ws_manager.send_to_user(uid, {"type": "group_updated", "data": {"group_id": group_id, "event": "deleted"}})
+        except Exception:
+            pass
+    return {"message": "Group deleted", "deleted": True}
+
+
+@app.delete("/groups/{group_id}/members/{username}")
+async def remove_group_member(
+    group_id: int,
+    username: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Remove a member from the group (group admins)."""
+    actor_id = int(getattr(current_user, 'id', 0))
+    actor_name = str(getattr(current_user, 'username', ''))
+    _require_group_admin(db, group_id, actor_id)
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.id == actor_id:
+        raise HTTPException(status_code=400, detail="Use leave to remove yourself")
+    tm = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == target.id).first()
+    if not tm:
+        raise HTTPException(status_code=404, detail=f"{username} is not a member of this group")
+    db.delete(tm)
+    db.commit()
+    _group_notice(db, actor_id, group_id, f"🚫 {actor_name} removed {username}.")
+    AuditService.log_event(db, actor_id, "group_member_removed", f"{username} removed from group {group_id}")
+    await _notify_group_updated(db, group_id, {"event": "member_removed", "username": username})
+    try:
+        await ws_manager.send_to_user(target.id, {"type": "group_updated", "data": {"group_id": group_id, "event": "removed"}})
+    except Exception:
+        pass
+    return {"message": f"{username} removed from group"}
+
+
+@app.get("/groups/{group_id}/invite")
+async def get_group_invite(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Current invite link for the group, creating one on first use (group admins)."""
+    actor_id = int(getattr(current_user, 'id', 0))
+    _require_group_admin(db, group_id, actor_id)
+    g = db.query(Group).filter(Group.id == group_id).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if not g.invite_code:
+        g.invite_code = _new_invite_code()
+        db.commit()
+        db.refresh(g)
+    return _invite_payload(g)
+
+
+@app.post("/groups/{group_id}/invite/reset")
+async def reset_group_invite(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Revoke the current invite link and issue a new one (group admins)."""
+    actor_id = int(getattr(current_user, 'id', 0))
+    _require_group_admin(db, group_id, actor_id)
+    g = db.query(Group).filter(Group.id == group_id).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Group not found")
+    g.invite_code = _new_invite_code()
+    db.commit()
+    db.refresh(g)
+    AuditService.log_event(db, actor_id, "group_invite_reset", f"Invite link reset for group {group_id}")
+    return _invite_payload(g)
+
+
+def _group_by_invite(db: Session, code: str) -> Group:
+    code = code.strip()
+    # Accept a pasted link/QR payload as well as the bare code.
+    for prefix in ("dilarion://join/", "dilarion:join:"):
+        if code.startswith(prefix):
+            code = code[len(prefix):]
+    g = db.query(Group).filter(Group.invite_code == code).first() if code else None
+    if not g:
+        raise HTTPException(status_code=404, detail="Invite link is invalid or has been reset")
+    return g
+
+
+@app.get("/groups/invite/{code:path}")
+async def preview_group_invite(
+    code: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """What a user sees before joining via link: name, description, size."""
+    g = _group_by_invite(db, code)
+    user_id = int(getattr(current_user, 'id', 0))
+    is_member = db.query(GroupMember).filter(GroupMember.group_id == g.id, GroupMember.user_id == user_id).first() is not None
+    return {
+        "group_id": int(g.id),
+        "name": str(g.name),
+        "description": g.description,
+        "member_count": len(g.members),
+        "disappear_after_hours": g.disappear_after_hours,
+        "already_member": is_member,
+    }
+
+
+@app.post("/groups/join/{code:path}", response_model=GroupResponse)
+async def join_group_via_invite(
+    code: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Join a group through its invite link / QR code."""
+    g = _group_by_invite(db, code)
+    user_id = int(getattr(current_user, 'id', 0))
+    username = str(getattr(current_user, 'username', ''))
+    existing = db.query(GroupMember).filter(GroupMember.group_id == g.id, GroupMember.user_id == user_id).first()
+    if not existing:
+        db.add(GroupMember(group_id=g.id, user_id=user_id, role="member"))
+        db.commit()
+        db.refresh(g)
+        _group_notice(db, user_id, int(g.id), f"🔗 {username} joined using the group's invite link.")
+        AuditService.log_event(db, user_id, "group_join_invite", f"{username} joined group {g.id} via invite link")
+        await _notify_group_updated(db, int(g.id), {"event": "member_joined", "username": username})
+    return _group_dict(db, g, user_id)
 
 @app.get("/groups/{group_id}", response_model=GroupResponse)
 async def get_group_details(
@@ -7592,15 +7866,8 @@ async def get_group_details(
         g = db.query(Group).filter(Group.id == group_id).first()
         if not g:
             raise HTTPException(status_code=404, detail="Group not found")
-            
-        return {
-            "id": int(g.id),
-            "name": str(g.name),
-            "description": g.description,
-            "created_at": g.created_at,
-            "created_by": int(g.created_by),
-            "member_count": len(g.members)
-        }
+
+        return _group_dict(db, g, user_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -7891,7 +8158,7 @@ async def send_group_message(
             
         message = MessageService.send_message_to_group(
             db, user_id, payload.group_id, payload.message,
-            _resolve_disappear_hours(current_user, payload.disappear_after_hours, "text"), addressed_to_id, is_announcement,
+            _resolve_group_disappear_hours(db, current_user, payload.group_id, payload.disappear_after_hours, "text"), addressed_to_id, is_announcement,
             payload.encrypted_key, payload.iv, payload.decoy_content,
             content_type=_client_content_type(payload.content_type),
             reply_to_message_id=payload.reply_to_message_id,
@@ -11208,7 +11475,7 @@ async def upload_raw_group_media(
         with open(file_path, "wb") as buffer:
             buffer.write(content)
 
-        resolved_disappear_hours = _resolve_disappear_hours(current_user, disappear_after_hours, "voice" if is_voice else "media")
+        resolved_disappear_hours = _resolve_group_disappear_hours(db, current_user, group_id, disappear_after_hours, "voice" if is_voice else "media")
         expires_at = None
         auto_delete = False
         if resolved_disappear_hours is not None and resolved_disappear_hours > 0:

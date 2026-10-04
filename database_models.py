@@ -463,6 +463,13 @@ class Group(Base):
     created_at = Column(DateTime, default=func.now())
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     avatar_path = Column(String(512), nullable=True)
+    # Self-service group management — any user can create a group and run it
+    # from inside the chat. invite_code backs the shareable join link / QR
+    # (null = no active link; regenerating it revokes the old one).
+    # disappear_after_hours is the group-wide disappearing-message timer that
+    # applies to every member's messages in this group (null = off).
+    invite_code = Column(String(64), unique=True, nullable=True, index=True)
+    disappear_after_hours = Column(Integer, nullable=True)
     
     # Relationships
     members = relationship("GroupMember", back_populates="group", cascade="all, delete-orphan")
