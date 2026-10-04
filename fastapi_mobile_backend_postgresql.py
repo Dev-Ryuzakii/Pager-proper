@@ -336,6 +336,76 @@ def _send_email_message(to_email: str, subject: str, text_body: str, html_body: 
     return True
 
 
+def _sms_number(phone: str) -> str:
+    """Sendchamp wants international digits without '+', e.g. 2348012345678.
+    Local numbers (leading 0) get SENDCHAMP_DEFAULT_COUNTRY_CODE (234)."""
+    digits = re.sub(r"\D", "", phone or "")
+    if (phone or "").strip().startswith("+"):
+        return digits
+    if digits.startswith("00"):
+        return digits[2:]
+    if digits.startswith("0"):
+        return os.getenv("SENDCHAMP_DEFAULT_COUNTRY_CODE", "234") + digits[1:]
+    return digits
+
+
+async def _send_sms(phone: Optional[str], text: str) -> Optional[str]:
+    """Send one SMS. Sendchamp (SENDCHAMP_API_KEY) is the provider; Twilio is
+    kept as a fallback if only its credentials are set. Returns None on
+    success, otherwise a short error code for delivery-status reporting.
+    Keys come only from the environment and never reach API responses."""
+    if not phone:
+        return "phone_missing"
+    sendchamp_key = os.getenv("SENDCHAMP_API_KEY")
+    if sendchamp_key:
+        to = _sms_number(phone)
+        if len(to) < 10:
+            return "invalid_phone"
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(
+                    os.getenv("SENDCHAMP_BASE_URL", "https://api.sendchamp.com/api/v1").rstrip("/") + "/sms/send",
+                    headers={
+                        "Authorization": f"Bearer {sendchamp_key}",
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "to": [to],
+                        "message": text,
+                        "sender_name": os.getenv("SENDCHAMP_SENDER_NAME", "Sendchamp"),
+                        # dnd reaches numbers on Do-Not-Disturb (needed for
+                        # transactional codes in Nigeria); non_dnd / international also valid.
+                        "route": os.getenv("SENDCHAMP_ROUTE", "dnd"),
+                    },
+                )
+            if response.status_code >= 400:
+                logger.error("Sendchamp SMS failed (%s): %s", response.status_code, response.text[:300])
+                return "delivery_failed"
+            return None
+        except Exception as exc:
+            logger.error("Sendchamp SMS error: %s", exc)
+            return "delivery_failed"
+
+    twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
+    twilio_from = os.getenv("TWILIO_FROM_NUMBER")
+    if twilio_sid and twilio_token and twilio_from:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(
+                    f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json",
+                    auth=(twilio_sid, twilio_token),
+                    data={"From": twilio_from, "To": phone, "Body": text},
+                )
+                response.raise_for_status()
+            return None
+        except Exception as exc:
+            logger.error("Twilio SMS error: %s", exc)
+            return "delivery_failed"
+    return "sms_not_configured"
+
+
 async def _send_transactional_email(to_email: str, subject: str, text_body: str, html_body: Optional[str] = None) -> bool:
     try:
         return await asyncio.to_thread(_send_email_message, to_email, subject, text_body, html_body)
@@ -507,24 +577,11 @@ async def _deliver_invitation(user_id: int, invitation_code: str, purpose: str =
         else:
             errors["email"] = "email_missing"
 
-        twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
-        twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
-        twilio_from = os.getenv("TWILIO_FROM_NUMBER")
-        if twilio_sid and twilio_token and twilio_from:
-            try:
-                async with httpx.AsyncClient(timeout=15) as client:
-                    response = await client.post(
-                        f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json",
-                        auth=(twilio_sid, twilio_token),
-                        data={"From": twilio_from, "To": user.phone_number, "Body": sms_body},
-                    )
-                    response.raise_for_status()
-                user.sms_invite_sent_at = datetime.now(timezone.utc)
-            except Exception as exc:
-                logger.error("Invitation SMS failed for user %s: %s", user_id, exc)
-                errors["sms"] = "delivery_failed"
+        sms_error = await _send_sms(user.phone_number, sms_body)
+        if sms_error:
+            errors["sms"] = sms_error
         else:
-            errors["sms"] = "twilio_not_configured"
+            user.sms_invite_sent_at = datetime.now(timezone.utc)
 
         user.invitation_delivery_errors = errors or None
         db.commit()
@@ -618,7 +675,12 @@ class OnboardingProfile(BaseModel):
     camera_attestation: bool = Field(..., description="Client attests that image came directly from the camera")
 
 class UserLogin(UserAuth):
-    pass  # Same as auth - just username and token
+    # Device identity — lets the server keep one signed-in device per
+    # platform and tell the account owner exactly who tried to sign in.
+    device_id: Optional[str] = Field(None, max_length=128, description="Stable per-install id")
+    device_name: Optional[str] = Field(None, max_length=120)
+    platform: Optional[str] = Field(None, max_length=20, description="android | ios | desktop | web")
+    location: Optional[str] = Field(None, max_length=200, description="Optional client-reported location, e.g. 'Lagos, Nigeria'")
 
 # 90 days — longest group disappearing-message timer a client can pick.
 MAX_GROUP_DISAPPEAR_HOURS = 24 * 90
@@ -2253,15 +2315,27 @@ class CallService:
                 and user_id == call.caller_id):
             action = "missed"
 
+        # Both sides usually send "end"; only the first one closes the call.
+        if call.ended_at is not None and action in ("end", "decline", "missed"):
+            db.commit()
+            return call
+
         call.status = action
+
+        if action in ("accept", "accepted") and getattr(call, "answered_at", None) is None:
+            call.answered_at = datetime.utcnow()
 
         if action in ("end", "decline", "missed"):
             call.ended_at = datetime.utcnow()
-            if call.started_at and action == "end":
+            # Talk time only — from when the callee answered, not from when it
+            # started ringing. Unanswered calls stay at 0.
+            answered = getattr(call, "answered_at", None)
+            if action == "end" and answered:
                 ended = call.ended_at.replace(tzinfo=timezone.utc)
-                started = call.started_at.replace(tzinfo=timezone.utc) if call.started_at.tzinfo is None else call.started_at
-                duration = (ended - started).total_seconds()
-                call.duration = int(duration)
+                started = answered.replace(tzinfo=timezone.utc) if answered.tzinfo is None else answered
+                call.duration = max(0, int((ended - started).total_seconds()))
+            else:
+                call.duration = 0
         
         db.commit()
 
@@ -5111,8 +5185,87 @@ async def complete_onboarding_profile(
 
 
 
+def _platform_group(platform: Optional[str]) -> str:
+    p = (platform or "").lower().strip()
+    if p in ("android", "ios", "mobile"):
+        return "mobile"
+    return p or "mobile"
+
+
+def _client_ip(request: Optional[Request]) -> Optional[str]:
+    if request is None:
+        return None
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+async def _approximate_location(ip: Optional[str]) -> Optional[str]:
+    """City/country for an IP, for the "someone tried to sign in" alert.
+    Uses GEOIP_URL (default ip-api.com); set GEOIP_DISABLED=1 to turn off."""
+    if not ip or os.getenv("GEOIP_DISABLED") == "1":
+        return None
+    try:
+        import ipaddress
+        addr = ipaddress.ip_address(ip)
+        if addr.is_private or addr.is_loopback or addr.is_link_local:
+            return None
+    except ValueError:
+        return None
+    url = os.getenv("GEOIP_URL", "http://ip-api.com/json/{ip}?fields=status,city,regionName,country").replace("{ip}", ip)
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            data = (await client.get(url)).json()
+        if data.get("status") not in (None, "success"):
+            return None
+        parts = [data.get("city"), data.get("regionName"), data.get("country")]
+        seen = []
+        for part in parts:
+            if part and part not in seen:
+                seen.append(part)
+        return ", ".join(seen) or None
+    except Exception:
+        return None
+
+
+async def _alert_blocked_login(db: Session, user: User, attempt: Dict[str, Any]) -> None:
+    """Tell the account owner someone tried to sign in elsewhere — live on
+    their signed-in devices, by push, and by email."""
+    user_id = int(user.id)
+    await ws_manager.send_to_user(user_id, {"type": "login_attempt_blocked", "data": attempt})
+    where = attempt.get("location") or "an unknown location"
+    device = attempt.get("device_name") or attempt.get("platform") or "another device"
+    try:
+        await push_to_user(db, user_id, "Sign-in blocked", f"Someone tried to sign in on {device} from {where}.")
+    except Exception:
+        pass
+    if getattr(user, "email", None):
+        when = attempt.get("time_display") or attempt.get("time")
+        paragraphs = [
+            "We blocked an attempt to sign in to your Dilarion account because it is already signed in on another device of the same type.",
+            "If this was you, sign out on your current device first and then sign in on the new one. If it was not you, change your login token immediately and inform your administrator.",
+        ]
+        details = [
+            ("Device", device),
+            ("Platform", (attempt.get("platform") or "unknown").capitalize()),
+            ("Location", where),
+            ("IP address", attempt.get("ip") or "unknown"),
+            ("Time", when),
+        ]
+        text = (
+            f"Dear {user.full_name or user.username},\n\n" + "\n\n".join(paragraphs) + "\n\n"
+            + "\n".join(f"{k}: {v}" for k, v in details) + "\n\nKind regards,\nThe Dilarion Team"
+        )
+        await _send_transactional_email(
+            user.email, "Security alert: sign-in attempt blocked", text,
+            _email_template("Sign-in attempt blocked", f"Dear {user.full_name or user.username},", paragraphs,
+                            details=details, eyebrow="Security alert"),
+        )
+
+
 @app.post("/auth/login")
-async def login_user(login_data: UserLogin, db: Session = Depends(get_database_session)):
+async def login_user(login_data: UserLogin, db: Session = Depends(get_database_session), request: Request = None):
     """Login user with username and token - simplified JSON: {username, token}"""
     try:
         user = AdminService.authenticate_user(
@@ -5129,7 +5282,63 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
 
         # Create session
         user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
-        session = SessionService.create_session(db, user_id, "mobile", "mobile_app")
+        ip = _client_ip(request)
+
+        # One signed-in device per platform group: a second phone (or second
+        # desktop) can't sign in while another holds a live session. The
+        # owner is alerted with the device, location and time. Re-signing in
+        # on the same device is always allowed.
+        device_id = (login_data.device_id or "").strip() or None
+        group = _platform_group(login_data.platform)
+        if device_id:
+            now = datetime.now(timezone.utc)
+            live = db.query(UserSession).filter(
+                UserSession.user_id == user_id,
+                UserSession.is_active == True,
+                UserSession.expires_at > now,
+                UserSession.device_id.isnot(None),
+                UserSession.device_id != device_id,
+            ).all()
+            holder = next((x for x in live if _platform_group(x.platform) == group), None)
+            if holder:
+                location = (login_data.location or "").strip() or await _approximate_location(ip)
+                attempt = {
+                    "device_name": (login_data.device_name or "").strip() or None,
+                    "platform": (login_data.platform or "").lower() or None,
+                    "location": location,
+                    "ip": ip,
+                    "time": now.isoformat(),
+                    "time_display": now.strftime("%d %b %Y, %H:%M UTC"),
+                    "signed_in_device": holder.device_name,
+                }
+                AuditService.log_event(
+                    db, user_id, "login_blocked_other_device",
+                    f"Blocked sign-in from {attempt['device_name'] or 'unknown device'} ({attempt['platform'] or 'unknown'}) "
+                    f"at {location or 'unknown location'} [{ip or 'no ip'}]; already signed in on {holder.device_name or 'another device'}",
+                )
+                monitor_record_event("auth", "login", status="error", detail="blocked: already signed in on another device", user_id=user_id)
+                await _alert_blocked_login(db, user, attempt)
+                label = "phone" if group == "mobile" else group
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"This account is already signed in on another {label}"
+                           + (f" ({holder.device_name})" if holder.device_name else "")
+                           + ". Sign out on that device first. The account owner has been notified.",
+                )
+
+        session = SessionService.create_session(db, user_id, "mobile", ip or "mobile_app")
+        if device_id:
+            session.device_id = device_id
+            session.device_name = (login_data.device_name or "").strip() or None
+            session.platform = (login_data.platform or "").lower() or None
+            # Older sessions on this same device are superseded.
+            db.query(UserSession).filter(
+                UserSession.user_id == user_id,
+                UserSession.device_id == device_id,
+                UserSession.id != session.id,
+                UserSession.is_active == True,
+            ).update({"is_active": False, "logout_reason": "replaced"}, synchronize_session=False)
+            db.commit()
 
         monitor_record_event("auth", "login", user_id=user_id)
         return {
@@ -9982,8 +10191,9 @@ async def get_call_history(
                 "other_party_username": str(other_party.username) if other_party else "unknown",
                 "call_type": str(call.call_type),
                 "status": str(call.status),
-                "duration": int(call.duration),
+                "duration": int(call.duration or 0),
                 "started_at": call.started_at.isoformat(),
+                "answered_at": call.answered_at.isoformat() if getattr(call, "answered_at", None) else None,
                 "ended_at": call.ended_at.isoformat() if call.ended_at else None,
                 "is_caller": call.caller_id == user_id
             })
@@ -10785,6 +10995,10 @@ async def reset_with_recovery_code(
     # New credentials are hashed. Unlike the legacy plaintext User.token
     # column, they can never be read back by an administrator.
     setattr(user, 'password_hash', hash_password(payload.new_token))
+    # A reset means the old device may be lost — sign it out everywhere so
+    # the one-device-per-platform rule doesn't lock the owner out.
+    db.query(UserSession).filter(UserSession.user_id == user.id, UserSession.is_active == True).update(
+        {"is_active": False, "logout_reason": "token_reset"}, synchronize_session=False)
     setattr(user, 'token', None)
     new_recovery_code = _issue_recovery_code(user)
     db.commit()

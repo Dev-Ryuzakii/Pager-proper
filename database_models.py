@@ -335,6 +335,11 @@ class UserSession(Base):
     # Connection info
     ip_address = Column(String(45), nullable=True)
     user_agent = Column(String(512), nullable=True)
+    # Which device holds this session — one signed-in device per platform
+    # group (mobile / desktop / web) is enforced at login.
+    device_id = Column(String(128), nullable=True, index=True)
+    device_name = Column(String(120), nullable=True)
+    platform = Column(String(20), nullable=True)
     
     # Session status
     is_active = Column(Boolean, default=True)
@@ -598,7 +603,8 @@ class Call(Base):
     status = Column(String(20), default="initiated")  # initiated, ringing, accepted, declined, ended, missed
     
     # Metadata
-    duration = Column(Integer, default=0)  # duration in seconds
+    duration = Column(Integer, default=0)  # talk time in seconds, counted from answer
+    answered_at = Column(DateTime, nullable=True)  # when the callee picked up
     encryption_key = Column(Text, nullable=True)  # Optional per-call encryption key
     
     # Timestamps
