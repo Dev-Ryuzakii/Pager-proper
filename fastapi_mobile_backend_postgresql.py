@@ -17,8 +17,10 @@ import httpx
 import re
 import smtplib
 import io
+import asyncio
 from email.message import EmailMessage
-from urllib.parse import quote_plus
+from html import escape
+from urllib.parse import quote_plus, unquote_plus
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -181,6 +183,262 @@ def _decode_camera_image(value: str) -> tuple[bytes, str]:
     return content, ext
 
 
+EMAIL_LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "email", "dilarion-logo.png")
+EMAIL_LOGO_CID = "dilarion-logo"
+
+
+def _email_template(
+    title: str,
+    greeting: str,
+    paragraphs: List[str],
+    cta_label: Optional[str] = None,
+    cta_url: Optional[str] = None,
+    details: Optional[List[tuple]] = None,
+    eyebrow: str = "Dilarion",
+    closing: Optional[List[str]] = None,
+    code_label: Optional[str] = None,
+    code: Optional[str] = None,
+    after: Optional[List[str]] = None,
+) -> str:
+    """Branded transactional email. The Dilarion logo is embedded inline (cid:)
+    by _send_email_message, so it shows without the recipient having to
+    allow remote images — set DILARION_LOGO_URL to use a hosted copy instead."""
+    paragraph_html = "".join(
+        f'<p style="margin:0 0 16px;color:#3f3638;font-size:15px;line-height:1.7">{escape(paragraph)}</p>'
+        for paragraph in paragraphs
+    )
+    details_html = ""
+    if details:
+        rows = "".join(
+            f'<tr><td style="padding:8px 14px;color:#7a6e70;font-size:13px;width:38%;border-bottom:1px solid #eee6e1">{escape(str(k))}</td>'
+            f'<td style="padding:8px 14px;color:#24191b;font-size:14px;font-weight:700;border-bottom:1px solid #eee6e1">{escape(str(v))}</td></tr>'
+            for k, v in details
+        )
+        details_html = (
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+            'style="margin:4px 0 22px;background:#faf7f4;border:1px solid #eee6e1;border-radius:10px;border-collapse:separate">'
+            f'{rows}</table>'
+        )
+    cta_html = ""
+    if cta_label and cta_url:
+        cta_html = (
+            '<table role="presentation" cellspacing="0" cellpadding="0" style="margin:6px 0 24px"><tr>'
+            f'<td style="background:#6f1024;border-radius:9px"><a href="{escape(cta_url, quote=True)}" '
+            'style="display:inline-block;color:#ffffff;text-decoration:none;font-weight:700;font-size:15px;padding:14px 26px">'
+            f'{escape(cta_label)}</a></td></tr></table>'
+            '<p style="margin:0 0 18px;color:#7a6e70;font-size:12px;line-height:1.6">'
+            'If the button does not work, copy and paste this address into your browser:<br>'
+            f'<a href="{escape(cta_url, quote=True)}" style="color:#6f1024;word-break:break-all">{escape(cta_url)}</a></p>'
+        )
+    code_html = ""
+    if code:
+        code_html = (
+            '<div style="margin:4px 0 22px;padding:16px 18px;background:#310a13;border-radius:10px">'
+            f'<div style="color:#e9cfd4;font-size:11px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase">{escape(code_label or "Code")}</div>'
+            f'<div style="margin-top:8px;color:#ffffff;font-family:Menlo,Consolas,monospace;font-size:17px;font-weight:700;letter-spacing:.5px;word-break:break-all">{escape(code)}</div>'
+            '</div>'
+        )
+    after_html = "".join(
+        f'<p style="margin:0 0 16px;color:#3f3638;font-size:15px;line-height:1.7">{escape(line)}</p>' for line in (after or [])
+    )
+    closing_lines = closing if closing is not None else ["Kind regards,", "The Dilarion Team"]
+    closing_html = (
+        '<p style="margin:10px 0 0;color:#3f3638;font-size:15px;line-height:1.6">'
+        + "<br>".join(escape(line) for line in closing_lines) + "</p>"
+    ) if closing_lines else ""
+    logo_src = os.getenv("DILARION_LOGO_URL", "").strip() or f"cid:{EMAIL_LOGO_CID}"
+    brand = (
+        f'<img src="{escape(logo_src, quote=True)}" width="44" height="44" alt="Dilarion" '
+        'style="display:block;border:0;border-radius:10px">'
+    )
+    year = datetime.now(timezone.utc).year
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{escape(title)}</title></head>
+<body style="margin:0;padding:0;background:#f4f1ec;font-family:Arial,Helvetica,sans-serif;color:#24191b">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0">{escape(title)}</div>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f4f1ec;padding:32px 16px">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;background:#ffffff;border:1px solid #e2dad4;border-radius:14px;overflow:hidden">
+        <tr><td style="background:#310a13;padding:20px 30px">
+          <table role="presentation" cellspacing="0" cellpadding="0"><tr>
+            <td>{brand}</td>
+            <td style="padding-left:12px;color:#ffffff;font-size:20px;font-weight:800;letter-spacing:.3px">Dilarion</td>
+          </tr></table>
+        </td></tr>
+        <tr><td style="padding:34px 30px 30px">
+          <div style="color:#9d1d36;font-size:11px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase">{escape(eyebrow)}</div>
+          <h1 style="margin:10px 0 22px;font-size:24px;line-height:1.3;color:#24191b">{escape(title)}</h1>
+          <p style="margin:0 0 16px;color:#24191b;font-size:15px">{escape(greeting)}</p>
+          {paragraph_html}{details_html}{code_html}{cta_html}{after_html}{closing_html}
+        </td></tr>
+        <tr><td style="padding:18px 30px;background:#faf7f4;border-top:1px solid #eee6e1">
+          <p style="margin:0;color:#8a7e80;font-size:12px;line-height:1.6">
+            This is an automated message from Dilarion regarding your account. If you were not expecting it, no action is required.
+          </p>
+        </td></tr>
+      </table>
+      <p style="color:#9a8e90;font-size:11px;margin:16px 0 0">&copy; {year} Dilarion. Secure communication for approved organizations.</p>
+    </td></tr>
+  </table>
+</body></html>"""
+
+
+def _send_email_message(to_email: str, subject: str, text_body: str, html_body: Optional[str] = None) -> bool:
+    """Send through configured SMTP. RESEND_API_KEY enables Resend defaults automatically."""
+    resend_key = os.getenv("RESEND_API_KEY")
+    smtp_host = os.getenv("SMTP_HOST") or ("smtp.resend.com" if resend_key else None)
+    smtp_user = os.getenv("SMTP_USERNAME") or ("resend" if resend_key else None)
+    smtp_password = os.getenv("SMTP_PASSWORD") or resend_key
+    from_email = os.getenv("SMTP_FROM") or os.getenv("RESEND_FROM_EMAIL")
+    if not smtp_host or not smtp_user or not smtp_password or not from_email:
+        logger.warning("Email not sent to %s: SMTP/Resend configuration is incomplete", to_email)
+        return False
+
+    port = int(os.getenv("SMTP_PORT", "465" if smtp_host == "smtp.resend.com" else "587"))
+    use_ssl = os.getenv("SMTP_SSL", "1" if port in (465, 2465) else "0") == "1"
+    use_starttls = os.getenv("SMTP_STARTTLS", "0" if use_ssl else "1") == "1"
+    # Deliverability: a named sender, a real Message-ID/Date on the sending
+    # domain, a plain-text part alongside the HTML, and no tracking pixels.
+    # Inbox placement still depends on SPF/DKIM/DMARC for that domain.
+    from email.utils import formataddr, formatdate, make_msgid, parseaddr
+    sender_name, sender_addr = parseaddr(from_email)
+    if not sender_name:
+        sender_name = os.getenv("SMTP_FROM_NAME", "Dilarion")
+    sender_domain = sender_addr.split("@", 1)[-1] if "@" in sender_addr else None
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = formataddr((sender_name, sender_addr))
+    msg["To"] = to_email
+    msg["Date"] = formatdate(localtime=False)
+    msg["Message-ID"] = make_msgid(domain=sender_domain)
+    reply_to = os.getenv("SMTP_REPLY_TO") or os.getenv("SUPPORT_EMAIL")
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    msg["Auto-Submitted"] = "auto-generated"
+    msg.set_content(text_body)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
+        if f"cid:{EMAIL_LOGO_CID}" in html_body and os.path.exists(EMAIL_LOGO_PATH):
+            with open(EMAIL_LOGO_PATH, "rb") as logo_file:
+                msg.get_payload()[-1].add_related(
+                    logo_file.read(), maintype="image", subtype="png",
+                    cid=f"<{EMAIL_LOGO_CID}>", filename="dilarion-logo.png",
+                )
+
+    smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+    with smtp_class(smtp_host, port, timeout=20) as server:
+        if use_starttls:
+            server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.send_message(msg)
+    logger.info("Transactional email queued through SMTP for %s: %s", to_email, subject)
+    return True
+
+
+async def _send_transactional_email(to_email: str, subject: str, text_body: str, html_body: Optional[str] = None) -> bool:
+    try:
+        return await asyncio.to_thread(_send_email_message, to_email, subject, text_body, html_body)
+    except Exception as exc:
+        logger.error("Transactional email failed for %s: %s", to_email, exc)
+        return False
+
+
+async def _email_organization_request_submitted(request_id: int, organization_name: str, contact_name: str, contact_email: str) -> None:
+    subject = f"We received your Dilarion request — {organization_name}"
+    paragraphs = [
+        f"Thank you for submitting an organization account request for {organization_name}.",
+        f"Your request reference is #{request_id}. A Dilarion administrator will review the information and email you when a decision is made.",
+        "No staff accounts have been created yet. Staff can only be added by a Dilarion administrator after the organization is approved.",
+    ]
+    await _send_transactional_email(
+        contact_email,
+        subject,
+        f"Hello {contact_name},\n\n" + "\n\n".join(paragraphs),
+        _email_template("Request received", f"Hello {contact_name},", paragraphs),
+    )
+    admin_email = os.getenv("ADMIN_NOTIFICATION_EMAIL")
+    if admin_email:
+        portal_url = os.getenv("DILARION_ADMIN_URL", "").rstrip("/")
+        admin_paragraphs = [
+            f"{contact_name} submitted a new organization account request for {organization_name}.",
+            f"Request reference: #{request_id}. Review it from the Organizations page in the admin console.",
+        ]
+        await _send_transactional_email(
+            admin_email,
+            f"New Dilarion organization request — {organization_name}",
+            "\n\n".join(admin_paragraphs),
+            _email_template("New organization request", "Hello administrator,", admin_paragraphs, "Review request", portal_url) if portal_url else _email_template("New organization request", "Hello administrator,", admin_paragraphs),
+        )
+
+
+async def _email_organization_decision(
+    approved: bool,
+    organization_name: str,
+    contact_name: str,
+    contact_email: str,
+    username: Optional[str] = None,
+    admin_note: Optional[str] = None,
+) -> None:
+    if approved:
+        portal_url = os.getenv("DILARION_ORG_PORTAL_URL", os.getenv("DILARION_WEB_URL", "")).rstrip("/")
+        paragraphs = [
+            f"Your organization account request for {organization_name} has been approved.",
+            f"Your read-only portal username is {username}. Sign in using the password your organization chose when submitting the request.",
+            "For your security, keep your organization credentials confidential.",
+        ]
+        if admin_note:
+            paragraphs.append(f"Administrator note: {admin_note}")
+        await _send_transactional_email(
+            contact_email,
+            f"Your Dilarion organization account is approved — {organization_name}",
+            f"Hello {contact_name},\n\n" + "\n\n".join(paragraphs),
+            _email_template("Your organization is approved", f"Hello {contact_name},", paragraphs, "Open organization portal", portal_url) if portal_url else _email_template("Your organization is approved", f"Hello {contact_name},", paragraphs),
+        )
+    else:
+        paragraphs = [
+            f"Your organization account request for {organization_name} was not approved at this time.",
+            f"Administrator note: {admin_note}" if admin_note else "Contact Dilarion support if you need clarification or would like to submit corrected information.",
+        ]
+        await _send_transactional_email(
+            contact_email,
+            f"Update on your Dilarion request — {organization_name}",
+            f"Hello {contact_name},\n\n" + "\n\n".join(paragraphs),
+            _email_template("Request update", f"Hello {contact_name},", paragraphs),
+        )
+
+
+async def _email_admin_account_created(email: str, username: str, role: str) -> None:
+    admin_url = os.getenv("DILARION_ADMIN_URL", "").rstrip("/")
+    role_label = "Administrator" if role == "admin" else "Operator"
+    paragraphs = [
+        f"An {role_label.lower()} account has been created for you on the Dilarion administration console.",
+        "Please sign in with the username below and the password provided to you separately by your account administrator. You will be asked to keep these credentials confidential.",
+        "For your security, change your password after your first sign-in and do not forward this email.",
+    ]
+    details = [("Username", username), ("Role", role_label)]
+    text = (
+        "Dear colleague,\n\n" + "\n\n".join(paragraphs)
+        + f"\n\nUsername: {username}\nRole: {role_label}"
+        + (f"\nAdministration console: {admin_url}" if admin_url else "")
+        + "\n\nKind regards,\nThe Dilarion Team"
+    )
+    await _send_transactional_email(
+        email,
+        f"Your Dilarion {role_label.lower()} account",
+        text,
+        _email_template(
+            f"Your {role_label.lower()} account is ready",
+            "Dear colleague,",
+            paragraphs,
+            "Open administration console" if admin_url else None,
+            admin_url or None,
+            details=details,
+            eyebrow="Administration access",
+        ),
+    )
+
+
 async def _deliver_invitation(user_id: int, invitation_code: str, purpose: str = "invite") -> None:
     """Send both channels and persist channel-level status. Provider secrets
     come exclusively from environment variables and never enter API responses."""
@@ -194,37 +452,60 @@ async def _deliver_invitation(user_id: int, invitation_code: str, purpose: str =
             return
         organization = db.query(Organization).filter(Organization.id == user.organization_id).first()
         org_name = organization.name if organization else "your organization"
-        base_url = os.getenv("DILARION_APP_URL", "dilarion://activate").rstrip("/")
-        link = f"{base_url}?code={quote_plus(invitation_code)}"
-        action = "asked you to reset your Dilarion login" if purpose == "reset" else "invited you to Dilarion"
+        name = user.full_name or user.username
+        is_reset = purpose == "reset"
+        # Activation happens in the Dilarion app (no web flow yet): the email
+        # carries the one-time activation code the user pastes there. No
+        # dilarion:// link — mail clients strip or flag custom-scheme links.
+        if is_reset:
+            subject = "Reset your Dilarion login token"
+            title = "Reset your login token"
+            paragraphs = [
+                f"A request to reset the login token for your Dilarion account with {org_name} has been approved.",
+                "Open the Dilarion app, select \u201cActivate account\u201d on the sign-in screen and enter the activation code below to choose a new login token. Your previous token will no longer be valid once the reset is complete.",
+            ]
+        else:
+            subject = f"Your Dilarion account for {org_name}"
+            title = "Activate your Dilarion account"
+            paragraphs = [
+                f"{org_name} has created a Dilarion account for you. Dilarion is the secure messaging and calling platform used by your organization.",
+                "To activate your account, install and open the Dilarion app, select \u201cActivate account\u201d on the sign-in screen and enter the activation code below. You will then choose a personal login token and complete your profile.",
+            ]
+        details = [("Organization", org_name), ("Username", user.username), ("Code valid for", "72 hours")]
+        closing_note = "For your security, keep your activation code and login token private and do not forward this email."
         body = (
-            f"Hello {user.full_name or user.username},\n\n{org_name} {action}. "
-            f"Open {link} and create your private login token. "
-            "Administrators cannot view that token. This link expires in 72 hours."
+            f"Dear {name},\n\n" + "\n\n".join(paragraphs) + "\n\n"
+            f"Organization: {org_name}\nUsername: {user.username}\n"
+            f"Activation code: {invitation_code}\n\n"
+            f"This code is valid for 72 hours. {closing_note}\n\n"
+            "Kind regards,\nThe Dilarion Team"
+        )
+        sms_body = (
+            f"Dilarion: {'reset your login token' if is_reset else f'your {org_name} account is ready'}. "
+            f"Username: {user.username}. In the Dilarion app choose Activate account and enter code: {invitation_code} (valid 72h)"
         )
 
-        smtp_host = os.getenv("SMTP_HOST")
-        if smtp_host:
+        if user.email:
             try:
-                msg = EmailMessage()
-                msg["Subject"] = f"Your {org_name} Dilarion {'password reset' if purpose == 'reset' else 'invitation'}"
-                msg["From"] = os.getenv("SMTP_FROM", "no-reply@dilarion.app")
-                msg["To"] = user.email
-                msg.set_content(body)
-                port = int(os.getenv("SMTP_PORT", "587"))
-                with smtplib.SMTP(smtp_host, port, timeout=15) as server:
-                    if os.getenv("SMTP_STARTTLS", "1") == "1":
-                        server.starttls()
-                    smtp_user = os.getenv("SMTP_USERNAME")
-                    if smtp_user:
-                        server.login(smtp_user, os.getenv("SMTP_PASSWORD", ""))
-                    server.send_message(msg)
-                user.email_invite_sent_at = datetime.now(timezone.utc)
+                sent = await _send_transactional_email(
+                    user.email,
+                    subject,
+                    body,
+                    _email_template(
+                        title, f"Dear {name},", paragraphs,
+                        details=details, eyebrow="Account security" if is_reset else "Account activation",
+                        code_label="Activation code", code=invitation_code, after=[closing_note],
+                    ),
+                )
+                if sent:
+                    user.email_invite_sent_at = datetime.now(timezone.utc)
+                else:
+                    errors["email"] = "delivery_failed"
             except Exception as exc:
                 logger.error("Invitation email failed for user %s: %s", user_id, exc)
                 errors["email"] = "delivery_failed"
         else:
-            errors["email"] = "smtp_not_configured"
+            errors["email"] = "email_missing"
 
         twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
         twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
@@ -235,7 +516,7 @@ async def _deliver_invitation(user_id: int, invitation_code: str, purpose: str =
                     response = await client.post(
                         f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json",
                         auth=(twilio_sid, twilio_token),
-                        data={"From": twilio_from, "To": user.phone_number, "Body": body},
+                        data={"From": twilio_from, "To": user.phone_number, "Body": sms_body},
                     )
                     response.raise_for_status()
                 user.sms_invite_sent_at = datetime.now(timezone.utc)
@@ -4391,6 +4672,7 @@ async def get_status(db: Session = Depends(get_database_session)):
 @app.post("/organization-requests", status_code=202)
 async def submit_organization_request(
     payload: OrganizationRequestCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_database_session),
 ):
     """Public intake for a read-only organization portal account."""
@@ -4420,6 +4702,13 @@ async def submit_organization_request(
     db.add(request_row)
     db.commit()
     db.refresh(request_row)
+    background_tasks.add_task(
+        _email_organization_request_submitted,
+        int(request_row.id),
+        request_row.organization_name,
+        request_row.contact_name,
+        request_row.contact_email,
+    )
     return {"request_id": int(request_row.id), "status": "pending", "message": "Organization account request submitted for review"}
 
 
@@ -4452,6 +4741,7 @@ async def list_organization_requests(
 async def approve_organization_request(
     request_id: int,
     decision: OrganizationRequestDecision,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_admin_user),
     db: Session = Depends(get_database_session),
 ):
@@ -4515,6 +4805,15 @@ async def approve_organization_request(
     row.organization_id = organization.id
     db.commit()
     AuditService.log_event(db, int(current_user.id), "organization_approved", f"Approved organization request {request_id}")
+    background_tasks.add_task(
+        _email_organization_decision,
+        True,
+        row.organization_name,
+        row.contact_name,
+        row.contact_email,
+        organization_account.username,
+        decision.admin_note,
+    )
     return {
         "status": "approved",
         "organization": {"id": int(organization.id), "name": organization.name, "slug": organization.slug},
@@ -4527,6 +4826,7 @@ async def approve_organization_request(
 async def reject_organization_request(
     request_id: int,
     decision: OrganizationRequestDecision,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_admin_user),
     db: Session = Depends(get_database_session),
 ):
@@ -4540,6 +4840,15 @@ async def reject_organization_request(
     row.reviewed_at = datetime.now(timezone.utc)
     row.reviewed_by_admin_id = current_user.id
     db.commit()
+    background_tasks.add_task(
+        _email_organization_decision,
+        False,
+        row.organization_name,
+        row.contact_name,
+        row.contact_email,
+        None,
+        decision.admin_note,
+    )
     return {"status": "rejected"}
 
 
@@ -4630,6 +4939,7 @@ async def admin_list_organizations(
 @app.post("/admin/organizations", status_code=201)
 async def admin_create_organization(
     payload: AdminCreateOrganization,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_admin_user),
     db: Session = Depends(get_database_session),
 ):
@@ -4653,6 +4963,20 @@ async def admin_create_organization(
     db.commit()
     db.refresh(organization)
     AuditService.log_event(db, int(current_user.id), "organization_created", f"Created organization {organization.id}")
+    background_tasks.add_task(
+        _send_transactional_email,
+        organization.contact_email,
+        f"Your organization has been created on Dilarion — {organization.name}",
+        f"Hello {organization.contact_name},\n\n{organization.name} has been created on Dilarion. A Dilarion administrator can now provision staff under the organization.",
+        _email_template(
+            "Your organization is ready",
+            f"Hello {organization.contact_name},",
+            [
+                f"{organization.name} has been created on Dilarion.",
+                "A Dilarion administrator can now provision staff under your organization. Each staff member will receive their own private activation code by email and SMS to set up the Dilarion app.",
+            ],
+        ),
+    )
     return {"id": int(organization.id), "name": organization.name, "slug": organization.slug}
 
 
@@ -4712,10 +5036,22 @@ async def admin_add_organization_staff(
     return {"organization_id": organization_id, "invited_user_count": len(invitations), "message": "Staff invitations queued by email and SMS"}
 
 
+@app.get("/brand/dilarion-logo.png", include_in_schema=False)
+async def brand_logo():
+    """Public logo for emails/pages (set DILARION_LOGO_URL to this to host it remotely)."""
+    if not os.path.exists(EMAIL_LOGO_PATH):
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(EMAIL_LOGO_PATH, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.post("/auth/activate")
 async def activate_invitation(payload: InvitationActivation, db: Session = Depends(get_database_session)):
     """Consume an invite and let the user privately choose their login token."""
-    digest = _invitation_digest(payload.invitation_code.strip())
+    # Accept the bare code or a pasted "...?code=<code>" link.
+    raw_code = payload.invitation_code.strip()
+    if "code=" in raw_code:
+        raw_code = unquote_plus(raw_code.split("code=", 1)[1].split("&", 1)[0])
+    digest = _invitation_digest(raw_code)
     user = db.query(User).filter(User.invitation_token_hash == digest, User.is_active == True).first()
     if not user or user.invitation_accepted_at:
         raise HTTPException(status_code=400, detail="Invitation is invalid or has already been used")
@@ -11244,18 +11580,23 @@ async def admin_get_media(
 class CreateOperatorRequest(BaseModel):
     username: str
     phone_number: str
+    email: str = Field(..., min_length=3, max_length=255)
     password: str
     role: str = "operator"
 
 @app.post("/admin/operators")
 async def create_operator(
     data: CreateOperatorRequest,
+    background_tasks: BackgroundTasks,
     current_admin: User = Depends(get_admin_only),
     db: Session = Depends(get_database_session)
 ):
     """Admin creates an operator account"""
+    email = data.email.strip().lower()
+    if not _valid_email(email):
+        raise HTTPException(status_code=400, detail="Invalid email address")
     existing = db.query(User).filter(
-        (User.username == data.username) | (User.phone_number == data.phone_number)
+        (User.username == data.username) | (User.phone_number == data.phone_number) | (User.email == email)
     ).first()
     if existing:
         raise HTTPException(status_code=400, detail="Username or phone already exists")
@@ -11265,6 +11606,7 @@ async def create_operator(
     op = User(
         username=data.username,
         phone_number=data.phone_number,
+        email=email,
         password_hash=hash_password(data.password),
         is_admin=True,
         admin_role=op_role,
@@ -11275,7 +11617,8 @@ async def create_operator(
     db.add(op)
     db.commit()
     db.refresh(op)
-    return {"id": op.id, "username": op.username, "admin_role": op.admin_role}
+    background_tasks.add_task(_email_admin_account_created, op.email, op.username, op.admin_role)
+    return {"id": op.id, "username": op.username, "email": op.email, "admin_role": op.admin_role, "email_notification": "queued"}
 
 @app.get("/admin/operators")
 async def list_operators(
@@ -11284,7 +11627,7 @@ async def list_operators(
 ):
     """List all operators"""
     ops = db.query(User).filter(User.is_admin == True, User.admin_role.in_(["operator", "admin"])).all()
-    return [{"id": u.id, "username": u.username, "phone_number": u.phone_number,
+    return [{"id": u.id, "username": u.username, "phone_number": u.phone_number, "email": u.email,
              "admin_role": u.admin_role, "is_active": u.is_active,
              "can_approve_duress_wipe": bool(u.can_approve_duress_wipe),
              "monitored_services": u.monitored_services or [],
@@ -11292,7 +11635,8 @@ async def list_operators(
              "last_login": str(u.last_login) if u.last_login else None} for u in ops]
 
 class UpdateOperatorRequest(BaseModel):
-    new_username: str
+    new_username: Optional[str] = Field(None, min_length=3, max_length=50)
+    email: Optional[str] = Field(None, min_length=3, max_length=255)
 
 @app.patch("/admin/operators/{username}")
 async def update_operator_username(
@@ -11301,7 +11645,7 @@ async def update_operator_username(
     current_admin: User = Depends(get_admin_only),
     db: Session = Depends(get_database_session)
 ):
-    """Admin/superadmin edits username of operator or admin"""
+    """Admin/superadmin edits the username or email of an operator/admin."""
     op = db.query(User).filter(User.username == username).first()
     if not op:
         raise HTTPException(status_code=404, detail="User not found")
@@ -11309,12 +11653,23 @@ async def update_operator_username(
         raise HTTPException(status_code=404, detail="User not found")
     if getattr(op, 'admin_role', None) == 'admin' and getattr(current_admin, 'admin_role', None) != 'superadmin':
         raise HTTPException(status_code=403, detail="Only superadmin can edit admin usernames")
-    existing = db.query(User).filter(User.username == data.new_username).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Username already taken")
-    op.username = data.new_username
+    if data.new_username and data.new_username != op.username:
+        existing = db.query(User).filter(User.username == data.new_username).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Username already taken")
+        op.username = data.new_username.strip()
+    if data.email is not None:
+        email = data.email.strip().lower()
+        if not _valid_email(email):
+            raise HTTPException(status_code=400, detail="Invalid email address")
+        existing_email = db.query(User).filter(User.email == email, User.id != op.id).first()
+        if existing_email:
+            raise HTTPException(status_code=400, detail="Email address already in use")
+        op.email = email
+    if not data.new_username and data.email is None:
+        raise HTTPException(status_code=400, detail="Provide a username or email to update")
     db.commit()
-    return {"status": "updated", "username": data.new_username}
+    return {"status": "updated", "username": op.username, "email": op.email}
 
 @app.delete("/admin/operators/{username}")
 async def delete_operator(

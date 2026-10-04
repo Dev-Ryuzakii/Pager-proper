@@ -35,8 +35,18 @@ lists enforce the user's organization boundary.
 
 ## Notification configuration
 
-Email uses SMTP (`SMTP_HOST`, `SMTP_PORT`, `SMTP_STARTTLS`, `SMTP_USERNAME`,
-`SMTP_PASSWORD`, `SMTP_FROM`). SMS uses Twilio
+Email uses Resend SMTP. Set `RESEND_API_KEY` and `RESEND_FROM_EMAIL`; the
+backend automatically uses `smtp.resend.com`, or set the explicit `SMTP_*`
+values shown in `.env.example`. The sending domain in `SMTP_FROM` must be
+verified in Resend. `ADMIN_NOTIFICATION_EMAIL` optionally receives new-request
+alerts. `DILARION_ORG_PORTAL_URL` is used in approval emails and
+`DILARION_ADMIN_URL` in administrator alerts.
+
+Email is queued for request submission, approval, rejection, direct
+organization creation, every staff invitation, and token reset. Delivery
+failure is logged without rolling back the organization or user transaction.
+
+SMS uses Twilio
 (`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`). Set
 `DILARION_APP_URL` to the mobile app's activation deep-link or HTTPS URL.
 

@@ -53,6 +53,7 @@ def test_organization_approval_activation_and_camera_onboarding(tmp_path, monkey
     admin = _admin(db)
 
     async def scenario():
+        submission_background = BackgroundTasks()
         submitted = await api.submit_organization_request(
             api.OrganizationRequestCreate(
                 organization_name="Acme Ltd",
@@ -62,11 +63,15 @@ def test_organization_approval_activation_and_camera_onboarding(tmp_path, monkey
                 username="acme-portal",
                 password="AcmePortalSecret!",
             ),
+            submission_background,
             db,
         )
+        assert len(submission_background.tasks) == 1
+        approval_background = BackgroundTasks()
         approved = await api.approve_organization_request(
-            submitted["request_id"], api.OrganizationRequestDecision(), admin, db
+            submitted["request_id"], api.OrganizationRequestDecision(), approval_background, admin, db
         )
+        assert len(approval_background.tasks) == 1
         assert "password" not in repr(approved)
         assert approved["organization_account"]["access"] == "read_only"
 
