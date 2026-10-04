@@ -5380,7 +5380,7 @@ async def logout_user(current_user: User = Depends(get_current_user),
 
 # ── Multi-device linking ────────────────────────────────────────────────────────
 
-VALID_PLATFORMS = {"ios", "android", "desktop"}
+VALID_PLATFORMS = {"ios", "android", "desktop", "web"}  # web = browser app at web.dilarion.xyz
 LINK_REQUEST_TTL_MINUTES = 5
 
 def _link_request_expired(req) -> bool:
