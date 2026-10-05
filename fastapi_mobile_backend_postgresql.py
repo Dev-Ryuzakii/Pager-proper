@@ -829,6 +829,17 @@ class OrganizationAccountLogin(BaseModel):
     password: str = Field(..., min_length=8, max_length=128)
 
 
+class OrganizationForgotPassword(BaseModel):
+    # Username or the organization's contact email — either identifies the account.
+    identifier: str = Field(..., min_length=3, max_length=120)
+
+
+class OrganizationResetPassword(BaseModel):
+    identifier: str = Field(..., min_length=3, max_length=120)
+    code: str = Field(..., min_length=4, max_length=12)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
 class OrganizationRequestDecision(BaseModel):
     admin_note: Optional[str] = Field(None, max_length=2000)
 
@@ -5763,6 +5774,89 @@ async def organization_account_login(
         "access": "invite",
         "organization": {"id": int(organization.id), "name": organization.name} if organization else None,
     }
+
+
+def _find_org_portal_account(db: Session, identifier: str) -> Optional[User]:
+    """Resolve a portal (viewer) account by its username or by its
+    organization's contact email."""
+    ident = (identifier or "").strip().lower()
+    account = db.query(User).filter(
+        User.username == ident,
+        User.organization_role == "viewer",
+        User.is_active == True,
+        User.suspended_at.is_(None),
+    ).first()
+    if account:
+        return account
+    org = db.query(Organization).filter(func.lower(Organization.contact_email) == ident).first()
+    if not org:
+        return None
+    return db.query(User).filter(
+        User.organization_id == org.id,
+        User.organization_role == "viewer",
+        User.is_active == True,
+        User.suspended_at.is_(None),
+    ).first()
+
+
+@app.post("/organization/auth/forgot-password", status_code=202)
+async def organization_forgot_password(
+    payload: OrganizationForgotPassword,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_database_session),
+):
+    """Start a self-service reset for an organization's OWN portal login. A
+    6-digit code is emailed to the organization's contact email. Always
+    returns 202 so the endpoint can't be used to probe which accounts exist."""
+    account = _find_org_portal_account(db, payload.identifier)
+    if account:
+        organization = db.query(Organization).filter(Organization.id == account.organization_id).first()
+        to_email = organization.contact_email if organization else None
+        if to_email:
+            code = f"{secrets.randbelow(1000000):06d}"
+            account.invitation_token_hash = _invitation_digest(code)
+            account.invitation_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+            db.commit()
+            org_name = organization.name if organization else "your organization"
+            paragraphs = [
+                f"We received a request to reset the password for the Dilarion organization portal of {org_name}.",
+                "Enter the 6-digit code below on the portal's reset screen to choose a new password. The code is valid for 1 hour. If you did not request this, you can ignore this email — your password will not change.",
+            ]
+            background_tasks.add_task(
+                _send_transactional_email,
+                to_email,
+                "Reset your Dilarion organization portal password",
+                f"Hello,\n\n" + "\n\n".join(paragraphs) + f"\n\nReset code: {code}\n\nKind regards,\nThe Dilarion Team",
+                _email_template(
+                    "Reset your portal password", "Hello,", paragraphs,
+                    eyebrow="Portal security", code_label="Reset code", code=code,
+                    after=["For your security, do not share this code with anyone."],
+                ),
+            )
+    return {"status": "sent", "message": "If the account exists, a reset code has been emailed to the organization contact address."}
+
+
+@app.post("/organization/auth/reset-password")
+async def organization_reset_password(
+    payload: OrganizationResetPassword,
+    db: Session = Depends(get_database_session),
+):
+    """Complete a portal password reset with the emailed code, then sign the
+    account out everywhere so any old session is invalidated."""
+    account = _find_org_portal_account(db, payload.identifier)
+    now = datetime.now(timezone.utc)
+    expires = getattr(account, "invitation_expires_at", None) if account else None
+    if expires is not None and expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if (not account or not account.invitation_token_hash or expires is None or expires < now
+            or account.invitation_token_hash != _invitation_digest(payload.code.strip())):
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+    account.password_hash = hash_password(payload.new_password)
+    account.invitation_token_hash = None
+    account.invitation_expires_at = None
+    db.query(UserSession).filter(UserSession.user_id == account.id).delete()
+    db.commit()
+    return {"status": "reset", "message": "Your portal password has been reset. You can now sign in with the new password."}
 
 
 @app.get("/organization/me")
