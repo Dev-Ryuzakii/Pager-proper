@@ -85,6 +85,7 @@ from link_preview import fetch_link_preview
 from service_monitor import (
     record_event as monitor_record_event,
     SERVICE_NAMES as MONITOR_SERVICE_NAMES,
+    allowed_service_names as monitor_allowed_service_names,
     service_allowed as monitor_service_allowed,
     subscribe as monitor_subscribe,
     unsubscribe as monitor_unsubscribe,
@@ -1242,6 +1243,112 @@ class UserService:
             detail="Only administrators can delete user accounts."
         )
 
+_AI_DECOY_CONTENT_TYPES = {"encrypted", "gif", "sticker"}
+
+
+def _organization_name(db: Session, user: User) -> str:
+    organization_id = getattr(user, "organization_id", None)
+    if not organization_id:
+        return "Dilarion workspace"
+    organization = db.query(Organization).filter(Organization.id == organization_id).first()
+    return str(getattr(organization, "name", "") or "Dilarion workspace")
+
+
+def _recent_decoy_context(rows: List[Message], sender_id: int) -> List[Dict[str, str]]:
+    """Return oldest-to-newest safe visible history from the sender's viewpoint."""
+    result: List[Dict[str, str]] = []
+    for row in reversed(rows):
+        text = str(getattr(row, "decoy_content", "") or "").strip()
+        if text:
+            result.append({
+                "speaker": "sender" if int(getattr(row, "sender_id", 0)) == sender_id else "coworker",
+                "text": text,
+            })
+    return result
+
+
+def _direct_decoy_context(db: Session, sender: User, recipient: User) -> Dict[str, Any]:
+    sender_id = int(getattr(sender, "id", 0))
+    recipient_id = int(getattr(recipient, "id", 0))
+    recent = db.query(Message).filter(
+        Message.group_id.is_(None),
+        Message.conference_id.is_(None),
+        or_(
+            and_(Message.sender_id == sender_id, Message.recipient_id == recipient_id),
+            and_(Message.sender_id == recipient_id, Message.recipient_id == sender_id),
+        ),
+        Message.is_deleted == False,
+    ).order_by(Message.timestamp.desc()).limit(6).all()
+    return {
+        "organization": _organization_name(db, sender),
+        "sender_department": getattr(sender, "department", None) or "general operations",
+        "recipient_department": getattr(recipient, "department", None) or "another department",
+        "conversation_type": "direct coworker conversation",
+        "recent_messages": _recent_decoy_context(recent, sender_id),
+    }
+
+
+def _group_decoy_context(db: Session, sender: User, group_id: int) -> Dict[str, Any]:
+    sender_id = int(getattr(sender, "id", 0))
+    group = db.query(Group).filter(Group.id == group_id).first()
+    recent = db.query(Message).filter(
+        Message.group_id == group_id,
+        Message.is_deleted == False,
+    ).order_by(Message.timestamp.desc()).limit(6).all()
+    group_name = str(getattr(group, "name", "") or "team")[:80]
+    return {
+        "organization": _organization_name(db, sender),
+        "sender_department": getattr(sender, "department", None) or "general operations",
+        "recipient_department": "cross-functional team",
+        "conversation_type": f"work group: {group_name}",
+        "recent_messages": _recent_decoy_context(recent, sender_id),
+    }
+
+
+def _conference_decoy_context(db: Session, sender: User, conference_id: int) -> Dict[str, Any]:
+    sender_id = int(getattr(sender, "id", 0))
+    recent = db.query(Message).filter(
+        Message.conference_id == conference_id,
+        Message.is_deleted == False,
+    ).order_by(Message.timestamp.desc()).limit(6).all()
+    return {
+        "organization": _organization_name(db, sender),
+        "sender_department": getattr(sender, "department", None) or "general operations",
+        "recipient_department": "meeting participants",
+        "conversation_type": "internal meeting chat",
+        "recent_messages": _recent_decoy_context(recent, sender_id),
+    }
+
+
+def _message_decoy_context(db: Session, sender: User, message: Message) -> Dict[str, Any]:
+    if getattr(message, "group_id", None):
+        return _group_decoy_context(db, sender, int(message.group_id))
+    if getattr(message, "conference_id", None):
+        return _conference_decoy_context(db, sender, int(message.conference_id))
+    recipient = db.query(User).filter(User.id == message.recipient_id).first()
+    if recipient:
+        return _direct_decoy_context(db, sender, recipient)
+    return {
+        "organization": _organization_name(db, sender),
+        "sender_department": getattr(sender, "department", None) or "general operations",
+        "recipient_department": "another department",
+        "conversation_type": "direct coworker conversation",
+        "recent_messages": [],
+    }
+
+
+def _server_decoy(
+    encrypted_content: str,
+    context: Dict[str, Any],
+    content_type: str,
+    client_decoy: Optional[str],
+) -> str:
+    """The server owns protected-message decoys; system cards keep their label."""
+    if content_type not in _AI_DECOY_CONTENT_TYPES and client_decoy:
+        return client_decoy
+    return FakeTextGenerator.generate_decoy_text_for_message(encrypted_content, context=context)
+
+
 class MessageService:
     """Service class for message operations"""
     
@@ -1253,7 +1360,12 @@ class MessageService:
         if not sender or not recipient or not _same_organization(sender, recipient):
             raise HTTPException(status_code=404, detail="Recipient not found")
 
-        decoy_text = decoy_content if decoy_content else FakeTextGenerator.generate_decoy_text_for_message(message_content)
+        decoy_text = _server_decoy(
+            message_content,
+            _direct_decoy_context(db, sender, recipient),
+            content_type,
+            decoy_content,
+        )
 
         expires_at = None
         auto_delete = False
@@ -1305,7 +1417,15 @@ class MessageService:
         if not membership:
             raise HTTPException(status_code=403, detail="You are not a member of this group")
 
-        decoy_text = decoy_content if decoy_content else FakeTextGenerator.generate_decoy_text_for_message(message_content)
+        sender = db.query(User).filter(User.id == sender_id, User.is_active == True).first()
+        if not sender:
+            raise HTTPException(status_code=404, detail="Sender not found")
+        decoy_text = _server_decoy(
+            message_content,
+            _group_decoy_context(db, sender, group_id),
+            content_type,
+            decoy_content,
+        )
 
         expires_at = None
         auto_delete = False
@@ -1353,7 +1473,15 @@ class MessageService:
         if not membership:
             raise HTTPException(status_code=403, detail="Not an active participant in this conference")
 
-        decoy_text = decoy_content if decoy_content else FakeTextGenerator.generate_decoy_text_for_message(message_content)
+        sender = db.query(User).filter(User.id == sender_id, User.is_active == True).first()
+        if not sender:
+            raise HTTPException(status_code=404, detail="Sender not found")
+        decoy_text = _server_decoy(
+            message_content,
+            _conference_decoy_context(db, sender, conference_id),
+            content_type,
+            decoy_content,
+        )
 
         message = Message(
             sender_id=sender_id,
@@ -9898,8 +10026,16 @@ async def edit_message(
         setattr(msg, 'encrypted_key', payload.encrypted_key)
     if payload.iv is not None:
         setattr(msg, 'iv', payload.iv)
-    if payload.decoy_content is not None:
-        setattr(msg, 'decoy_content', payload.decoy_content)
+    setattr(
+        msg,
+        'decoy_content',
+        _server_decoy(
+            payload.message,
+            _message_decoy_context(db, current_user, msg),
+            str(getattr(msg, 'content_type', 'encrypted') or 'encrypted'),
+            payload.decoy_content,
+        ),
+    )
     setattr(msg, 'is_edited', True)
     setattr(msg, 'edited_at', datetime.now(timezone.utc))
     db.commit()
@@ -12162,7 +12298,8 @@ async def list_operators(
     return [{"id": u.id, "username": u.username, "phone_number": u.phone_number, "email": u.email,
              "admin_role": u.admin_role, "is_active": u.is_active,
              "can_approve_duress_wipe": bool(u.can_approve_duress_wipe),
-             "monitored_services": u.monitored_services or [],
+             # None (not []) means the default: every service channel.
+             "monitored_services": u.monitored_services,
              "accessible_pages": u.accessible_pages,
              "last_login": str(u.last_login) if u.last_login else None} for u in ops]
 
@@ -12239,7 +12376,10 @@ ADMIN_PAGE_KEYS = [
 
 class SetServiceAccessRequest(BaseModel):
     username: str
-    services: List[str] = Field(default_factory=list, description="Subset of known service names this admin may monitor")
+    services: Optional[List[str]] = Field(
+        None,
+        description="Subset of known service names this admin may monitor; null clears the override back to the default (every service)",
+    )
 
 class SetPageAccessRequest(BaseModel):
     username: str
@@ -12280,16 +12420,20 @@ async def set_service_access(
     current_sa: User = Depends(get_superadmin_only),
     db: Session = Depends(get_database_session),
 ):
-    """Superadmin grants/revokes which service-health channels an admin/operator can view."""
+    """Superadmin grants/revokes which service-health channels an admin/operator can view.
+    services=null resets the admin back to the default (every service)."""
     target = db.query(User).filter(User.username == data.username).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     if getattr(target, 'admin_role', None) == 'superadmin':
         raise HTTPException(status_code=400, detail="Superadmin already sees every service")
-    unknown = [s for s in data.services if s not in MONITOR_SERVICE_NAMES]
-    if unknown:
-        raise HTTPException(status_code=400, detail=f"Unknown service name(s): {unknown}")
-    target.monitored_services = sorted(set(data.services))
+    if data.services is None:
+        target.monitored_services = None
+    else:
+        unknown = [s for s in data.services if s not in MONITOR_SERVICE_NAMES]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Unknown service name(s): {unknown}")
+        target.monitored_services = sorted(set(data.services))
     db.commit()
     return {"username": target.username, "monitored_services": target.monitored_services}
 
@@ -12303,7 +12447,8 @@ async def list_service_health_services(
     before the realtime feed has produced anything."""
     from database_models import ServiceEvent
     since = datetime.now(timezone.utc) - timedelta(hours=1)
-    visible = [s for s in MONITOR_SERVICE_NAMES if monitor_service_allowed(current_admin, s)]
+    allowed = monitor_allowed_service_names(current_admin)
+    visible = MONITOR_SERVICE_NAMES if allowed is None else [s for s in MONITOR_SERVICE_NAMES if s in allowed]
     result = []
     for service in visible:
         ok_count = db.query(ServiceEvent).filter(
@@ -12332,7 +12477,8 @@ async def list_service_health_events(
             raise HTTPException(status_code=403, detail="Not authorized to view this service")
         allowed_services = [service]
     else:
-        allowed_services = [s for s in MONITOR_SERVICE_NAMES if monitor_service_allowed(current_admin, s)]
+        allowed = monitor_allowed_service_names(current_admin)
+        allowed_services = MONITOR_SERVICE_NAMES if allowed is None else [s for s in MONITOR_SERVICE_NAMES if s in allowed]
     if not allowed_services:
         return {"events": []}
     q = db.query(ServiceEvent).filter(ServiceEvent.service.in_(allowed_services))
@@ -12423,10 +12569,10 @@ async def service_health_live(websocket: WebSocket, token: Optional[str] = None)
             await websocket.close(code=4003)
             return
         is_superadmin = getattr(user, 'admin_role', None) == 'superadmin'
-        allowed_services = None if is_superadmin else set(getattr(user, 'monitored_services', None) or [])
+        allowed_services = monitor_allowed_service_names(user)
         await websocket.accept()
         await monitor_subscribe(websocket, allowed_services)
-        await websocket.send_json({"type": "connected", "services": MONITOR_SERVICE_NAMES if is_superadmin else sorted(allowed_services)})
+        await websocket.send_json({"type": "connected", "services": MONITOR_SERVICE_NAMES if allowed_services is None else sorted(allowed_services)})
         try:
             while True:
                 # This socket is receive-only from the client's side (server pushes
