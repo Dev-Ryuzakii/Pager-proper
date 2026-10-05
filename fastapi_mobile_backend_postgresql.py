@@ -12568,7 +12568,6 @@ async def service_health_live(websocket: WebSocket, token: Optional[str] = None)
         if not user:
             await websocket.close(code=4003)
             return
-        is_superadmin = getattr(user, 'admin_role', None) == 'superadmin'
         allowed_services = monitor_allowed_service_names(user)
         await websocket.accept()
         await monitor_subscribe(websocket, allowed_services)

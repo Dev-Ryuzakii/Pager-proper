@@ -12,8 +12,10 @@ record_event() never blocks or raises into the caller's request path: the DB
 write and the realtime WebSocket fan-out both run in a background asyncio
 task, and any failure there is logged and swallowed, not propagated.
 
-Access control: superadmin sees every service. An admin/operator only sees
-the services superadmin has listed in their `monitored_services` column.
+Access control: superadmin sees every service. An admin/operator also sees
+every service until a superadmin narrows them via the `monitored_services`
+column — NULL means "never restricted" (default: all), while an explicitly
+saved list (including an empty one) is a deliberate restriction.
 """
 
 import asyncio
@@ -43,12 +45,27 @@ SERVICE_NAMES: List[str] = [
 ]
 
 
+def allowed_service_names(user) -> Optional[Set[str]]:
+    """The services `user` may view, or None meaning every service.
+
+    None is returned for a superadmin, and for an admin/operator who has
+    never been restricted (`monitored_services` is NULL) — monitoring is
+    visible by default and a superadmin narrows it, rather than every new
+    admin starting out unable to see anything. An explicitly saved list is
+    honored as-is, so an empty list really does mean "no channels".
+    """
+    if getattr(user, "admin_role", None) == "superadmin":
+        return None
+    configured = getattr(user, "monitored_services", None)
+    if configured is None:
+        return None
+    return set(configured)
+
+
 def service_allowed(user, service: str) -> bool:
     """True if `user` (a User row, already known to be is_admin) may view `service`."""
-    if getattr(user, "admin_role", None) == "superadmin":
-        return True
-    allowed = getattr(user, "monitored_services", None) or []
-    return service in allowed
+    allowed = allowed_service_names(user)
+    return allowed is None or service in allowed
 
 
 def record_event(
