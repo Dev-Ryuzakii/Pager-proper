@@ -8,6 +8,7 @@ import re
 import time
 from typing import Optional
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import OperationalError
 from database_models import Base
@@ -18,6 +19,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_database_url(database_url: str) -> str:
+    """Return a connection URL suitable for logs without its password."""
+    try:
+        return make_url(database_url).render_as_string(hide_password=True)
+    except Exception:
+        return "<configured database URL>"
 
 class DatabaseConfig:
     """Database configuration class"""
@@ -37,7 +46,7 @@ class DatabaseConfig:
         for key, value in os.environ.items():
             if "DATABASE" in key.upper() or "DB_" in key.upper():
                 # Don't log sensitive information
-                if "PASSWORD" in key.upper() or "SECRET" in key.upper():
+                if key.upper() == "DATABASE_URL" or "PASSWORD" in key.upper() or "SECRET" in key.upper():
                     logger.info(f"  {key}: ***")
                 else:
                     logger.info(f"  {key}: {value}")
@@ -45,11 +54,10 @@ class DatabaseConfig:
         if database_url and database_url.strip():
             # Use Render's provided DATABASE_URL
             logger.info("Using Render DATABASE_URL")
-            logger.info(f"Raw DATABASE_URL: {database_url}")
             
             # Validate and normalize the database URL
             self.DATABASE_URL = self._normalize_database_url(database_url)
-            logger.info(f"Normalized DATABASE_URL: {self.DATABASE_URL}")
+            logger.info("Database URL: %s", _safe_database_url(self.DATABASE_URL))
         else:
             # Fallback to individual environment variables
             logger.warning("DATABASE_URL not found or empty, using fallback configuration")
@@ -61,7 +69,7 @@ class DatabaseConfig:
             
             # Connection string
             self.DATABASE_URL = self._build_database_url()
-            logger.info(f"Using fallback DATABASE_URL: {self.DATABASE_URL}")
+            logger.info("Using fallback database URL: %s", _safe_database_url(self.DATABASE_URL))
         
         # Engine and session
         self.engine = None
@@ -106,7 +114,7 @@ class DatabaseConfig:
             try:
                 # Handle special case for Render's DATABASE_URL which might need SSL settings
                 database_url = self.DATABASE_URL
-                logger.info(f"Processing database URL: {database_url}")
+                logger.info("Processing database URL: %s", _safe_database_url(database_url))
                 
                 if "render.com" in database_url and "sslmode=require" not in database_url:
                     # Add SSL requirement for Render
@@ -115,7 +123,7 @@ class DatabaseConfig:
                         database_url += "&sslmode=require"
                     else:
                         database_url += "?sslmode=require"
-                    logger.info(f"Modified database URL: {database_url}")
+                    logger.info("Modified database URL: %s", _safe_database_url(database_url))
                 
                 self.engine = create_engine(
                     database_url,
@@ -252,7 +260,7 @@ if __name__ == "__main__":
     
     # Show configuration
     if hasattr(db_config, 'DATABASE_URL'):
-        print(f"Database URL: {db_config.DATABASE_URL}")
+        print(f"Database URL: {_safe_database_url(db_config.DATABASE_URL)}")
     
     # Test initialization
     success = init_database()

@@ -6,6 +6,7 @@ Script to create an admin user account
 import os
 import sys
 import logging
+from getpass import getpass
 
 # Load .env before database config (try cwd and script directory)
 def _load_env():
@@ -141,7 +142,14 @@ def list_admin_users():
         
         print(f"Found {len(admin_users)} admin user(s):")
         for user in admin_users:
-            print(f"  - {user.username} (ID: {user.id})")
+            role = user.admin_role or "admin"
+            email = user.email or "-"
+            last_login = user.last_login or "never"
+            print(
+                f"  - ID: {user.id} | username: {user.username} | "
+                f"email: {email} | role: {role} | active: {user.is_active} | "
+                f"last login: {last_login}"
+            )
         
         session.close()
         return True
@@ -150,6 +158,73 @@ def list_admin_users():
         logger.error(f"Error listing admin users: {e}")
         print(f"❌ Failed to list admin users: {e}")
         return False
+
+
+def reset_admin_password(username: str, password: str, force_change: bool = True):
+    """Reset a database-backed admin password and revoke existing sessions.
+
+    The password is supplied by the interactive CLI instead of as a command
+    argument so it is not exposed in shell history or the process list.
+    """
+    if len(password) < 12:
+        print("❌ Password must contain at least 12 characters")
+        return False
+
+    session = None
+    try:
+        if not db_config.initialize_database():
+            print("❌ Failed to initialize database connection")
+            return False
+
+        session = db_config.get_session()
+        if not session:
+            print("❌ Failed to get database session")
+            return False
+
+        user = session.query(User).filter(
+            User.username == username,
+            User.is_admin == True,
+        ).first()
+        if not user:
+            print(f"❌ Admin user {username!r} not found")
+            return False
+
+        user.password_hash = hash_password(password)
+        user.must_change_password = force_change
+
+        invalidated = session.query(UserSession).filter(
+            UserSession.user_id == user.id,
+            UserSession.is_active == True,
+        ).update(
+            {
+                "is_active": False,
+                "logout_reason": "admin_password_reset",
+            },
+            synchronize_session=False,
+        )
+
+        session.add(AuditLog(
+            user_id=user.id,
+            event_type="admin_password_reset_vps",
+            event_description=f"Password reset from management CLI for admin {user.username}",
+            severity="warning",
+        ))
+        session.commit()
+
+        print(f"✅ Password reset for admin {user.username}")
+        print(f"🔒 Invalidated {invalidated} active session(s)")
+        if force_change:
+            print("⚠️  Admin must change this temporary password after login")
+        return True
+    except Exception as e:
+        if session:
+            session.rollback()
+        logger.error(f"Error resetting admin password: {e}")
+        print(f"❌ Failed to reset admin password: {e}")
+        return False
+    finally:
+        if session:
+            session.close()
 
 def remove_admin_status(username: str):
     """Remove admin status from a user"""
@@ -227,6 +302,7 @@ if __name__ == "__main__":
         print("  python create_admin_user.py init              # Create DB tables first")
         print("  python create_admin_user.py create [username] [password]")
         print("  python create_admin_user.py list")
+        print("  python create_admin_user.py reset-password <username> [--no-force-change]")
         print("  python create_admin_user.py remove <username>")
         print("\nNote: Run 'init' first if tables don't exist. If no username/password for create, defaults:")
         print("  Username: admin")
@@ -254,6 +330,26 @@ if __name__ == "__main__":
     elif command == "list":
         success = list_admin_users()
         sys.exit(0 if success else 1)
+
+    elif command == "reset-password":
+        if len(sys.argv) < 3:
+            print("Usage: python create_admin_user.py reset-password <username> [--no-force-change]")
+            sys.exit(1)
+        if any(arg not in {"--no-force-change"} for arg in sys.argv[3:]):
+            print("Usage: python create_admin_user.py reset-password <username> [--no-force-change]")
+            sys.exit(1)
+
+        username = sys.argv[2]
+        force_change = "--no-force-change" not in sys.argv[3:]
+        password_label = "New temporary password" if force_change else "New password"
+        password = getpass(f"{password_label}: ")
+        confirmation = getpass(f"Confirm {password_label.lower()}: ")
+        if password != confirmation:
+            print("❌ Passwords do not match")
+            sys.exit(1)
+
+        success = reset_admin_password(username, password, force_change=force_change)
+        sys.exit(0 if success else 1)
     
     elif command == "remove":
         if len(sys.argv) < 3:
@@ -269,5 +365,6 @@ if __name__ == "__main__":
         print("Usage:")
         print("  python create_admin_user.py create [username] [password]")
         print("  python create_admin_user.py list")
+        print("  python create_admin_user.py reset-password <username> [--no-force-change]")
         print("  python create_admin_user.py remove <username>")
         sys.exit(1)
