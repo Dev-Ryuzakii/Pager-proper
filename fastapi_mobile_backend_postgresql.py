@@ -5769,7 +5769,7 @@ async def get_organization_portal_account(
         # Organizations can view their staff and invite new staff, but not
         # edit or suspend anyone - that stays with Dilarion admins.
         "access": "invite",
-        "permissions": {"view_staff": True, "invite_staff": True, "edit_staff": False, "suspend_staff": False},
+        "permissions": {"view_staff": True, "invite_staff": True, "reset_staff_login": True, "edit_staff": False, "suspend_staff": False},
     }
 
 
@@ -5833,6 +5833,43 @@ async def organization_resend_staff_invite(
     _resend_staff_invitation(db, user, background_tasks)
     AuditService.log_event(db, int(current_user.id), "staff_invite_resent", f"Organization portal resent invitation to {user.username}")
     return {"status": "queued", "message": "A new activation code was sent by email and SMS"}
+
+
+@app.post("/organization/users/{user_id}/reset-login", status_code=202)
+async def organization_reset_staff_login(
+    user_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_organization_viewer),
+    db: Session = Depends(get_database_session),
+):
+    """Reset a staff member's login token from the organization portal. Same
+    effect as an approved reset request: the old credential stops working,
+    every device is signed out, and a one-time setup code goes out by email
+    and SMS. The organization never sees the new credential."""
+    user = db.query(User).filter(
+        User.id == user_id,
+        User.organization_id == current_user.organization_id,
+        User.organization_role != "viewer",
+    ).first()
+    if not user or getattr(user, "is_admin", False):
+        raise HTTPException(status_code=404, detail="Staff member not found")
+    if not user.email and not user.phone_number:
+        raise HTTPException(status_code=400, detail="This staff member has no email or phone number to receive the reset code")
+    now = datetime.now(timezone.utc)
+    code = secrets.token_urlsafe(32)
+    user.token = None
+    user.password_hash = None
+    user.invitation_token_hash = _invitation_digest(code)
+    user.invitation_expires_at = now + timedelta(hours=72)
+    user.invited_at = now
+    user.invitation_accepted_at = None
+    user.invitation_delivery_errors = None
+    db.query(UserSession).filter(UserSession.user_id == user.id).delete()
+    db.commit()
+    background_tasks.add_task(_deliver_invitation, int(user.id), code, "reset")
+    AuditService.log_event(db, int(current_user.id), "organization_staff_login_reset",
+                           f"Organization portal reset login for {user.username}, all sessions invalidated")
+    return {"status": "queued", "message": "Login reset. A one-time setup code was sent by email and SMS"}
 
 
 @app.get("/admin/organizations")
@@ -12722,6 +12759,65 @@ async def get_admin_only(credentials: HTTPAuthorizationCredentials = Depends(sec
         raise HTTPException(status_code=403, detail="Admin or superadmin role required")
     return user
 
+
+class DeliveryTestRequest(BaseModel):
+    email: Optional[str] = None
+    phone: Optional[str] = None
+
+
+@app.post("/admin/test-delivery")
+async def admin_test_delivery(
+    payload: DeliveryTestRequest,
+    current_admin: User = Depends(get_admin_only),
+):
+    """Superadmin-only: fire one real test email and/or SMS through the live
+    SMTP + Sendchamp config and report exactly what happened. Lets us debug
+    'mail/SMS not sending' on the VPS without SSH, using the server's own
+    environment. Secrets are never returned — only which vars are present."""
+    if getattr(current_admin, 'admin_role', None) != 'superadmin':
+        raise HTTPException(status_code=403, detail="Superadmin only")
+
+    def present(*names: str) -> bool:
+        return any(os.getenv(n) for n in names)
+
+    config = {
+        "email": {
+            "smtp_host": present("SMTP_HOST", "RESEND_API_KEY"),
+            "smtp_user": present("SMTP_USERNAME", "RESEND_API_KEY"),
+            "smtp_password": present("SMTP_PASSWORD", "RESEND_API_KEY"),
+            "from_email": present("SMTP_FROM", "RESEND_FROM_EMAIL"),
+        },
+        "sms": {
+            "sendchamp_api_key": present("SENDCHAMP_API_KEY"),
+            "twilio": present("TWILIO_ACCOUNT_SID"),
+            "sender_name": os.getenv("SENDCHAMP_SENDER_NAME", "Sendchamp"),
+            "route": os.getenv("SENDCHAMP_ROUTE", "dnd"),
+        },
+    }
+
+    email_result = None
+    if payload.email:
+        try:
+            sent = _send_email_message(
+                payload.email,
+                "Dilarion delivery test",
+                "This is a Dilarion email delivery test. If you received it, SMTP works.",
+            )
+            email_result = {"ok": bool(sent), "error": None if sent else "configuration_incomplete"}
+        except Exception as exc:  # noqa: BLE001
+            email_result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    sms_result = None
+    if payload.phone:
+        err = await _send_sms(
+            payload.phone,
+            "Dilarion SMS delivery test. If you got this, Sendchamp works.",
+        )
+        sms_result = {"ok": err is None, "error": err, "normalized": _sms_number(payload.phone)}
+
+    return {"config": config, "email": email_result, "sms": sms_result}
+
+
 # ── Admin master decryption key ─────────────────────────────────────────────
 # Every client also wraps each message's AES key for this key's public half
 # (served at GET /encryption/admin-public-key, fetched the same way a device's
@@ -13229,6 +13325,57 @@ async def list_service_health_events(
             "created_at": r.created_at.isoformat() if r.created_at else None,
         } for r in rows
     ]}
+
+@app.get("/admin/service-health/organizations")
+async def list_service_health_organizations(
+    window_hours: int = Query(24, ge=1, le=720),
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """One card per organization for the Service Health landing view: staff
+    count, traced ok/error totals and the most recent event in the window.
+    Events with no organization roll up under organization_id = null."""
+    from database_models import ServiceEvent
+    since = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    allowed = monitor_allowed_service_names(current_admin)
+    visible = MONITOR_SERVICE_NAMES if allowed is None else [s for s in MONITOR_SERVICE_NAMES if s in allowed]
+
+    stats = {}
+    if visible:
+        rows = db.query(
+            ServiceEvent.organization_id.label("organization_id"),
+            func.sum(case((ServiceEvent.status == "ok", 1), else_=0)).label("ok_count"),
+            func.sum(case((ServiceEvent.status == "error", 1), else_=0)).label("error_count"),
+            func.count(func.distinct(ServiceEvent.user_id)).label("active_users"),
+            func.max(ServiceEvent.created_at).label("last_event_at"),
+        ).filter(
+            ServiceEvent.service.in_(visible),
+            ServiceEvent.created_at >= since,
+        ).group_by(ServiceEvent.organization_id).all()
+        stats = {r.organization_id: r for r in rows}
+
+    staff_counts = dict(db.query(User.organization_id, func.count(User.id)).filter(
+        User.organization_id.isnot(None), User.is_admin == False,
+    ).group_by(User.organization_id).all())
+
+    def card(org_id, name, is_active=True):
+        r = stats.get(org_id)
+        return {
+            "organization_id": org_id,
+            "name": name,
+            "is_active": is_active,
+            "staff_count": int(staff_counts.get(org_id, 0)) if org_id is not None else None,
+            "active_users": int(r.active_users or 0) if r else 0,
+            "ok_count": int(r.ok_count or 0) if r else 0,
+            "error_count": int(r.error_count or 0) if r else 0,
+            "last_event_at": r.last_event_at.isoformat() if r and r.last_event_at else None,
+        }
+
+    cards = [card(int(o.id), o.name, bool(o.is_active))
+             for o in db.query(Organization).order_by(Organization.name.asc()).all()]
+    if None in stats:
+        cards.append(card(None, "Platform / unassigned"))
+    return {"organizations": cards, "window_hours": window_hours}
 
 @app.get("/admin/service-health/users")
 async def list_service_health_users(
@@ -14013,7 +14160,10 @@ async def report_policy_violation(
     ss_dir = os.path.join(_user_data_dir(user_id), "policy_violations")
     os.makedirs(ss_dir, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    filename = f"violation_{ts}_{uuid.uuid4().hex[:6]}.jpg"
+    # The desktop agent uploads PNG; keep the real extension so it's served
+    # with the right content type.
+    ext = ".png" if (file.content_type or "").endswith("png") or (file.filename or "").lower().endswith(".png") else ".jpg"
+    filename = f"violation_{ts}_{uuid.uuid4().hex[:6]}{ext}"
     file_path = os.path.join(ss_dir, filename)
     content = await file.read()
     with open(file_path, "wb") as f:
@@ -14059,6 +14209,7 @@ async def admin_list_policy_violations(
             "id": r.id, "username": u.username if u else None, "process_name": r.process_name,
             "device_hostname": r.device_hostname, "detected_at": r.detected_at.isoformat() if r.detected_at else None,
             "reviewed": r.reviewed,
+            "has_screenshot": bool(r.screenshot_path and os.path.exists(r.screenshot_path)),
         })
     return {"violations": result}
 
@@ -14090,7 +14241,10 @@ async def admin_get_policy_violation_screenshot(
     if not row or not os.path.exists(row.screenshot_path):
         raise HTTPException(status_code=404, detail="Not found")
     from fastapi.responses import FileResponse
-    return FileResponse(row.screenshot_path, media_type="image/jpeg")
+    # Older rows were saved as .jpg even when the bytes are PNG — sniff them.
+    with open(row.screenshot_path, "rb") as fh:
+        is_png = fh.read(8) == b"\x89PNG\r\n\x1a\n"
+    return FileResponse(row.screenshot_path, media_type="image/png" if is_png else "image/jpeg")
 
 @app.post("/admin/monitoring/policy/violations/{violation_id}/review")
 async def admin_review_policy_violation(

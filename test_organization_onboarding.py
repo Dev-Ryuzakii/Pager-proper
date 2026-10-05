@@ -158,6 +158,16 @@ def test_organization_approval_activation_and_camera_onboarding(tmp_path, monkey
         with pytest.raises(HTTPException) as activated_err:
             await api.organization_resend_staff_invite(user.id, BackgroundTasks(), viewer, db)
         assert activated_err.value.status_code == 409
+        # ...so the portal resets her login instead: old credential and every
+        # session are gone, and a reset code goes out.
+        reset_background = BackgroundTasks()
+        await api.organization_reset_staff_login(user.id, reset_background, viewer, db)
+        db.refresh(user)
+        assert user.password_hash is None
+        assert user.invitation_accepted_at is None
+        assert user.invitation_token_hash is not None
+        assert reset_background.tasks[0].args[2] == "reset"
+        assert db.query(api.UserSession).filter(api.UserSession.user_id == user.id).count() == 0
 
     asyncio.run(scenario())
     db.close()
