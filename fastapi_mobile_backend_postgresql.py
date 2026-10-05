@@ -10623,6 +10623,42 @@ async def admin_get_user_registration_details(username: str,
         logger.error(f"Admin get user registration details error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve user registration details")
 
+class AdminUserOnboardingProfile(BaseModel):
+    """What a user submitted during the mandatory first-login profile setup.
+    The portrait bytes are not inlined here — fetch them from
+    GET /users/{username}/profile-picture (admins pass its tenant check)."""
+    username: str
+    job_title: Optional[str] = None
+    address: Optional[str] = None
+    emergency_contact_name: Optional[str] = None
+    emergency_contact_phone: Optional[str] = None
+    onboarding_completed_at: Optional[datetime] = None
+    has_profile_picture: bool = False
+
+@app.get("/admin/users/{username}/onboarding_profile", response_model=AdminUserOnboardingProfile)
+async def admin_get_user_onboarding_profile(
+    username: str,
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Onboarding answers (job title, address, emergency contact) and whether a
+    live-camera portrait is on file, for the admin console's user detail view."""
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    picture_path = getattr(user, "profile_picture_path", None)
+    return AdminUserOnboardingProfile(
+        username=str(user.username),
+        job_title=user.job_title,
+        address=user.address,
+        emergency_contact_name=user.emergency_contact_name,
+        emergency_contact_phone=user.emergency_contact_phone,
+        onboarding_completed_at=user.onboarding_completed_at,
+        # A path can outlive its file (cleared upload dir, moved server), so
+        # check the disk rather than telling the admin a portrait exists.
+        has_profile_picture=bool(picture_path) and os.path.exists(picture_path),
+    )
+
 @app.get("/calls/history")
 async def get_call_history(
     current_user: User = Depends(get_current_user),
