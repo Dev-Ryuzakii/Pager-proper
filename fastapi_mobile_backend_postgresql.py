@@ -5865,10 +5865,12 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
         user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
         ip = _client_ip(request)
 
-        # One signed-in device per platform group: a second phone (or second
-        # desktop) can't sign in while another holds a live session. The
-        # owner is alerted with the device, location and time. Re-signing in
-        # on the same device is always allowed.
+        # Keep one signed-in device per platform group.  A new login replaces
+        # an older session in that group instead of leaving the user locked
+        # out until the old session expires.  This is especially important for
+        # browsers, whose per-install device id can change when site data is
+        # cleared or the app is reinstalled.  Other platform groups remain
+        # signed in (for example, web login does not replace the desktop app).
         device_id = (login_data.device_id or "").strip() or None
         group = _platform_group(login_data.platform)
         if device_id:
@@ -5880,31 +5882,24 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
                 UserSession.device_id.isnot(None),
                 UserSession.device_id != device_id,
             ).all()
-            holder = next((x for x in live if _platform_group(x.platform) == group), None)
-            if holder:
-                location = (login_data.location or "").strip() or await _approximate_location(ip)
-                attempt = {
-                    "device_name": (login_data.device_name or "").strip() or None,
-                    "platform": (login_data.platform or "").lower() or None,
-                    "location": location,
-                    "ip": ip,
-                    "time": now.isoformat(),
-                    "time_display": now.strftime("%d %b %Y, %H:%M UTC"),
-                    "signed_in_device": holder.device_name,
-                }
+            replaced = [x for x in live if _platform_group(x.platform) == group]
+            if replaced:
+                replaced_names = sorted({
+                    (x.device_name or x.platform or "unknown device") for x in replaced
+                })
+                for old_session in replaced:
+                    old_session.is_active = False
+                    old_session.logout_reason = "replaced"
+                db.commit()
                 AuditService.log_event(
-                    db, user_id, "login_blocked_other_device",
-                    f"Blocked sign-in from {attempt['device_name'] or 'unknown device'} ({attempt['platform'] or 'unknown'}) "
-                    f"at {location or 'unknown location'} [{ip or 'no ip'}]; already signed in on {holder.device_name or 'another device'}",
+                    db, user_id, "login_replaced_other_device",
+                    f"New {group} sign-in replaced {len(replaced)} active session(s): "
+                    + ", ".join(replaced_names),
                 )
-                monitor_record_event("auth", "login", status="error", detail="blocked: already signed in on another device", user_id=user_id)
-                await _alert_blocked_login(db, user, attempt)
-                label = "phone" if group == "mobile" else group
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"This account is already signed in on another {label}"
-                           + (f" ({holder.device_name})" if holder.device_name else "")
-                           + ". Sign out on that device first. The account owner has been notified.",
+                monitor_record_event(
+                    "auth", "login", status="success",
+                    detail=f"replaced {len(replaced)} active {group} session(s)",
+                    user_id=user_id,
                 )
 
         session = SessionService.create_session(db, user_id, "mobile", ip or "mobile_app")
