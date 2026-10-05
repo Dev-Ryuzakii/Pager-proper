@@ -197,7 +197,7 @@ class Message(Base):
     iv = Column(String(255), nullable=True)      # AES Initialization Vector
     
     # Message metadata
-    timestamp = Column(DateTime, default=func.now())
+    timestamp = Column(DateTime, default=datetime.utcnow)  # naive UTC; serialized as UTC by _iso
     delivered = Column(Boolean, default=False)
     read = Column(Boolean, default=False)
     read_timestamp = Column(DateTime, nullable=True)
@@ -392,7 +392,7 @@ class AuditLog(Base):
     severity = Column(String(20), default="info")  # debug, info, warning, error, critical
     
     # Event metadata
-    timestamp = Column(DateTime, default=func.now())
+    timestamp = Column(DateTime, default=datetime.utcnow)  # naive UTC; serialized as UTC by _iso
     ip_address = Column(String(45), nullable=True)
     user_agent = Column(String(512), nullable=True)
     session_id = Column(String(512), nullable=True)
@@ -1240,7 +1240,7 @@ class CommandAuditLog(Base):
     target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     command_type = Column(String(50), nullable=False)
     action = Column(String(20), nullable=False)   # issued, delivered, executing, done, failed, stopped
-    timestamp = Column(DateTime, default=func.now())
+    timestamp = Column(DateTime, default=datetime.utcnow)  # naive UTC; serialized as UTC by _iso
     metadata_ = Column("metadata", JSON, nullable=True)
 
     admin = relationship("User", foreign_keys=[admin_id])

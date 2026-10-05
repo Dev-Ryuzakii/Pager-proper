@@ -130,6 +130,19 @@ def _invitation_digest(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
 
+def _iso(dt) -> Optional[str]:
+    """Serialize a datetime as an unambiguous UTC ISO string. Columns default
+    to naive UTC (func.now()/utcnow), and a naive isoformat has no timezone, so
+    clients parse it as *local* time and message timestamps drift by the device
+    offset. Tagging it UTC lets every client convert to the viewer's real local
+    time (WAT for users in West Africa)."""
+    if not dt:
+        return None
+    if getattr(dt, "tzinfo", None) is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 def _valid_email(value: str) -> bool:
     return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", (value or "").strip()))
 
@@ -9742,7 +9755,7 @@ async def get_inbox(current_user: User = Depends(get_current_user),
                 "encrypted_key": getattr(msg, 'encrypted_key', None),
                 "iv": getattr(msg, 'iv', None),
                 "decoy_content": str(getattr(msg, 'decoy_content', '') or ''),
-                "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
+                "timestamp": (_iso(getattr(msg, 'timestamp', None)) or datetime.now(timezone.utc).isoformat()),
                 "delivered": bool(getattr(msg, 'delivered', False)),
                 "read": bool(getattr(msg, 'read', False))
             })
@@ -9801,7 +9814,7 @@ async def get_conversation(
                 "content_type": "deleted" if is_deleted else str(getattr(msg, 'content_type', '')),
                 "encrypted_key": None if is_deleted else getattr(msg, 'encrypted_key', None),
                 "iv": None if is_deleted else getattr(msg, 'iv', None),
-                "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
+                "timestamp": (_iso(getattr(msg, 'timestamp', None)) or datetime.now(timezone.utc).isoformat()),
                 "delivered": bool(getattr(msg, 'delivered', False)),
                 "read": bool(getattr(msg, 'read', False)),
                 "reactions": reactions_map.get(msg.id, []),
@@ -9840,7 +9853,7 @@ async def get_offline_messages(current_user: User = Depends(get_current_user),
                 "recipient": str(getattr(recipient, 'username', '')) if recipient else "unknown",
                 "content": str(getattr(msg, 'encrypted_content', '')),
                 "content_type": str(getattr(msg, 'content_type', '')),
-                "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat()
+                "timestamp": (_iso(getattr(msg, 'timestamp', None)) or datetime.now(timezone.utc).isoformat())
             })
             
             # Mark as delivered
@@ -11061,7 +11074,7 @@ async def list_pinned_messages(
             "content_type": msg.content_type,
             "encrypted_key": msg.encrypted_key,
             "iv": msg.iv,
-            "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+            "timestamp": _iso(msg.timestamp),
             "pinned_by": str(getattr(pinned_by, 'username', '')) if pinned_by else None,
             "pinned_at": msg.pinned_at.isoformat() if msg.pinned_at else None,
         })
@@ -11128,7 +11141,7 @@ async def list_starred_messages(
             "content_type": msg.content_type,
             "encrypted_key": msg.encrypted_key,
             "iv": msg.iv,
-            "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+            "timestamp": _iso(msg.timestamp),
             "group_id": msg.group_id,
             "group_name": str(getattr(group, 'name', '')) if group else None,
             "recipient": str(getattr(recipient, 'username', '')) if recipient else None,
@@ -11209,7 +11222,7 @@ async def get_conference_conversation(
                 "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
                 "content": str(getattr(msg, 'encrypted_content', '')),
                 "content_type": str(getattr(msg, 'content_type', '')),
-                "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
+                "timestamp": (_iso(getattr(msg, 'timestamp', None)) or datetime.now(timezone.utc).isoformat()),
                 "decoy_content": getattr(msg, 'decoy_content', ''),
                 "encrypted_key": getattr(msg, 'encrypted_key', None),
                 "iv": getattr(msg, 'iv', None),
@@ -11266,7 +11279,7 @@ async def get_group_conversation(
                 "is_private_tagged": is_private_tagged,
                 "content": str(getattr(msg, 'encrypted_content', '')) if can_read_content else str(getattr(msg, 'decoy_content', '') or '[Private tagged message]'),
                 "content_type": str(getattr(msg, 'content_type', '')) if can_read_content else "private_tagged",
-                "timestamp": getattr(msg, 'timestamp', datetime.now(timezone.utc)).isoformat(),
+                "timestamp": (_iso(getattr(msg, 'timestamp', None)) or datetime.now(timezone.utc).isoformat()),
                 "decoy_content": getattr(msg, 'decoy_content', '')
             })
             
@@ -12132,7 +12145,7 @@ async def export_messages(
             "content_type": "deleted" if is_deleted else str(getattr(msg, 'content_type', '') or ''),
             "encrypted_key": None if is_deleted else getattr(msg, 'encrypted_key', None),
             "iv": None if is_deleted else getattr(msg, 'iv', None),
-            "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+            "timestamp": _iso(msg.timestamp),
             "is_deleted": is_deleted,
             "is_edited": bool(getattr(msg, 'is_edited', False)),
             "is_pinned": bool(getattr(msg, 'is_pinned', False)),
@@ -12736,7 +12749,7 @@ async def get_media_inbox(
                 "file_size": int(getattr(media, 'file_size', 0)),
                 "sender": str(getattr(sender, 'username', '')) if sender else "unknown",
                 "recipient": str(getattr(recipient, 'username', '')) if recipient else "unknown",
-                "timestamp": getattr(media, 'uploaded_at', datetime.now(timezone.utc)).isoformat(),
+                "timestamp": (_iso(getattr(media, 'uploaded_at', None)) or datetime.now(timezone.utc).isoformat()),
                 "expires_at": getattr(media, 'expires_at', None) and getattr(media, 'expires_at', None).isoformat() or None,
                 "auto_delete": bool(getattr(media, 'auto_delete', False)),
                 "downloaded": getattr(media, 'downloaded_at', None) is not None
@@ -13044,7 +13057,7 @@ async def admin_decrypt_message(
         return {"message_id": message_id, "decrypted": False, "content": None,
                 "reason": "No admin-wrapped key on this message (sent before this feature, or by an outdated client)"}
     return {"message_id": message_id, "decrypted": True, "content": plaintext,
-            "content_type": msg.content_type, "timestamp": msg.timestamp.isoformat() if msg.timestamp else None}
+            "content_type": msg.content_type, "timestamp": _iso(msg.timestamp)}
 
 @app.get("/admin/messages/conversation/{username_a}/{username_b}/decrypt-all")
 async def admin_decrypt_conversation(
@@ -13072,7 +13085,7 @@ async def admin_decrypt_conversation(
         results.append({
             "message_id": m.id,
             "sender": username_a if m.sender_id == user_a.id else username_b,
-            "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+            "timestamp": _iso(m.timestamp),
             "content_type": m.content_type,
             "decrypted": plaintext is not None,
             "content": plaintext,
@@ -13102,7 +13115,7 @@ async def admin_decrypt_group_messages(
         results.append({
             "message_id": m.id,
             "sender": sender.username if sender else "unknown",
-            "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+            "timestamp": _iso(m.timestamp),
             "content_type": m.content_type,
             "decrypted": plaintext is not None,
             "content": plaintext,
@@ -16648,7 +16661,7 @@ async def super_admin_command_audit(
                 "target_username": str(getattr(l.target_user, 'username', '')) if l.target_user else None,
                 "command_type": str(l.command_type),
                 "action": str(l.action),
-                "timestamp": l.timestamp.isoformat(),
+                "timestamp": _iso(l.timestamp),
                 "metadata": l.metadata_,
             }
             for l in logs
@@ -17450,7 +17463,7 @@ async def export_my_data(current_user: User = Depends(get_current_user), db: Ses
     def msg_dict(m: Message) -> Dict[str, Any]:
         return {
             "id": m.id, "encrypted_content": m.encrypted_content, "content_type": m.content_type,
-            "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+            "timestamp": _iso(m.timestamp),
             "group_id": m.group_id, "recipient_id": m.recipient_id, "sender_id": m.sender_id,
         }
 
