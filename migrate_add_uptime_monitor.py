@@ -46,11 +46,15 @@ def migrate():
         if not existing:
             logger.info("Seeding the platform's own endpoints as uptime targets...")
             for name, url in SEED_TARGETS:
+                # created_at is set explicitly: it is NOT NULL and its default
+                # is applied by the ORM's Python-side default, which raw SQL
+                # here does not go through.
                 conn.execute(
                     text(
                         "INSERT INTO uptime_targets "
-                        "(name, url, method, expected_status, interval_seconds, timeout_ms, is_active, last_status) "
-                        "VALUES (:name, :url, 'GET', 200, 60, 10000, TRUE, 'unknown')"
+                        "(name, url, method, expected_status, interval_seconds, timeout_ms, "
+                        " is_active, last_status, created_at) "
+                        "VALUES (:name, :url, 'GET', 200, 60, 10000, TRUE, 'unknown', NOW())"
                     ),
                     {"name": name, "url": url},
                 )
