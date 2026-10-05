@@ -7166,6 +7166,20 @@ async def conference_accept(
     part.joined_at = datetime.utcnow()
     db.commit()
 
+    # This user's other devices are still ringing for the same call - stop
+    # them (the answering device sends its id so it isn't told to stop).
+    answering_device = str(payload.get("device_id") or "").strip()
+    note = {"type": "conference_answered_elsewhere", "data": {
+        "conference_id": conference_id, "device_name": payload.get("device_name"),
+    }}
+    for other_id, ws in list(ws_manager._connections.get(user_id, {}).items()):
+        if answering_device and other_id == answering_device:
+            continue
+        try:
+            await ws.send_text(json.dumps(note))
+        except Exception:
+            pass
+
     existing = db.query(ConferenceParticipant).filter(
         ConferenceParticipant.conference_id == conference_id,
         ConferenceParticipant.user_id != user_id,
