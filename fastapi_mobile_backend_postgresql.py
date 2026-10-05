@@ -4435,6 +4435,31 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Uptime check error: {e}")
 
+    async def periodic_endpoint_metric_flush():
+        while True:
+            try:
+                await asyncio.sleep(ENDPOINT_METRIC_FLUSH_SECONDS)
+                written = await _flush_endpoint_metrics()
+                if written:
+                    logger.info(f"Endpoint metrics: wrote {written} minute-bucket(s)")
+
+                # Once-a-day prune, same shape and hour as the uptime series'.
+                now = datetime.now(timezone.utc)
+                if now.hour == 3 and now.minute < 5:
+                    from database_models import EndpointMetric
+                    prune_db = next(get_database_session())
+                    try:
+                        cutoff = now.replace(tzinfo=None) - timedelta(days=ENDPOINT_METRIC_RETENTION_DAYS)
+                        removed = prune_db.query(EndpointMetric).filter(EndpointMetric.bucket < cutoff) \
+                            .delete(synchronize_session=False)
+                        prune_db.commit()
+                        if removed:
+                            logger.info(f"Endpoint metrics: pruned {removed} minute-bucket(s) older than {ENDPOINT_METRIC_RETENTION_DAYS} days")
+                    finally:
+                        prune_db.close()
+            except Exception as e:
+                logger.error(f"Endpoint metric flush error: {e}")
+
     async def periodic_retention_enforcement():
         while True:
             try:
@@ -4471,6 +4496,7 @@ async def lifespan(app: FastAPI):
     task_reminder_task = asyncio.create_task(periodic_task_reminders())
     retention_task = asyncio.create_task(periodic_retention_enforcement())
     uptime_task = asyncio.create_task(periodic_uptime_checks())
+    endpoint_metrics_task = asyncio.create_task(periodic_endpoint_metric_flush())
 
     yield
 
@@ -4481,7 +4507,15 @@ async def lifespan(app: FastAPI):
     meeting_reminder_task.cancel()
     retention_task.cancel()
     uptime_task.cancel()
-    
+    endpoint_metrics_task.cancel()
+
+    # Write out whatever the last interval accumulated before the process goes
+    # away, so a restart does not silently swallow a flush interval of traffic.
+    try:
+        await _flush_endpoint_metrics()
+    except Exception as e:
+        logger.warning(f"Final endpoint metric flush failed: {e}")
+
     # Shutdown
     logger.info("📴 Shutting down FastAPI Mobile Backend")
 
@@ -4500,6 +4534,200 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Per-endpoint traffic metrics ─────────────────────────────────────────────
+#
+# "Uptime for every endpoint" cannot mean probing every endpoint. This app
+# serves 300-odd routes and most of them are POST/PUT/DELETE with real side
+# effects: a probe of POST /messages would send a message, one of
+# DELETE /admin/users/{username} would delete an account, and one of
+# POST /auth/login would trip the one-device rule and log somebody out. So
+# coverage comes from measuring the traffic actually served instead — a
+# middleware times every request and folds it into a per-minute counter that is
+# flushed to endpoint_metrics in bulk.
+#
+# What that buys: every route that is used has a real uptime, error rate and
+# p95 read off live traffic. What it costs: a route nobody calls has no
+# numbers, and the page shows it as "no traffic" rather than as healthy.
+
+# Column names are imported so they cannot drift from the model's declarations.
+from database_models import ENDPOINT_LATENCY_BUCKETS, ENDPOINT_LATENCY_OVERFLOW_COLUMN
+
+_ENDPOINT_LAT_SLOT_NAMES = tuple(name for name, _ in ENDPOINT_LATENCY_BUCKETS) + (ENDPOINT_LATENCY_OVERFLOW_COLUMN,)
+
+# How often the accumulator is written out, and how long the rollups are kept.
+# The retention matches the uptime check series, and the prune rides along with
+# that loop's own nightly pass.
+ENDPOINT_METRIC_FLUSH_SECONDS = 30
+ENDPOINT_METRIC_RETENTION_DAYS = 30
+
+# (route, method, minute) -> counters. One process serves everything, so there
+# is nothing to reconcile on the way in; the flush upserts regardless, so a
+# second replica would simply add its own counts.
+_endpoint_metrics: Dict[tuple, dict] = {}
+
+
+def _endpoint_metric_minute() -> datetime:
+    """The current minute, naive UTC.
+
+    Naive on purpose: endpoint_metrics.bucket is a plain timestamp column, and
+    an aware value round-tripped through the driver does not compare equal to
+    the one that went in — which is what the flush relies on to find the row
+    for the same minute.
+    """
+    return datetime.now(timezone.utc).replace(second=0, microsecond=0, tzinfo=None)
+
+
+def _route_template(request: Request) -> str:
+    """The route this request matched, as a template.
+
+    Starlette attaches the matched Route to the scope, so "/admin/users/42" is
+    reported as "/admin/users/{username}" and the page groups by endpoint
+    rather than by id. Anything that matched no route collapses to one literal:
+    a 404 spike is worth seeing, but keeping the raw path would let a scanner
+    mint a fresh series on every request.
+    """
+    path = getattr(request.scope.get("route"), "path", None)
+    return path or "<unmatched>"
+
+
+def _record_endpoint_metric(route: str, method: str, status_code: int, duration_ms: int) -> None:
+    """Fold one finished request into the current minute.
+
+    Synchronous and await-free, so it cannot interleave with a flush that is
+    mid-swap.
+    """
+    key = (route, method, _endpoint_metric_minute())
+    entry = _endpoint_metrics.get(key)
+    if entry is None:
+        entry = dict.fromkeys(_ENDPOINT_LAT_SLOT_NAMES, 0)
+        entry.update(
+            request_count=0, success_count=0, client_error_count=0,
+            server_error_count=0, duration_sum_ms=0, duration_max_ms=0,
+        )
+        _endpoint_metrics[key] = entry
+
+    entry["request_count"] += 1
+    if status_code >= 500:
+        entry["server_error_count"] += 1
+    elif status_code >= 400:
+        entry["client_error_count"] += 1
+    else:
+        entry["success_count"] += 1
+
+    entry["duration_sum_ms"] += duration_ms
+    if duration_ms > entry["duration_max_ms"]:
+        entry["duration_max_ms"] = duration_ms
+
+    for slot, (_, bound) in zip(_ENDPOINT_LAT_SLOT_NAMES, ENDPOINT_LATENCY_BUCKETS):
+        if duration_ms < bound:
+            entry[slot] += 1
+            break
+    else:
+        entry[ENDPOINT_LATENCY_OVERFLOW_COLUMN] += 1
+
+
+def _merge_endpoint_metrics(target: dict, source: dict) -> None:
+    """Fold one accumulator's counters into another. Used when a failed flush
+    is put back for the next tick to retry — every field is a sum except the
+    peak latency, which is a maximum."""
+    for field, value in source.items():
+        if field == "duration_max_ms":
+            target[field] = max(target[field], value)
+        else:
+            target[field] += value
+
+
+async def _flush_endpoint_metrics() -> int:
+    """Write out every accumulated minute. Returns how many were written.
+
+    Never swallows a failure silently: the batch is put back into the
+    accumulator so the next tick retries it, and the error is re-raised for the
+    caller to log. Metrics are diagnostics — nothing here may break a request
+    or take the loop down.
+    """
+    if not _endpoint_metrics:
+        return 0
+
+    # Swap and clear without awaiting in between, so a request landing right
+    # now starts a fresh minute rather than being lost with the old one.
+    pending = _endpoint_metrics.copy()
+    _endpoint_metrics.clear()
+
+    from database_models import EndpointMetric
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    db = next(get_database_session())
+    try:
+        table = EndpointMetric.__table__
+        statement = pg_insert(table).values([
+            {"route": route, "method": method, "bucket": bucket, **entry}
+            for (route, method, bucket), entry in pending.items()
+        ])
+        additive = [name for name in _ENDPOINT_LAT_SLOT_NAMES]
+        statement = statement.on_conflict_do_update(
+            index_elements=["route", "method", "bucket"],
+            set_={
+                **{
+                    field: table.c[field] + statement.excluded[field]
+                    for field in (
+                        "request_count", "success_count", "client_error_count",
+                        "server_error_count", "duration_sum_ms", *additive,
+                    )
+                },
+                # A second flush inside the same minute (a restart, a clock
+                # boundary) must keep the worst latency seen, not the last.
+                "duration_max_ms": func.greatest(table.c.duration_max_ms, statement.excluded.duration_max_ms),
+            },
+        )
+        db.execute(statement)
+        db.commit()
+        return len(pending)
+    except Exception:
+        db.rollback()
+        for key, entry in pending.items():
+            existing = _endpoint_metrics.get(key)
+            if existing is None:
+                _endpoint_metrics[key] = entry
+            else:
+                _merge_endpoint_metrics(existing, entry)
+        raise
+    finally:
+        db.close()
+
+
+@app.middleware("http")
+async def endpoint_metrics_middleware(request: Request, call_next):
+    """Times every request and records how it ended.
+
+    Sits outside the router, so it also sees the responses error handlers
+    synthesise — which is the whole point: a route that has started returning
+    500s must show up as such.
+    """
+    if request.method == "OPTIONS":
+        # CORS preflight. It matches no route, fires constantly in front of the
+        # admin console, and says nothing about the endpoint behind it.
+        return await call_next(request)
+
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        # An unhandled exception becomes a 500 further up, in Starlette's own
+        # error middleware, which sits outside this one. Record it as the 500
+        # it is going to be before letting it carry on.
+        _record_endpoint_metric(
+            _route_template(request), request.method, 500,
+            int((time.perf_counter() - started) * 1000),
+        )
+        raise
+
+    _record_endpoint_metric(
+        _route_template(request), request.method, response.status_code,
+        int((time.perf_counter() - started) * 1000),
+    )
+    return response
 
 
 # WebSocket chat: connection manager (user_id -> set of WebSockets)
@@ -13403,6 +13631,176 @@ async def uptime_incidents(
             "checks_failed": int(r.checks_failed or 0),
         } for r in rows
     ]}
+
+
+# ── Per-endpoint traffic (the "Endpoints" half of the uptime page) ───────────
+#
+# These read the rollups the request middleware writes. Nothing here probes
+# anything: the numbers are the traffic the API actually served, which is the
+# only way to cover every route — see the comment above the middleware.
+
+def _registered_http_routes() -> list:
+    """Every (method, path) this app serves, sorted.
+
+    Read off the live router, so a new endpoint appears on the page the moment
+    the code declaring it is deployed. There is no second list to keep in sync,
+    and "all endpoints" therefore means exactly all of them.
+    """
+    pairs = set()
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None)
+        if not path or not methods:
+            continue
+        for method in methods:
+            # HEAD and OPTIONS are Starlette's own additions to every route,
+            # not endpoints anyone wrote.
+            if method in ("HEAD", "OPTIONS"):
+                continue
+            pairs.add((method, path))
+    return sorted(pairs, key=lambda pair: (pair[1], pair[0]))
+
+
+def _endpoint_p95_ms(buckets: dict, total: int):
+    """p95 read off the latency histogram, as (milliseconds, over_max).
+
+    Returns the upper bound of the bucket the 95th percentile falls in. That is
+    a bucket boundary rather than a measured latency — close enough to spot a
+    route that has gone slow, which is what this is for. over_max means the
+    95th percentile is past the last bound (2500ms), so the value is a floor.
+    """
+    if not total:
+        return None, False
+    target = total * 0.95
+    cumulative = 0
+    for slot, bound in ENDPOINT_LATENCY_BUCKETS:
+        cumulative += buckets.get(slot, 0)
+        if cumulative >= target:
+            return bound, False
+    return ENDPOINT_LATENCY_BUCKETS[-1][1], True
+
+
+@app.get("/admin/uptime/endpoints")
+async def endpoint_metric_overview(
+    window_hours: int = Query(24, ge=1, le=720),
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Per-endpoint health for every route this app serves, from real traffic.
+
+    Routes with no traffic in the window still appear, with null numbers —
+    "all endpoints" means all of them, and a route nobody calls is reported as
+    unmeasured rather than as 100% up.
+    """
+    from database_models import EndpointMetric
+
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=window_hours)
+    slots = tuple(name for name, _ in ENDPOINT_LATENCY_BUCKETS) + (ENDPOINT_LATENCY_OVERFLOW_COLUMN,)
+
+    rows = db.query(
+        EndpointMetric.route,
+        EndpointMetric.method,
+        func.sum(EndpointMetric.request_count),
+        func.sum(EndpointMetric.success_count),
+        func.sum(EndpointMetric.client_error_count),
+        func.sum(EndpointMetric.server_error_count),
+        func.sum(EndpointMetric.duration_sum_ms),
+        func.max(EndpointMetric.duration_max_ms),
+        *[func.sum(getattr(EndpointMetric, slot)) for slot in slots],
+    ).filter(EndpointMetric.bucket >= cutoff) \
+     .group_by(EndpointMetric.route, EndpointMetric.method).all()
+
+    measured = {}
+    for row in rows:
+        route, method = row[0], row[1]
+        requests = int(row[2] or 0)
+        server_errors = int(row[5] or 0)
+        duration_sum = int(row[6] or 0)
+        buckets = {slot: int(value or 0) for slot, value in zip(slots, row[8:])}
+        p95_ms, p95_over_max = _endpoint_p95_ms(buckets, requests)
+        measured[(route, method)] = {
+            "traffic": True,
+            "requests": requests,
+            "success": int(row[3] or 0),
+            # A 4xx is the caller's problem, not the endpoint being down — a 409
+            # from the one-device login rule is the rule working. Reported
+            # separately rather than counted against uptime.
+            "client_errors": int(row[4] or 0),
+            "server_errors": server_errors,
+            "uptime_percent": round(100.0 * (requests - server_errors) / requests, 2) if requests else None,
+            "avg_ms": round(duration_sum / requests) if requests else None,
+            "max_ms": int(row[7]) if row[7] is not None else None,
+            "p95_ms": p95_ms,
+            "p95_over_max": p95_over_max,
+        }
+
+    unmeasured = {
+        "traffic": False, "requests": 0, "success": 0, "client_errors": 0,
+        "server_errors": 0, "uptime_percent": None, "avg_ms": None,
+        "max_ms": None, "p95_ms": None, "p95_over_max": False,
+    }
+
+    endpoints = []
+    for method, path in _registered_http_routes():
+        stats = measured.get((path, method), unmeasured)
+        endpoints.append({"method": method, "path": path, **stats})
+
+    total_requests = sum(e["requests"] for e in endpoints)
+    total_server_errors = sum(e["server_errors"] for e in endpoints)
+    return {
+        "window_hours": window_hours,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": {
+            "routes": len(endpoints),
+            "routes_with_traffic": sum(1 for e in endpoints if e["traffic"]),
+            "routes_erroring": sum(1 for e in endpoints if e["server_errors"]),
+            "requests": total_requests,
+            "server_errors": total_server_errors,
+            "uptime_percent": round(100.0 * (total_requests - total_server_errors) / total_requests, 2) if total_requests else None,
+        },
+        "endpoints": endpoints,
+    }
+
+
+@app.get("/admin/uptime/endpoints/series")
+async def endpoint_metric_series(
+    route: str = Query(..., min_length=1, max_length=300),
+    method: str = Query(..., min_length=1, max_length=8),
+    window_hours: int = Query(6, ge=1, le=720),
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Minute-by-minute traffic for one route — the series behind its chart.
+
+    Read from the same rollups the overview table uses, so it is one indexed
+    query rather than a scan over raw requests.
+    """
+    from database_models import EndpointMetric
+
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=window_hours)
+    rows = db.query(EndpointMetric).filter(
+        EndpointMetric.route == route,
+        EndpointMetric.method == method.strip().upper(),
+        EndpointMetric.bucket >= cutoff,
+    ).order_by(EndpointMetric.bucket.asc()).all()
+
+    return {
+        "route": route,
+        "method": method.strip().upper(),
+        "window_hours": window_hours,
+        "points": [
+            {
+                "bucket": r.bucket.isoformat() if r.bucket else None,
+                "requests": int(r.request_count or 0),
+                "success": int(r.success_count or 0),
+                "client_errors": int(r.client_error_count or 0),
+                "server_errors": int(r.server_error_count or 0),
+                "avg_ms": round(int(r.duration_sum_ms or 0) / int(r.request_count)) if r.request_count else None,
+                "max_ms": int(r.duration_max_ms or 0),
+            }
+            for r in rows
+        ],
+    }
 
 
 # ── Org device-policy compliance agent ──────────────────────────────────────

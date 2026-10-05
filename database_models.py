@@ -3,7 +3,7 @@ PostgreSQL Database Models for Secure Messaging System
 Using SQLAlchemy ORM for data modeling and relationships
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, LargeBinary, ForeignKey, Float, JSON, UniqueConstraint, Index
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, DateTime, Boolean, LargeBinary, ForeignKey, Float, JSON, UniqueConstraint, Index
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, relationship
 from sqlalchemy.sql import func
 from datetime import datetime
@@ -1369,6 +1369,84 @@ class UptimeIncident(Base):
     checks_failed = Column(Integer, nullable=False, default=0)
 
     target = relationship("UptimeTarget", foreign_keys=[target_id])
+
+
+# Latency histogram slots on EndpointMetric, in order, paired with the upper
+# bound each represents in milliseconds. The final slot is the overflow:
+# everything at or above the last bound. Declared here and imported by the
+# backend so the column names and the bounds cannot drift apart.
+ENDPOINT_LATENCY_BUCKETS = (
+    ("lat_lt_10", 10),
+    ("lat_lt_25", 25),
+    ("lat_lt_50", 50),
+    ("lat_lt_100", 100),
+    ("lat_lt_250", 250),
+    ("lat_lt_500", 500),
+    ("lat_lt_1000", 1000),
+    ("lat_lt_2500", 2500),
+)
+ENDPOINT_LATENCY_OVERFLOW_COLUMN = "lat_ge_2500"
+
+
+class EndpointMetric(Base):
+    """One minute of real traffic for one route.
+
+    Every request the API serves is timed by a middleware and folded into an
+    in-process counter, which is flushed here in bulk. A row per request would
+    be far too much data for a messaging backend, and probing every route
+    synthetically is not an option — most of the 300-odd routes are POST, PUT
+    or DELETE with real side effects, and probing them would send messages and
+    delete accounts. Measuring the traffic actually served is the only way to
+    cover every endpoint without breaking any of them.
+
+    A route with no row in the window has had no traffic, which the page
+    reports as such rather than as 100% uptime.
+    """
+    __tablename__ = "endpoint_metrics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # The route template ("/admin/users/{username}"), never the concrete path:
+    # a row per id would make this table enormous and useless. Requests that
+    # matched no route collapse to the single literal "<unmatched>".
+    route = Column(String(300), nullable=False)
+    method = Column(String(8), nullable=False)
+    # Truncated to the minute, naive UTC. Naive because the column is a plain
+    # timestamp, and an aware value does not round-trip equal to the one that
+    # went in — which is what the flush uses to spot an existing minute.
+    bucket = Column(DateTime, nullable=False)
+
+    request_count = Column(Integer, nullable=False, default=0)
+    # Split so "uptime" can mean server-side health (5xx) without hiding the
+    # 4xx sharing the same route: a 409 from the one-device login rule is not
+    # the endpoint being down.
+    success_count = Column(Integer, nullable=False, default=0)
+    client_error_count = Column(Integer, nullable=False, default=0)
+    server_error_count = Column(Integer, nullable=False, default=0)
+
+    duration_sum_ms = Column(BigInteger, nullable=False, default=0)
+    duration_max_ms = Column(Integer, nullable=False, default=0)
+
+    # One column per entry in ENDPOINT_LATENCY_BUCKETS, plus the overflow. Real
+    # columns rather than a JSON blob so Postgres can SUM them across a window
+    # — that is what makes a window-wide p95 possible without keeping a row per
+    # request, and what lets the upsert merge counts arithmetically.
+    lat_lt_10 = Column(Integer, nullable=False, default=0)
+    lat_lt_25 = Column(Integer, nullable=False, default=0)
+    lat_lt_50 = Column(Integer, nullable=False, default=0)
+    lat_lt_100 = Column(Integer, nullable=False, default=0)
+    lat_lt_250 = Column(Integer, nullable=False, default=0)
+    lat_lt_500 = Column(Integer, nullable=False, default=0)
+    lat_lt_1000 = Column(Integer, nullable=False, default=0)
+    lat_lt_2500 = Column(Integer, nullable=False, default=0)
+    lat_ge_2500 = Column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        # Makes the flush's ON CONFLICT target exact, and serves per-route reads.
+        UniqueConstraint("route", "method", "bucket", name="uq_endpoint_metrics_route_method_bucket"),
+        # Serves the window scan behind the overview and the nightly prune,
+        # both of which filter on bucket alone.
+        Index("ix_endpoint_metrics_bucket_route", "bucket", "route"),
+    )
 
 
 # Database connection configuration
