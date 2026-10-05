@@ -1063,9 +1063,10 @@ class PersonalPlan(Base):
 
 class GoogleCalendarLink(Base):
     """OAuth token pair for a user's linked Google account, used to pull
-    their Google Calendar events into the same merged calendar feed.
-    Tokens are the standard Google OAuth2 refresh/access pair — access_token
-    is short-lived and refreshed via refresh_token as needed."""
+    their Google Calendar events into the same merged calendar feed and to
+    push Dilarion meetings/tasks into it. Tokens are the standard Google
+    OAuth2 refresh/access pair — access_token is short-lived and refreshed
+    via refresh_token as needed."""
     __tablename__ = "google_calendar_links"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -1075,10 +1076,36 @@ class GoogleCalendarLink(Base):
     refresh_token = Column(Text, nullable=False)
     token_expires_at = Column(DateTime, nullable=True)
     calendar_id = Column(String(255), default="primary")
+    # Space-separated scopes Google actually granted at consent time. Links
+    # created before push support carry the read-only scope, so the client is
+    # told to re-link (needs_relink) rather than silently failing to write.
+    granted_scope = Column(Text, nullable=True)
     linked_at = Column(DateTime, default=func.now())
     last_synced_at = Column(DateTime, nullable=True)
 
     user = relationship("User", foreign_keys=[user_id])
+
+
+class GoogleCalendarEventLink(Base):
+    """Maps one Dilarion meeting/task to the Google Calendar event that
+    mirrors it for one user. Exists so a reschedule patches the same event
+    and a cancellation deletes it, instead of every sync creating a
+    duplicate. One row per (user, source) pair."""
+    __tablename__ = "google_calendar_event_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    source_type = Column(String(20), nullable=False)  # "meeting" | "task"
+    source_id = Column(Integer, nullable=False)
+    google_event_id = Column(String(1024), nullable=False)
+    calendar_id = Column(String(255), default="primary")
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "source_type", "source_id", name="uq_google_event_link_source"),
+    )
 
 
 class ChatSettings(Base):

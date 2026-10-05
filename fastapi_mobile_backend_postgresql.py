@@ -64,7 +64,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Organization, OrganizationAccessRequest, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, ChatSettings, HiddenMessage
+from database_models import User, Organization, OrganizationAccessRequest, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, GoogleCalendarEventLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, ChatSettings, HiddenMessage
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -588,6 +588,37 @@ async def _deliver_invitation(user_id: int, invitation_code: str, purpose: str =
     finally:
         db.close()
 
+
+async def _send_reminder_email(
+    to_email: Optional[str],
+    name: str,
+    subject: str,
+    paragraphs: List[str],
+    details: List[tuple],
+    eyebrow: str,
+) -> bool:
+    """Best-effort reminder email alongside the existing in-app/APNs reminder.
+    Never raises: a bad address or a provider outage must not break the
+    periodic reminder loops, and must not stop the other recipients or the
+    reminder_sent flag from being set."""
+    if not to_email:
+        return False
+    try:
+        body = (
+            f"Dear {name},\n\n" + "\n\n".join(paragraphs) + "\n\n"
+            + "\n".join(f"{label}: {value}" for label, value in details) + "\n\n"
+            "Kind regards,\nThe Dilarion Team"
+        )
+        return await _send_transactional_email(
+            to_email,
+            subject,
+            body,
+            _email_template(subject, f"Dear {name},", paragraphs, details=details, eyebrow=eyebrow),
+        )
+    except Exception as exc:
+        logger.warning("Reminder email to %s failed: %s", to_email, exc)
+        return False
+
 # Pydantic Models
 class UserAuth(BaseModel):
     username: str = Field(..., min_length=3, max_length=50, description="User's username")
@@ -622,6 +653,9 @@ class AdminUpdateUser(BaseModel):
     username: Optional[str] = Field(None, min_length=3, max_length=50)
     phone_number: Optional[str] = Field(None, min_length=10, max_length=20)
     is_active: Optional[bool] = Field(None)
+    # Lets an admin move a user who has no organization into one (or correct a
+    # mis-assignment). Omit to leave the current organization untouched.
+    organization_id: Optional[int] = Field(None)
 
 
 class OrganizationRequestedUser(BaseModel):
@@ -3594,7 +3628,26 @@ class AdminService:
             user.phone_number = user_data.phone_number
         if user_data.is_active is not None:
             user.is_active = user_data.is_active
-            
+        if user_data.organization_id is not None:
+            # Moving a user between organizations (or in from "unassigned") —
+            # audited either way, since it changes what the user can see.
+            organization = db.query(Organization).filter(
+                Organization.id == user_data.organization_id,
+                Organization.is_active == True,
+            ).first()
+            if not organization:
+                raise HTTPException(status_code=404, detail="Organization not found")
+            previous_organization_id = user.organization_id
+            user.organization_id = organization.id
+            if not user.organization_role:
+                user.organization_role = "member"
+            db.commit()
+            AuditService.log_event(
+                db, admin_user_id, "user_organization_changed",
+                f"User {user.username} moved from organization {previous_organization_id or 'unassigned'} "
+                f"to {organization.id} ({organization.name})",
+            )
+
         db.commit()
         db.refresh(user)
         
@@ -3965,6 +4018,22 @@ async def lifespan(app: FastAPI):
                             })
                             if not ws_sent:
                                 await push_to_user(db, p.user_id, "Meeting starting soon", f"{title_text} starts in a few minutes")
+                            # Email as well as the in-app/APNs ping — someone who
+                            # is offline on every device still gets told.
+                            participant = db.query(User).filter(User.id == p.user_id).first()
+                            if participant:
+                                starts_at = meeting.scheduled_at.strftime("%Y-%m-%d %H:%M UTC")
+                                await _send_reminder_email(
+                                    participant.email,
+                                    participant.full_name or participant.username,
+                                    f"Meeting starting soon: {title_text}",
+                                    [
+                                        f"“{title_text}” starts at {starts_at}.",
+                                        "Open the Dilarion app and join with the code below.",
+                                    ],
+                                    [("Meeting", title_text), ("Starts", starts_at), ("Join code", meeting.join_code)],
+                                    "Meeting reminder",
+                                )
                         meeting.reminder_sent = True
                     if due:
                         db.commit()
@@ -4004,6 +4073,20 @@ async def lifespan(app: FastAPI):
                             })
                             if not ws_sent:
                                 await push_to_user(db, uid, "Task due soon", f"{title_text} is due soon")
+                            assignee = db.query(User).filter(User.id == uid).first()
+                            if assignee:
+                                due_at = task.due_at.strftime("%Y-%m-%d %H:%M UTC")
+                                await _send_reminder_email(
+                                    assignee.email,
+                                    assignee.full_name or assignee.username,
+                                    f"Task due soon: {title_text}",
+                                    [
+                                        f"“{title_text}” is due {due_at}.",
+                                        "Open the Dilarion app to review the task or submit your report.",
+                                    ],
+                                    [("Task", title_text), ("Due", due_at)],
+                                    "Task reminder",
+                                )
                         task.reminder_sent = True
                     if due:
                         db.commit()
@@ -4924,6 +5007,46 @@ async def reject_organization_request(
         decision.admin_note,
     )
     return {"status": "rejected"}
+
+
+@app.post("/admin/organization-requests/{request_id}/resend-decision-email", status_code=202)
+async def resend_organization_decision_email(
+    request_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Re-send the approval/rejection email for a request that was already
+    decided. The decision itself is never changed — this only re-delivers the
+    notice when the contact lost it or never received it."""
+    row = db.query(OrganizationAccessRequest).filter(OrganizationAccessRequest.id == request_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Organization request not found")
+    if row.status == "pending":
+        raise HTTPException(status_code=409, detail="This request has not been decided yet")
+
+    username = row.requested_admin_username
+    if not username and row.organization_id:
+        account = db.query(User).filter(
+            User.organization_id == row.organization_id,
+            User.user_type == "organization",
+        ).first()
+        username = account.username if account else None
+
+    background_tasks.add_task(
+        _email_organization_decision,
+        row.status == "approved",
+        row.organization_name,
+        row.contact_name,
+        row.contact_email,
+        username,
+        row.admin_note,
+    )
+    AuditService.log_event(
+        db, int(current_user.id), "organization_decision_email_resent",
+        f"Re-sent {row.status} email for organization request {request_id} to {row.contact_email}",
+    )
+    return {"status": row.status, "message": f"Decision email re-queued to {row.contact_email}"}
 
 
 @app.post("/organization/auth/login")
@@ -7126,6 +7249,7 @@ async def giphy_trending(
 @app.post("/meetings/create")
 async def create_meeting(
     payload: MeetingCreateRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
@@ -7186,6 +7310,7 @@ async def create_meeting(
     })
 
     monitor_record_event("meetings", "create", user_id=creator_id)
+    background_tasks.add_task(_sync_meeting_to_google, int(meeting.id))
     return {
         "meeting_id": meeting.id,
         "join_code": join_code,
@@ -7360,7 +7485,11 @@ async def delete_personal_plan(
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
-GOOGLE_OAUTH_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+# calendar.events covers both reading and writing events, so one scope serves
+# the pull (Google events into the Dilarion calendar) and the push (Dilarion
+# meetings/tasks into Google). Links consented before push support hold a
+# read-only token and are surfaced as needs_relink by /calendar/google/status.
+GOOGLE_OAUTH_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 
 # Short-lived OAuth handshake state — ephemeral by nature (the whole flow is
 # under a minute), so an in-process dict is fine, same precedent as the
@@ -7371,6 +7500,14 @@ _GOOGLE_OAUTH_STATE_TTL_SECONDS = 600
 
 def _google_oauth_configured() -> bool:
     return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
+
+
+def _google_link_can_write(link: GoogleCalendarLink) -> bool:
+    """True when the stored consent actually carries write access. Links made
+    before push support only granted calendar.readonly, so writes are skipped
+    for them instead of failing with a 403 mid-sync."""
+    scope = getattr(link, "granted_scope", None) or ""
+    return "calendar.events" in scope or "https://www.googleapis.com/auth/calendar" in scope
 
 
 @app.get("/calendar/google/authorize")
@@ -7450,6 +7587,11 @@ async def google_calendar_callback(
     expires_in = tokens.get("expires_in", 3600)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
     refresh_token = tokens.get("refresh_token")
+    # Google echoes back exactly what was granted — the only trustworthy
+    # source for "can this link write?", since the requested scope and the
+    # consented scope can differ (e.g. an account that previously approved
+    # read-only and is reusing that consent).
+    granted_scope = tokens.get("scope")
 
     link = db.query(GoogleCalendarLink).filter(GoogleCalendarLink.user_id == user_id).first()
     if link:
@@ -7457,6 +7599,8 @@ async def google_calendar_callback(
         if refresh_token:  # Google only sends this on first consent — keep the old one otherwise
             setattr(link, 'refresh_token', refresh_token)
         setattr(link, 'token_expires_at', expires_at)
+        if granted_scope:
+            setattr(link, 'granted_scope', granted_scope)
         if google_email:
             setattr(link, 'google_email', google_email)
     else:
@@ -7470,7 +7614,7 @@ async def google_calendar_callback(
         link = GoogleCalendarLink(
             user_id=user_id, google_email=google_email,
             access_token=tokens.get("access_token"), refresh_token=refresh_token,
-            token_expires_at=expires_at,
+            token_expires_at=expires_at, granted_scope=granted_scope,
         )
         db.add(link)
     db.commit()
@@ -7491,6 +7635,10 @@ async def google_calendar_status(
     return {
         "linked": True,
         "google_email": link.google_email,
+        "can_push": _google_link_can_write(link),
+        # Set for links consented before two-way sync existed: the client
+        # should prompt a re-link so Dilarion can write events, not just read.
+        "needs_relink": not _google_link_can_write(link),
         "last_synced_at": link.last_synced_at.isoformat() if link.last_synced_at else None,
     }
 
@@ -7581,6 +7729,164 @@ async def _fetch_google_events(db: Session, link: GoogleCalendarLink, start: dat
             "html_link": ev.get("htmlLink"),
         })
     return result
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Rows come back from the DB as naive datetimes; treat them as UTC so a
+    pushed Google event lands at the time the meeting was actually scheduled."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+async def _push_google_event(
+    db: Session,
+    user_id: int,
+    source_type: str,
+    source_id: int,
+    summary: str,
+    description: Optional[str],
+    start: datetime,
+    end: datetime,
+    attendees: Optional[List[str]] = None,
+    cancelled: bool = False,
+) -> Optional[str]:
+    """Mirror one Dilarion meeting/task into a linked user's Google Calendar.
+
+    Create-or-patch is keyed on the (user, source) mapping row, so a
+    reschedule updates the same event instead of spawning a duplicate, and
+    cancelled=True deletes it. Best-effort throughout: an unlinked user, a
+    read-only link, or any Google failure returns None after logging — a
+    calendar push must never fail the API call that triggered it."""
+    if not _google_oauth_configured():
+        return None
+    link = db.query(GoogleCalendarLink).filter(GoogleCalendarLink.user_id == user_id).first()
+    if not link or not _google_link_can_write(link):
+        return None
+
+    mapping = db.query(GoogleCalendarEventLink).filter(
+        GoogleCalendarEventLink.user_id == user_id,
+        GoogleCalendarEventLink.source_type == source_type,
+        GoogleCalendarEventLink.source_id == source_id,
+    ).first()
+    if cancelled and not mapping:
+        return None
+
+    access_token = await _refresh_google_token_if_needed(db, link)
+    if not access_token:
+        return None
+
+    calendar_id = link.calendar_id or "primary"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    base = f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events"
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            if cancelled:
+                resp = await client.delete(f"{base}/{mapping.google_event_id}", headers=headers)
+                # 410 = already gone on Google's side, which is the outcome we want.
+                if resp.status_code not in (200, 204, 410):
+                    logger.warning(f"Google event delete failed for user {user_id} ({source_type}:{source_id}): {resp.status_code}")
+                    return None
+                db.delete(mapping)
+                db.commit()
+                return None
+
+            body: Dict[str, Any] = {
+                "summary": summary,
+                "description": description or "",
+                "start": {"dateTime": _as_utc(start).isoformat(), "timeZone": "UTC"},
+                "end": {"dateTime": _as_utc(end).isoformat(), "timeZone": "UTC"},
+                # Google reminds the user itself; a linked user may therefore
+                # also get the backend's own reminder email. Popup-only keeps
+                # the duplicate noise down while the event still surfaces.
+                "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 10}]},
+                "extendedProperties": {"private": {"dilarionSource": f"{source_type}:{source_id}"}},
+            }
+            if attendees:
+                body["attendees"] = [{"email": email} for email in attendees if email]
+
+            if mapping:
+                resp = await client.patch(f"{base}/{mapping.google_event_id}", headers=headers, json=body)
+            else:
+                resp = await client.post(base, headers=headers, json=body)
+        if resp.status_code not in (200, 201):
+            logger.warning(f"Google event push failed for user {user_id} ({source_type}:{source_id}): {resp.status_code} {resp.text}")
+            return None
+        event_id = resp.json().get("id")
+    except Exception as e:
+        logger.warning(f"Google event push error for user {user_id} ({source_type}:{source_id}): {e}")
+        return None
+
+    if not event_id:
+        return None
+    if mapping:
+        setattr(mapping, 'google_event_id', event_id)
+        setattr(mapping, 'calendar_id', calendar_id)
+    else:
+        db.add(GoogleCalendarEventLink(
+            user_id=user_id, source_type=source_type, source_id=source_id,
+            google_event_id=event_id, calendar_id=calendar_id,
+        ))
+    db.commit()
+    return event_id
+
+
+async def _sync_meeting_to_google(meeting_id: int, cancelled: bool = False) -> None:
+    """Push (or delete) a scheduled meeting in the Google Calendar of every
+    participant holding a write-capable link. Runs as a background task with
+    its own session so a slow Google call never delays the request."""
+    db = next(get_database_session())
+    try:
+        meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
+        if not meeting:
+            return
+        starts = _as_utc(meeting.scheduled_at)
+        ends = starts + timedelta(minutes=int(meeting.duration_minutes or 60))
+        title = meeting.title or "Meeting"
+        description = f"Scheduled in Dilarion. Join code: {meeting.join_code}"
+        participants = db.query(MeetingParticipant).filter(MeetingParticipant.meeting_id == meeting_id).all()
+        for p in participants:
+            await _push_google_event(
+                db, int(p.user_id), "meeting", meeting_id,
+                title, description, starts, ends, cancelled=cancelled,
+            )
+    except Exception as e:
+        logger.warning(f"Google meeting sync failed for meeting {meeting_id}: {e}")
+    finally:
+        db.close()
+
+
+async def _sync_task_to_google(task_id: int, cancelled: bool = False) -> None:
+    """Same, for a task with a due date — assignees and breakout-group members
+    each get the deadline in their own calendar. Tasks without a due_at have
+    nothing to place on a calendar and are skipped."""
+    db = next(get_database_session())
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            return
+        if not task.due_at and not cancelled:
+            return
+        recipient_ids = set()
+        for a in db.query(TaskAssignee).filter(TaskAssignee.task_id == task_id).all():
+            recipient_ids.add(int(a.user_id))
+        for g in db.query(TaskGroup).filter(TaskGroup.task_id == task_id).all():
+            for m in db.query(TaskGroupMember).filter(TaskGroupMember.task_group_id == g.id).all():
+                recipient_ids.add(int(m.user_id))
+        if not recipient_ids:
+            return
+        due = _as_utc(task.due_at) if task.due_at else datetime.now(timezone.utc)
+        title = f"Task due: {task.title or 'Task'}"
+        description = task.description or "Assigned in Dilarion."
+        # A deadline reads better as a short block ending at the due time.
+        for uid in recipient_ids:
+            await _push_google_event(
+                db, uid, "task", task_id,
+                title, description, due - timedelta(minutes=30), due, cancelled=cancelled,
+            )
+    except Exception as e:
+        logger.warning(f"Google task sync failed for task {task_id}: {e}")
+    finally:
+        db.close()
 
 
 # ─── Tasks ───────────────────────────────────────────────────────────────────
@@ -7707,6 +8013,7 @@ async def _spawn_next_task_occurrence(db: Session, task: Task) -> Optional[Task]
 @app.post("/tasks")
 async def create_task(
     payload: TaskCreate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
 ):
@@ -7771,6 +8078,7 @@ async def create_task(
             await push_to_user(db, uid, "New task", f"{creator_username} assigned you: {task.title}")
 
     AuditService.log_event(db, user_id, "task_created", f"Task '{task.title}' (ID {task.id}) created")
+    background_tasks.add_task(_sync_task_to_google, int(task.id))
     return _task_dict(db, task)
 
 
@@ -7819,6 +8127,7 @@ async def get_task(
 async def update_task_status(
     task_id: int,
     payload: TaskStatusUpdate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
 ):
@@ -7839,6 +8148,13 @@ async def update_task_status(
     next_task = None
     if payload.status == "completed" and task.recurrence:
         next_task = await _spawn_next_task_occurrence(db, task)
+
+    # A finished or cancelled task has no deadline left to show in a calendar;
+    # reopening one puts the event back.
+    if payload.status in ("completed", "cancelled"):
+        background_tasks.add_task(_sync_task_to_google, task_id, True)
+    else:
+        background_tasks.add_task(_sync_task_to_google, task_id)
 
     result = _task_dict(db, task)
     if next_task:
@@ -8210,6 +8526,7 @@ async def deny_from_waiting_room(
 @app.post("/meetings/{meeting_id}/cancel")
 async def cancel_meeting(
     meeting_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
@@ -8220,6 +8537,7 @@ async def cancel_meeting(
         raise HTTPException(status_code=403, detail="Only the creator can cancel this meeting")
     meeting.status = "cancelled"
     db.commit()
+    background_tasks.add_task(_sync_meeting_to_google, int(meeting.id), True)
     return {"success": True}
 
 
@@ -12649,6 +12967,52 @@ async def admin_get_all_users(current_user: User = Depends(get_admin_user),
     except Exception as e:
         logger.error(f"Admin get users error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve users")
+
+
+@app.post("/admin/users/{user_id}/resend-invitation", status_code=202)
+async def admin_resend_invitation(
+    user_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Re-issue a one-time activation code for a staff member whose invitation
+    was lost or has expired. Only the SHA-256 digest of a code is ever stored,
+    so the original code cannot be re-sent — a fresh one is generated and the
+    72-hour window restarts."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if getattr(user, "invitation_accepted_at", None):
+        raise HTTPException(
+            status_code=409,
+            detail="This account has already been activated — use a password reset instead",
+        )
+    if not user.email and not user.phone_number:
+        raise HTTPException(status_code=400, detail="This user has no email address or phone number to deliver to")
+
+    invitation_code = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    setattr(user, 'invitation_token_hash', _invitation_digest(invitation_code))
+    setattr(user, 'invitation_expires_at', now + timedelta(hours=72))
+    setattr(user, 'invited_at', now)
+    setattr(user, 'invitation_accepted_at', None)
+    setattr(user, 'invitation_delivery_errors', None)
+    setattr(user, 'is_active', True)
+    db.commit()
+
+    background_tasks.add_task(_deliver_invitation, user_id, invitation_code)
+    AuditService.log_event(
+        db, int(current_user.id), "invitation_resent",
+        f"Re-issued invitation for user {user.username} (ID {user_id})",
+    )
+    return {
+        "user_id": user_id,
+        "username": str(user.username),
+        "invitation_expires_at": (now + timedelta(hours=72)).isoformat(),
+        "message": "A fresh activation code was queued by email and SMS",
+    }
+
 
 # Directory to temporarily store uploaded files
 UPLOAD_DIR = "media_uploads"
