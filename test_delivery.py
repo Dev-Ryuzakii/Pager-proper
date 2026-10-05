@@ -88,6 +88,9 @@ def test_email(to_email):
     port = int(os.getenv("SMTP_PORT", "465" if smtp_host == "smtp.resend.com" else "587"))
     use_ssl = os.getenv("SMTP_SSL", "1" if port in (465, 2465) else "0") == "1"
     use_starttls = os.getenv("SMTP_STARTTLS", "0" if use_ssl else "1") == "1"
+    # Mirror the server: STARTTLS on an implicit-SSL socket (465) always fails.
+    if use_ssl:
+        use_starttls = False
     print(f"  host={smtp_host} port={port} ssl={use_ssl} starttls={use_starttls} user={smtp_user}")
     print(f"  from={from_email}")
 
@@ -163,6 +166,12 @@ def test_sms(phone):
         "Authorization": f"Bearer {sendchamp_key}",
         "Accept": "application/json",
         "Content-Type": "application/json",
+        # Sendchamp's Cloudflare bans the default python UA (error 1010).
+        "User-Agent": os.getenv(
+            "SENDCHAMP_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        ),
     })
     print(f"  POST {url}")
     print(f"  sender_name={os.getenv('SENDCHAMP_SENDER_NAME', 'Sendchamp')} route={os.getenv('SENDCHAMP_ROUTE', 'dnd')}")

@@ -487,6 +487,14 @@ async def _send_sms(phone: Optional[str], text: str) -> Optional[str]:
                         "Authorization": f"Bearer {sendchamp_key}",
                         "Accept": "application/json",
                         "Content-Type": "application/json",
+                        # Sendchamp sits behind Cloudflare, which bans the
+                        # default python-httpx user-agent (error 1010). Send a
+                        # normal browser UA so the request is accepted.
+                        "User-Agent": os.getenv(
+                            "SENDCHAMP_USER_AGENT",
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                        ),
                     },
                     json={
                         "to": [to],
