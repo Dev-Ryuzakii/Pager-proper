@@ -3,7 +3,7 @@ PostgreSQL Database Models for Secure Messaging System
 Using SQLAlchemy ORM for data modeling and relationships
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, LargeBinary, ForeignKey, Float, JSON, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, LargeBinary, ForeignKey, Float, JSON, UniqueConstraint, Index
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, relationship
 from sqlalchemy.sql import func
 from datetime import datetime
@@ -95,6 +95,17 @@ class User(Base):
     mastertoken_2fa_enabled = Column(Boolean, default=False)
     mastertoken_2fa_hash = Column(String(255), nullable=True)
     mastertoken_2fa_salt = Column(String(255), nullable=True)
+
+    # Admin/operator suspension. Deliberately separate from is_active so a
+    # suspension stays distinguishable from an ordinary deactivation and can be
+    # reversed on its own. A suspended account fails every authentication gate
+    # with the same bare 401 an expired session produces, and is never sent any
+    # email, SMS or push about it — the account simply stops working.
+    # suspension_reason is for the admin console only and is never returned to
+    # the suspended user.
+    suspended_at = Column(DateTime, nullable=True, index=True)
+    suspended_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    suspension_reason = Column(Text, nullable=True)
 
     profile_picture_path = Column(String(512), nullable=True)
     onboarding_completed_at = Column(DateTime, nullable=True)
@@ -1284,9 +1295,80 @@ class ServiceEvent(Base):
     detail = Column(Text, nullable=True)
     duration_ms = Column(Integer, nullable=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Resolved from the acting user when the event is written, so the monitor
+    # can be read per tenant without joining users on every event query. Null
+    # for events with no user (webhook deliveries, uptime probes, auth failures
+    # that never identified anyone).
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=func.now(), index=True)
 
     user = relationship("User", foreign_keys=[user_id])
+
+
+class UptimeTarget(Base):
+    """One endpoint the uptime checker probes on a schedule.
+
+    organization_id is nullable on purpose: null means a platform-wide target
+    (the API, the web site, the admin console) that is not owned by any tenant.
+    """
+    __tablename__ = "uptime_targets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(120), nullable=False)
+    url = Column(String(1000), nullable=False)
+    method = Column(String(8), nullable=False, default="GET")  # "GET" | "HEAD"
+    expected_status = Column(Integer, nullable=False, default=200)
+    interval_seconds = Column(Integer, nullable=False, default=60)
+    timeout_ms = Column(Integer, nullable=False, default=10000)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+    # Denormalized from the latest UptimeCheck so the scheduler's due-target
+    # query and the page's status column don't need a per-target subquery.
+    last_checked_at = Column(DateTime, nullable=True)
+    last_status = Column(String(10), nullable=False, default="unknown")  # "up" | "down" | "unknown"
+    last_response_ms = Column(Integer, nullable=True)
+    last_error = Column(String(300), nullable=True)
+
+    organization = relationship("Organization", foreign_keys=[organization_id])
+    __table_args__ = (
+        Index("ix_uptime_targets_active_last_checked", "is_active", "last_checked_at"),
+    )
+
+
+class UptimeCheck(Base):
+    """One probe result. The raw series behind the response-time chart and the
+    uptime percentage; rows are small and pruned by the retention policy."""
+    __tablename__ = "uptime_checks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_id = Column(Integer, ForeignKey("uptime_targets.id"), nullable=False, index=True)
+    checked_at = Column(DateTime, default=func.now(), nullable=False, index=True)
+    ok = Column(Boolean, nullable=False)
+    status_code = Column(Integer, nullable=True)
+    response_ms = Column(Integer, nullable=True)
+    # Short reason only ("HTTP 502", "connect timeout") — never a response body.
+    error = Column(String(300), nullable=True)
+
+    target = relationship("UptimeTarget", foreign_keys=[target_id])
+
+
+class UptimeIncident(Base):
+    """A down window: opened by the first failed probe, closed by the first
+    successful one. Kept as its own row so the page can show incident history
+    and durations without scanning the check series."""
+    __tablename__ = "uptime_incidents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_id = Column(Integer, ForeignKey("uptime_targets.id"), nullable=False, index=True)
+    started_at = Column(DateTime, default=func.now(), nullable=False, index=True)
+    resolved_at = Column(DateTime, nullable=True)
+    last_error = Column(String(300), nullable=True)
+    checks_failed = Column(Integer, nullable=False, default=0)
+
+    target = relationship("UptimeTarget", foreign_keys=[target_id])
 
 
 # Database connection configuration

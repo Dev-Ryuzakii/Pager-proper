@@ -16,10 +16,16 @@ Access control: superadmin sees every service. An admin/operator also sees
 every service until a superadmin narrows them via the `monitored_services`
 column — NULL means "never restricted" (default: all), while an explicitly
 saved list (including an empty one) is a deliberate restriction.
+
+Organization: every event is attributed to a tenant — the caller may pass
+`organization_id` directly, otherwise it is resolved from the acting user when
+the event is written. Readers may scope to one organization, and the realtime
+fan-out honors the same scope per subscriber.
 """
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import WebSocket
@@ -42,6 +48,9 @@ SERVICE_NAMES: List[str] = [
     "decryption",
     "webhooks",
     "devices",
+    # Fed by the uptime checker's own scheduler rather than request handlers —
+    # a target going down or recovering appears in the same feed.
+    "uptime",
 ]
 
 
@@ -75,15 +84,39 @@ def record_event(
     detail: Optional[str] = None,
     duration_ms: Optional[int] = None,
     user_id: Optional[int] = None,
+    organization_id: Optional[int] = None,
 ) -> None:
     """Fire-and-forget. Safe to call from any async request handler; does
-    nothing (just logs) if called with no running event loop."""
+    nothing (just logs) if called with no running event loop.
+
+    `organization_id` is optional — pass it when the call site already knows
+    the tenant; otherwise it is resolved from the user inside the background
+    task, so no existing call site had to change."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         logger.debug("record_event(%s.%s) called with no running loop, dropped", service, event_type)
         return
-    loop.create_task(_persist_and_broadcast(service, event_type, status, detail, duration_ms, user_id))
+    loop.create_task(
+        _persist_and_broadcast(service, event_type, status, detail, duration_ms, user_id, organization_id)
+    )
+
+
+def _resolve_organization_id(db, user_id: Optional[int], organization_id: Optional[int]) -> Optional[int]:
+    """The tenant an event belongs to: whatever the caller passed, else the
+    acting user's organization. Runs on the background task's own session."""
+    if organization_id is not None:
+        return organization_id
+    if user_id is None:
+        return None
+    try:
+        from database_models import User
+
+        return db.query(User.organization_id).filter(User.id == user_id).scalar()
+    except Exception:
+        # Attribution is best-effort; an event must still be recorded without it.
+        logger.exception("service_monitor: could not resolve organization for user_id=%s", user_id)
+        return None
 
 
 async def _persist_and_broadcast(
@@ -93,6 +126,7 @@ async def _persist_and_broadcast(
     detail: Optional[str],
     duration_ms: Optional[int],
     user_id: Optional[int],
+    organization_id: Optional[int] = None,
 ) -> None:
     from database_models import SessionLocal, ServiceEvent
 
@@ -100,6 +134,7 @@ async def _persist_and_broadcast(
     try:
         db = SessionLocal()
         try:
+            resolved_org_id = _resolve_organization_id(db, user_id, organization_id)
             row = ServiceEvent(
                 service=service,
                 event_type=event_type,
@@ -107,6 +142,7 @@ async def _persist_and_broadcast(
                 detail=(detail or None) and str(detail)[:500],
                 duration_ms=duration_ms,
                 user_id=user_id,
+                organization_id=resolved_org_id,
             )
             db.add(row)
             db.commit()
@@ -127,6 +163,7 @@ async def _persist_and_broadcast(
         "detail": detail,
         "duration_ms": duration_ms,
         "user_id": user_id,
+        "organization_id": event_row.organization_id,
         "created_at": event_row.created_at.isoformat() if event_row.created_at else None,
     }
     await _broadcast(payload)
@@ -136,15 +173,22 @@ async def _persist_and_broadcast(
 # Separate from the main chat ws_manager on purpose: this is a broadcast
 # filtered per-subscriber by allowed service set, not a send-to-one-user model.
 
+@dataclass(frozen=True)
+class MonitorFilter:
+    """What one subscriber may see. `services` is None for "every channel";
+    `organization_id` is None for "every organization"."""
+    services: Optional[Set[str]] = None
+    organization_id: Optional[int] = None
+
+
 class _MonitorHub:
     def __init__(self):
-        # websocket -> None (all services, superadmin) | Set[str] (allowed services)
-        self._subscribers: Dict[WebSocket, Optional[Set[str]]] = {}
+        self._subscribers: Dict[WebSocket, MonitorFilter] = {}
         self._lock = asyncio.Lock()
 
-    async def subscribe(self, websocket: WebSocket, allowed_services: Optional[Set[str]]) -> None:
+    async def subscribe(self, websocket: WebSocket, filter_: MonitorFilter) -> None:
         async with self._lock:
-            self._subscribers[websocket] = allowed_services
+            self._subscribers[websocket] = filter_
 
     async def unsubscribe(self, websocket: WebSocket) -> None:
         async with self._lock:
@@ -152,10 +196,15 @@ class _MonitorHub:
 
     async def broadcast(self, payload: Dict[str, Any]) -> None:
         service = payload.get("service")
+        organization_id = payload.get("organization_id")
         async with self._lock:
             targets = list(self._subscribers.items())
-        for ws, allowed in targets:
-            if allowed is not None and service not in allowed:
+        for ws, sub in targets:
+            if sub.services is not None and service not in sub.services:
+                continue
+            # A subscriber scoped to one tenant must not receive another's
+            # events — including platform-wide events that carry no tenant.
+            if sub.organization_id is not None and organization_id != sub.organization_id:
                 continue
             try:
                 await ws.send_json(payload)
@@ -170,8 +219,8 @@ async def _broadcast(payload: Dict[str, Any]) -> None:
     await _hub.broadcast(payload)
 
 
-async def subscribe(websocket: WebSocket, allowed_services: Optional[Set[str]]) -> None:
-    await _hub.subscribe(websocket, allowed_services)
+async def subscribe(websocket: WebSocket, filter_: MonitorFilter) -> None:
+    await _hub.subscribe(websocket, filter_)
 
 
 async def unsubscribe(websocket: WebSocket) -> None:

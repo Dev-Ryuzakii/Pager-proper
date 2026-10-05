@@ -29,11 +29,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, File, Form, UploadFile, Response, Request, WebSocket, WebSocketDisconnect, Body, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 import uvicorn
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, func, case
 
 # Import cryptographic libraries
 from Crypto.Cipher import AES, PKCS1_OAEP
@@ -90,6 +90,7 @@ from service_monitor import (
     service_allowed as monitor_service_allowed,
     subscribe as monitor_subscribe,
     unsubscribe as monitor_unsubscribe,
+    MonitorFilter as MonitorFilter_,
 )
 
 # Configure logging
@@ -163,6 +164,15 @@ def _require_same_organization(actor: User, target: User) -> None:
         # Deliberately indistinguishable from a missing account to avoid tenant
         # enumeration.
         raise HTTPException(status_code=404, detail="User not found")
+
+
+def _account_frozen(user) -> bool:
+    """True while an admin/operator has suspended this account.
+
+    Suspension is silent: callers reject with the same bare 401 an expired
+    session produces, so a suspended user is never told what happened, and no
+    email, SMS or push is ever sent about it."""
+    return getattr(user, "suspended_at", None) is not None
 
 
 def _decode_camera_image(value: str) -> tuple[bytes, str]:
@@ -3714,12 +3724,19 @@ class AdminService:
         """Check if user is an admin"""
         user = db.query(User).filter(User.id == user_id, User.is_admin == True).first()
         return user is not None
-    
+
     @staticmethod
     def authenticate_user(db: Session, username: str, token: str, ip_address: Optional[str] = None) -> Optional[User]:
         """Authenticate a user without ever storing their new login token in
         plaintext.  User.token remains a read-only legacy fallback."""
-        user = db.query(User).filter(User.username == username, User.is_active == True).first()
+        # A suspended account never authenticates: the caller turns this None
+        # into the same generic 401 a wrong token produces, so nothing signals
+        # to the user that they were suspended.
+        user = db.query(User).filter(
+            User.username == username,
+            User.is_active == True,
+            User.suspended_at.is_(None),
+        ).first()
         if user and not bool(getattr(user, "is_admin", False)):
             valid_hash = bool(user.password_hash and verify_password(token, user.password_hash))
             valid_legacy = bool(user.token and hmac.compare_digest(str(user.token), token))
@@ -4350,6 +4367,74 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Task reminder error: {e}")
 
+    async def periodic_uptime_checks():
+        while True:
+            try:
+                # Wake often and let each target's own interval decide whether
+                # it is due, so a 30-second target isn't tied to a slow tick.
+                await asyncio.sleep(15)
+                from types import SimpleNamespace
+                from database_models import UptimeTarget, UptimeCheck
+
+                now = datetime.now(timezone.utc)
+
+                # Snapshot what is due, then release the connection before any
+                # network I/O — a slow endpoint must not hold a pooled session.
+                db = next(get_database_session())
+                try:
+                    due = _uptime_targets_due(
+                        db.query(UptimeTarget).filter(UptimeTarget.is_active == True).all(), now
+                    )
+                    snapshots = [
+                        (int(t.id), SimpleNamespace(
+                            id=t.id, name=t.name, url=t.url, method=t.method,
+                            expected_status=t.expected_status, timeout_ms=t.timeout_ms,
+                            organization_id=t.organization_id,
+                        ))
+                        for t in due
+                    ]
+                finally:
+                    db.close()
+
+                # Probe concurrently, but bound the fan-out so a long target
+                # list can't open hundreds of sockets at once.
+                semaphore = asyncio.Semaphore(10)
+
+                async def probe_and_store(target_id: int, snapshot):
+                    async with semaphore:
+                        result = await _probe_uptime_target(snapshot)
+                    write_db = next(get_database_session())
+                    try:
+                        row = write_db.query(UptimeTarget).filter(UptimeTarget.id == target_id).first()
+                        if row:
+                            _apply_uptime_result(write_db, row, result)
+                    finally:
+                        write_db.close()
+
+                if snapshots:
+                    results = await asyncio.gather(
+                        *(probe_and_store(tid, snap) for tid, snap in snapshots),
+                        return_exceptions=True,
+                    )
+                    for outcome in results:
+                        if isinstance(outcome, Exception):
+                            logger.warning(f"Uptime probe failed: {outcome}")
+
+                # Cheap once-a-day prune of the raw series; incidents are kept.
+                if now.hour == 3 and now.minute < 5:
+                    prune_db = next(get_database_session())
+                    try:
+                        cutoff = now - timedelta(days=UPTIME_CHECK_RETENTION_DAYS)
+                        removed = prune_db.query(UptimeCheck).filter(UptimeCheck.checked_at < cutoff) \
+                            .delete(synchronize_session=False)
+                        prune_db.commit()
+                        if removed:
+                            logger.info(f"Uptime: pruned {removed} check(s) older than {UPTIME_CHECK_RETENTION_DAYS} days")
+                    finally:
+                        prune_db.close()
+            except Exception as e:
+                logger.error(f"Uptime check error: {e}")
+
     async def periodic_retention_enforcement():
         while True:
             try:
@@ -4385,6 +4470,7 @@ async def lifespan(app: FastAPI):
     meeting_reminder_task = asyncio.create_task(periodic_meeting_reminders())
     task_reminder_task = asyncio.create_task(periodic_task_reminders())
     retention_task = asyncio.create_task(periodic_retention_enforcement())
+    uptime_task = asyncio.create_task(periodic_uptime_checks())
 
     yield
 
@@ -4394,6 +4480,7 @@ async def lifespan(app: FastAPI):
     cleanup_task.cancel()
     meeting_reminder_task.cancel()
     retention_task.cancel()
+    uptime_task.cancel()
     
     # Shutdown
     logger.info("📴 Shutting down FastAPI Mobile Backend")
@@ -4476,6 +4563,31 @@ class ConnectionManager:
                 self._usernames.pop(user_id, None)
         logger.info(f"WS disconnected: user_id={user_id}")
         await self.broadcast_online_status()
+
+    async def disconnect_user(self, user_id: int) -> int:
+        """Close every live socket this user has open, on every device.
+
+        Used when an account is suspended: the socket loop does no re-check of
+        the account's state, so without this the frozen client would keep
+        receiving events over an already-open connection. Returns how many
+        sockets were closed."""
+        conns = self._connections.pop(user_id, None) or {}
+        self._usernames.pop(user_id, None)
+        closed = 0
+        for device_id, ws in list(conns.items()):
+            self._devices.pop(device_id, None)
+            try:
+                await ws.close(code=4001)
+                closed += 1
+            except Exception:
+                pass
+        if closed:
+            logger.info(f"WS force-closed {closed} socket(s) for user_id={user_id}")
+            try:
+                await self.broadcast_online_status()
+            except Exception:
+                pass
+        return closed
 
     async def send_to_user(self, user_id: int, data: dict) -> bool:
         """Send to ALL devices of a user. Returns True if at least one sent."""
@@ -4595,7 +4707,11 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             )
 
         # Get user
-        user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
+        user = db.query(User).filter(
+            User.id == user_id,
+            User.is_active == True,
+            User.suspended_at.is_(None),
+        ).first()
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -4635,7 +4751,11 @@ async def get_onboarding_user(
     session = SessionService.validate_session(db, token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
-    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    user = db.query(User).filter(
+        User.id == session.user_id,
+        User.is_active == True,
+        User.suspended_at.is_(None),
+    ).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return user
@@ -4652,6 +4772,7 @@ async def get_organization_viewer(
     user = db.query(User).filter(
         User.id == session.user_id,
         User.is_active == True,
+        User.suspended_at.is_(None),
         User.organization_role == "viewer",
     ).first()
     if not user or not user.organization_id:
@@ -4727,7 +4848,7 @@ async def websocket_chat(
             await websocket.close(code=4001)
             return
         _ws_auth_ok(token)
-        user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+        user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
         if not user:
             await websocket.close(code=4001)
             return
@@ -5385,6 +5506,7 @@ async def organization_account_login(
         User.username == payload.username.strip().lower(),
         User.organization_role == "viewer",
         User.is_active == True,
+        User.suspended_at.is_(None),
     ).first()
     if not account or not account.password_hash or not verify_password(payload.password, account.password_hash):
         raise HTTPException(status_code=401, detail="Invalid organization username or password")
@@ -12221,7 +12343,7 @@ async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(sec
         session = SessionService.validate_session(db, token)
         if not session:
             raise HTTPException(status_code=401, detail="Invalid or expired session", headers={"WWW-Authenticate": "Bearer"})
-        user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.is_admin == True).first()
+        user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None), User.is_admin == True).first()
         if not user:
             raise HTTPException(status_code=403, detail="Admin access required")
         return user
@@ -12613,9 +12735,12 @@ async def delete_operator(
 
 # Must match the `path` segments in pager-admin's AdminLayout.jsx ALL_NAV.
 ADMIN_PAGE_KEYS = [
-    "users", "groups", "emergency", "field-ops", "wipe-approvals",
-    "account-deletions", "recordings", "operators", "service-health",
-    "device-policy", "kill-switch", "data-purge", "settings", "audit",
+    # Must mirror ALL_NAV in pager-admin's AdminLayout.jsx — the superadmin page
+    # picker lists every page here, and an unknown key is rejected outright.
+    "organizations", "users", "groups", "emergency", "field-ops",
+    "wipe-approvals", "account-deletions", "password-resets", "recordings",
+    "service-health", "uptime", "device-policy", "operators", "audit",
+    "kill-switch", "data-purge", "settings",
 ]
 
 class SetServiceAccessRequest(BaseModel):
@@ -12683,38 +12808,50 @@ async def set_service_access(
 
 @app.get("/admin/service-health/services")
 async def list_service_health_services(
+    organization_id: Optional[int] = Query(None, description="Narrow the counts to one organization's events"),
     current_admin: User = Depends(get_admin_user),
     db: Session = Depends(get_database_session),
 ):
     """Known service names, filtered to what this admin may view, with a quick
     ok/error count over the last hour so the dashboard can render a status dot
-    before the realtime feed has produced anything."""
+    before the realtime feed has produced anything. Pass `organization_id` to
+    count only that tenant's events."""
     from database_models import ServiceEvent
     since = datetime.now(timezone.utc) - timedelta(hours=1)
     allowed = monitor_allowed_service_names(current_admin)
     visible = MONITOR_SERVICE_NAMES if allowed is None else [s for s in MONITOR_SERVICE_NAMES if s in allowed]
     result = []
     for service in visible:
-        ok_count = db.query(ServiceEvent).filter(
-            ServiceEvent.service == service, ServiceEvent.status == "ok", ServiceEvent.created_at >= since,
-        ).count()
-        error_count = db.query(ServiceEvent).filter(
-            ServiceEvent.service == service, ServiceEvent.status == "error", ServiceEvent.created_at >= since,
-        ).count()
-        result.append({"service": service, "ok_count_1h": ok_count, "error_count_1h": error_count})
-    return {"services": result, "is_superadmin": getattr(current_admin, 'admin_role', None) == 'superadmin'}
+        base = db.query(ServiceEvent).filter(
+            ServiceEvent.service == service, ServiceEvent.created_at >= since,
+        )
+        if organization_id is not None:
+            base = base.filter(ServiceEvent.organization_id == organization_id)
+        result.append({
+            "service": service,
+            "ok_count_1h": base.filter(ServiceEvent.status == "ok").count(),
+            "error_count_1h": base.filter(ServiceEvent.status == "error").count(),
+        })
+    return {
+        "services": result,
+        "is_superadmin": getattr(current_admin, 'admin_role', None) == 'superadmin',
+        "organization_id": organization_id,
+    }
 
 @app.get("/admin/service-health/events")
 async def list_service_health_events(
     service: Optional[str] = None,
     status_filter: Optional[str] = Query(None, alias="status"),
+    organization_id: Optional[int] = Query(None, description="Only events attributed to this organization"),
+    user_id: Optional[int] = Query(None, description="Only events attributed to this user"),
     limit: int = 100,
     current_admin: User = Depends(get_admin_user),
     db: Session = Depends(get_database_session),
 ):
     """Recent events, most recent first. `service` (optional) narrows to one
     channel this admin is allowed to see; omitted, returns every channel they
-    can see. `status` optionally filters to 'ok' or 'error'."""
+    can see. `status` optionally filters to 'ok' or 'error'. `organization_id`
+    and `user_id` scope the feed to one tenant or one person."""
     from database_models import ServiceEvent
     if service is not None:
         if not monitor_service_allowed(current_admin, service):
@@ -12728,14 +12865,78 @@ async def list_service_health_events(
     q = db.query(ServiceEvent).filter(ServiceEvent.service.in_(allowed_services))
     if status_filter in ("ok", "error"):
         q = q.filter(ServiceEvent.status == status_filter)
+    if organization_id is not None:
+        q = q.filter(ServiceEvent.organization_id == organization_id)
+    if user_id is not None:
+        q = q.filter(ServiceEvent.user_id == user_id)
     rows = q.order_by(ServiceEvent.created_at.desc()).limit(min(max(limit, 1), 500)).all()
     return {"events": [
         {
             "id": r.id, "service": r.service, "event_type": r.event_type, "status": r.status,
             "detail": r.detail, "duration_ms": r.duration_ms, "user_id": r.user_id,
+            "organization_id": r.organization_id,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         } for r in rows
     ]}
+
+@app.get("/admin/service-health/users")
+async def list_service_health_users(
+    organization_id: Optional[int] = Query(None, description="Roll up only this organization's users"),
+    window_hours: int = Query(24, ge=1, le=720),
+    limit: int = Query(200, ge=1, le=1000),
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Per-user activity rollup for the organization view — who under this
+    organization is generating events, and how many of them failed. Without
+    `organization_id` this returns the busiest users across every organization,
+    which is what the unscoped view shows. One grouped query, no N+1."""
+    from database_models import ServiceEvent
+    since = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    allowed = monitor_allowed_service_names(current_admin)
+    visible = MONITOR_SERVICE_NAMES if allowed is None else [s for s in MONITOR_SERVICE_NAMES if s in allowed]
+    if not visible:
+        return {"users": [], "window_hours": window_hours}
+
+    ok_expr = func.sum(case((ServiceEvent.status == "ok", 1), else_=0))
+    error_expr = func.sum(case((ServiceEvent.status == "error", 1), else_=0))
+    q = db.query(
+        ServiceEvent.user_id.label("user_id"),
+        ok_expr.label("ok_count"),
+        error_expr.label("error_count"),
+        func.max(ServiceEvent.created_at).label("last_event_at"),
+    ).filter(
+        ServiceEvent.service.in_(visible),
+        ServiceEvent.created_at >= since,
+        ServiceEvent.user_id.isnot(None),
+    )
+    if organization_id is not None:
+        q = q.filter(ServiceEvent.organization_id == organization_id)
+    rows = q.group_by(ServiceEvent.user_id).order_by(func.max(ServiceEvent.created_at).desc()).limit(limit).all()
+
+    user_ids = [r.user_id for r in rows]
+    people = {}
+    if user_ids:
+        for u in db.query(User).filter(User.id.in_(user_ids)).all():
+            org = db.query(Organization).filter(Organization.id == u.organization_id).first() if u.organization_id else None
+            people[int(u.id)] = {
+                "username": str(u.username),
+                "full_name": getattr(u, "full_name", None),
+                "organization_id": getattr(u, "organization_id", None),
+                "organization_name": org.name if org else None,
+            }
+    return {"users": [
+        {
+            "user_id": r.user_id,
+            "username": people.get(r.user_id, {}).get("username"),
+            "full_name": people.get(r.user_id, {}).get("full_name"),
+            "organization_id": people.get(r.user_id, {}).get("organization_id"),
+            "organization_name": people.get(r.user_id, {}).get("organization_name"),
+            "ok_count": int(r.ok_count or 0),
+            "error_count": int(r.error_count or 0),
+            "last_event_at": r.last_event_at.isoformat() if r.last_event_at else None,
+        } for r in rows
+    ], "window_hours": window_hours, "organization_id": organization_id}
 
 @app.get("/admin/users/{username}/activity")
 async def admin_user_activity(
@@ -12791,10 +12992,13 @@ async def report_client_event(
     return {"recorded": True}
 
 @app.websocket("/admin/service-health/live")
-async def service_health_live(websocket: WebSocket, token: Optional[str] = None):
+async def service_health_live(websocket: WebSocket, token: Optional[str] = None,
+                              organization_id: Optional[int] = None):
     """Realtime fan-out of every ServiceEvent this admin is allowed to see.
     Auth via ?token= (browsers can't set WS headers) — same session-token
-    validation as the main chat socket, plus an is_admin check."""
+    validation as the main chat socket, plus an is_admin check. Pass
+    ?organization_id= to receive only that tenant's events, matching the
+    filter the REST feed was loaded with."""
     db = None
     try:
         if not token:
@@ -12808,14 +13012,18 @@ async def service_health_live(websocket: WebSocket, token: Optional[str] = None)
         if not session:
             await websocket.close(code=4001)
             return
-        user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.is_admin == True).first()
+        user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None), User.is_admin == True).first()
         if not user:
             await websocket.close(code=4003)
             return
         allowed_services = monitor_allowed_service_names(user)
         await websocket.accept()
-        await monitor_subscribe(websocket, allowed_services)
-        await websocket.send_json({"type": "connected", "services": MONITOR_SERVICE_NAMES if allowed_services is None else sorted(allowed_services)})
+        await monitor_subscribe(websocket, MonitorFilter_(services=allowed_services, organization_id=organization_id))
+        await websocket.send_json({
+            "type": "connected",
+            "services": MONITOR_SERVICE_NAMES if allowed_services is None else sorted(allowed_services),
+            "organization_id": organization_id,
+        })
         try:
             while True:
                 # This socket is receive-only from the client's side (server pushes
@@ -12832,6 +13040,375 @@ async def service_health_live(websocket: WebSocket, token: Optional[str] = None)
             pass
         if db:
             db.close()
+
+# ── Uptime checker ──────────────────────────────────────────────────────────
+# A conventional synthetic checker: admins configure endpoints, a background
+# loop probes each one on its own interval, and every probe is stored so the
+# page can show uptime %, response times and incident history.
+#
+# Known limitation, stated plainly: the scheduler runs inside this API process,
+# so it cannot report this process being down. It watches everything else —
+# the web site, the admin console, upstream dependencies — plus the API's own
+# /health answered by any other replica.
+
+# A target may not be probed more often than this, however it was configured.
+UPTIME_MIN_INTERVAL_SECONDS = 30
+# How long raw probe rows are kept. Incidents survive; the per-check series is
+# a chart source, not a record.
+UPTIME_CHECK_RETENTION_DAYS = 30
+
+
+class UptimeTargetRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=120)
+    url: str = Field(..., min_length=8, max_length=1000)
+    method: str = Field("GET", description="GET or HEAD")
+    expected_status: int = Field(200, ge=100, le=599)
+    interval_seconds: int = Field(60, ge=UPTIME_MIN_INTERVAL_SECONDS, le=86400)
+    timeout_ms: int = Field(10000, ge=1000, le=60000)
+    organization_id: Optional[int] = Field(None, description="Null makes the target platform-wide rather than tenant-owned")
+    is_active: bool = True
+
+    @field_validator("url")
+    @classmethod
+    def _http_url(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not re.match(r"^https?://", cleaned, re.IGNORECASE):
+            raise ValueError("URL must start with http:// or https://")
+        return cleaned
+
+    @field_validator("method")
+    @classmethod
+    def _known_method(cls, value: str) -> str:
+        method = value.strip().upper()
+        if method not in ("GET", "HEAD"):
+            raise ValueError("method must be GET or HEAD")
+        return method
+
+
+async def _probe_uptime_target(target: "UptimeTarget") -> dict:
+    """One probe. Never raises — a network failure is a result, not an error."""
+    method = (getattr(target, "method", None) or "GET").upper()
+    raw_timeout_ms = int(getattr(target, "timeout_ms", 10000) or 10000)
+    timeout = httpx.Timeout(max(raw_timeout_ms, 1000) / 1000.0)
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.request(method, str(target.url))
+        elapsed = int((time.perf_counter() - started) * 1000)
+        expected = int(getattr(target, "expected_status", 200) or 200)
+        ok = response.status_code == expected
+        return {
+            "ok": ok,
+            "status_code": int(response.status_code),
+            "response_ms": elapsed,
+            "error": None if ok else f"HTTP {response.status_code} (expected {expected})",
+        }
+    except Exception as exc:
+        elapsed = int((time.perf_counter() - started) * 1000)
+        # Short reason only — never a response body.
+        return {"ok": False, "status_code": None, "response_ms": elapsed,
+                "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+
+def _apply_uptime_result(db: Session, target: "UptimeTarget", result: dict) -> dict:
+    """Store one probe result and open/close the incident it implies."""
+    from database_models import UptimeCheck, UptimeIncident
+
+    now = datetime.now(timezone.utc)
+    previous_status = getattr(target, "last_status", None) or "unknown"
+
+    db.add(UptimeCheck(
+        target_id=int(target.id),
+        checked_at=now,
+        ok=bool(result["ok"]),
+        status_code=result.get("status_code"),
+        response_ms=result.get("response_ms"),
+        error=(result.get("error") or None) and str(result["error"])[:300],
+    ))
+
+    target.last_checked_at = now
+    target.last_status = "up" if result["ok"] else "down"
+    target.last_response_ms = result.get("response_ms")
+    target.last_error = (result.get("error") or None) and str(result["error"])[:300]
+
+    open_incident = db.query(UptimeIncident).filter(
+        UptimeIncident.target_id == int(target.id),
+        UptimeIncident.resolved_at.is_(None),
+    ).first()
+
+    if result["ok"]:
+        if open_incident:
+            open_incident.resolved_at = now
+        if previous_status == "down":
+            # started_at can come back naive depending on the driver; the
+            # duration is a nicety, so a mismatch just falls back to no number.
+            duration = ""
+            if open_incident is not None:
+                try:
+                    started = open_incident.started_at
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    duration = f" after {int((now - started).total_seconds())}s"
+                except Exception:
+                    duration = ""
+            monitor_record_event(
+                "uptime", "recovered", status="ok",
+                detail=f"{target.name} recovered{duration}",
+                organization_id=getattr(target, "organization_id", None),
+            )
+    else:
+        if open_incident:
+            open_incident.checks_failed = int(open_incident.checks_failed or 0) + 1
+            open_incident.last_error = target.last_error
+        else:
+            db.add(UptimeIncident(
+                target_id=int(target.id), started_at=now,
+                last_error=target.last_error, checks_failed=1,
+            ))
+        if previous_status != "down":
+            monitor_record_event(
+                "uptime", "down", status="error",
+                detail=f"{target.name}: {target.last_error or 'unreachable'}",
+                organization_id=getattr(target, "organization_id", None),
+            )
+
+    db.commit()
+    return result
+
+
+def _uptime_targets_due(targets, now) -> list:
+    """Targets whose own interval has elapsed. Evaluated in Python because the
+    target list is small and the arithmetic is clearer than SQL's."""
+    due = []
+    for target in targets:
+        last = getattr(target, "last_checked_at", None)
+        if last is None:
+            due.append(target)
+            continue
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        if (now - last).total_seconds() >= max(int(getattr(target, "interval_seconds", 60) or 60), UPTIME_MIN_INTERVAL_SECONDS):
+            due.append(target)
+    return due
+
+
+@app.get("/admin/uptime/targets")
+async def list_uptime_targets(
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Every configured target with its latest known state."""
+    from database_models import UptimeTarget
+    rows = db.query(UptimeTarget).order_by(UptimeTarget.name.asc()).all()
+    org_names = {int(o.id): o.name for o in db.query(Organization).all()}
+    return {"targets": [
+        {
+            "id": int(t.id), "name": t.name, "url": t.url, "method": t.method,
+            "expected_status": int(t.expected_status or 200),
+            "interval_seconds": int(t.interval_seconds or 60),
+            "timeout_ms": int(t.timeout_ms or 10000),
+            "organization_id": getattr(t, "organization_id", None),
+            "organization_name": org_names.get(int(t.organization_id)) if t.organization_id else None,
+            "is_active": bool(t.is_active),
+            "last_checked_at": t.last_checked_at.isoformat() if t.last_checked_at else None,
+            "last_status": t.last_status or "unknown",
+            "last_response_ms": t.last_response_ms,
+            "last_error": t.last_error,
+        } for t in rows
+    ]}
+
+
+@app.post("/admin/uptime/targets", status_code=201)
+async def create_uptime_target(
+    payload: UptimeTargetRequest,
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Add a target. `last_status` starts 'unknown' so the page can tell
+    'not probed yet' from 'down'."""
+    from database_models import UptimeTarget
+    if payload.organization_id is not None:
+        if not db.query(Organization).filter(Organization.id == payload.organization_id).first():
+            raise HTTPException(status_code=404, detail="Organization not found")
+    target = UptimeTarget(
+        name=payload.name.strip(),
+        url=payload.url,
+        method=payload.method,
+        expected_status=payload.expected_status,
+        interval_seconds=max(payload.interval_seconds, UPTIME_MIN_INTERVAL_SECONDS),
+        timeout_ms=payload.timeout_ms,
+        organization_id=payload.organization_id,
+        is_active=payload.is_active,
+        created_by=int(getattr(current_admin, 'id', 0)),
+        last_status="unknown",
+    )
+    db.add(target)
+    db.commit()
+    db.refresh(target)
+    AuditService.log_event(
+        db, int(getattr(current_admin, 'id', 0)), "uptime_target_created",
+        f"Uptime target '{target.name}' ({target.url}) added",
+    )
+    return {"id": int(target.id), "name": target.name, "url": target.url}
+
+
+@app.put("/admin/uptime/targets/{target_id}")
+async def update_uptime_target(
+    target_id: int,
+    payload: UptimeTargetRequest,
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    from database_models import UptimeTarget
+    target = db.query(UptimeTarget).filter(UptimeTarget.id == target_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target not found")
+    if payload.organization_id is not None:
+        if not db.query(Organization).filter(Organization.id == payload.organization_id).first():
+            raise HTTPException(status_code=404, detail="Organization not found")
+    target.name = payload.name.strip()
+    target.url = payload.url
+    target.method = payload.method
+    target.expected_status = payload.expected_status
+    target.interval_seconds = max(payload.interval_seconds, UPTIME_MIN_INTERVAL_SECONDS)
+    target.timeout_ms = payload.timeout_ms
+    target.organization_id = payload.organization_id
+    target.is_active = payload.is_active
+    db.commit()
+    AuditService.log_event(
+        db, int(getattr(current_admin, 'id', 0)), "uptime_target_updated",
+        f"Uptime target '{target.name}' updated",
+    )
+    return {"id": int(target.id), "name": target.name}
+
+
+@app.delete("/admin/uptime/targets/{target_id}")
+async def delete_uptime_target(
+    target_id: int,
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Removes the target and its history. Its incidents go too — a dangling
+    incident would keep counting toward a target nobody is watching."""
+    from database_models import UptimeTarget, UptimeCheck, UptimeIncident
+    target = db.query(UptimeTarget).filter(UptimeTarget.id == target_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target not found")
+    name = target.name
+    db.query(UptimeCheck).filter(UptimeCheck.target_id == target_id).delete(synchronize_session=False)
+    db.query(UptimeIncident).filter(UptimeIncident.target_id == target_id).delete(synchronize_session=False)
+    db.delete(target)
+    db.commit()
+    AuditService.log_event(
+        db, int(getattr(current_admin, 'id', 0)), "uptime_target_deleted",
+        f"Uptime target '{name}' removed",
+    )
+    return {"deleted": True, "id": target_id}
+
+
+@app.post("/admin/uptime/targets/{target_id}/check")
+async def check_uptime_target_now(
+    target_id: int,
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Probe one target immediately, off its normal interval."""
+    from database_models import UptimeTarget
+    target = db.query(UptimeTarget).filter(UptimeTarget.id == target_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target not found")
+    result = await _probe_uptime_target(target)
+    _apply_uptime_result(db, target, result)
+    return {"id": target_id, "name": target.name, **result}
+
+
+@app.get("/admin/uptime/summary")
+async def uptime_summary(
+    window_hours: int = Query(24, ge=1, le=720),
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Per-target uptime percentage and response-time statistics over the
+    window, for the page's cards and table."""
+    from database_models import UptimeTarget, UptimeCheck
+    since = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    targets = db.query(UptimeTarget).order_by(UptimeTarget.name.asc()).all()
+    result = []
+    for target in targets:
+        rows = db.query(UptimeCheck).filter(
+            UptimeCheck.target_id == int(target.id),
+            UptimeCheck.checked_at >= since,
+        ).all()
+        total = len(rows)
+        ok = sum(1 for r in rows if r.ok)
+        times = sorted(r.response_ms for r in rows if r.response_ms is not None)
+        p95 = times[min(len(times) - 1, int(len(times) * 0.95))] if times else None
+        result.append({
+            "id": int(target.id),
+            "name": target.name,
+            "url": target.url,
+            "last_status": target.last_status or "unknown",
+            "last_checked_at": target.last_checked_at.isoformat() if target.last_checked_at else None,
+            "last_response_ms": target.last_response_ms,
+            "last_error": target.last_error,
+            "checks": total,
+            "fails": total - ok,
+            "uptime_percent": round(ok / total * 100, 2) if total else None,
+            "avg_response_ms": int(sum(times) / len(times)) if times else None,
+            "p95_response_ms": p95,
+        })
+    return {"window_hours": window_hours, "targets": result}
+
+
+@app.get("/admin/uptime/checks")
+async def uptime_checks(
+    target_id: int,
+    limit: int = Query(120, ge=1, le=1000),
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Response-time series for one target, oldest first so the chart can plot
+    it directly."""
+    from database_models import UptimeCheck
+    rows = db.query(UptimeCheck).filter(UptimeCheck.target_id == target_id) \
+        .order_by(UptimeCheck.checked_at.desc()).limit(limit).all()
+    rows.reverse()
+    return {"target_id": target_id, "checks": [
+        {
+            "checked_at": r.checked_at.isoformat() if r.checked_at else None,
+            "ok": bool(r.ok), "status_code": r.status_code,
+            "response_ms": r.response_ms, "error": r.error,
+        } for r in rows
+    ]}
+
+
+@app.get("/admin/uptime/incidents")
+async def uptime_incidents(
+    target_id: Optional[int] = None,
+    limit: int = Query(50, ge=1, le=500),
+    current_admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Recent incidents, still-open ones first."""
+    from database_models import UptimeIncident, UptimeTarget
+    q = db.query(UptimeIncident)
+    if target_id is not None:
+        q = q.filter(UptimeIncident.target_id == target_id)
+    rows = q.order_by(UptimeIncident.resolved_at.is_(None).desc(), UptimeIncident.started_at.desc()).limit(limit).all()
+    names = {int(t.id): t.name for t in db.query(UptimeTarget).all()}
+    return {"incidents": [
+        {
+            "id": int(r.id),
+            "target_id": int(r.target_id),
+            "target_name": names.get(int(r.target_id)),
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "resolved_at": r.resolved_at.isoformat() if r.resolved_at else None,
+            "open": r.resolved_at is None,
+            "last_error": r.last_error,
+            "checks_failed": int(r.checks_failed or 0),
+        } for r in rows
+    ]}
+
 
 # ── Org device-policy compliance agent ──────────────────────────────────────
 # Desktop-only: the Tauri app polls the blocklist below and checks its own
@@ -12985,7 +13562,7 @@ async def admin_get_policy_violation_screenshot(
     session = SessionService.validate_session(db, raw_token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
-    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
     if not admin or not admin.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
     row = db.query(PolicyViolationScreenshot).filter(PolicyViolationScreenshot.id == violation_id).first()
@@ -13226,6 +13803,114 @@ async def admin_update_user(phone_number: str,
         logger.error(f"Admin update user error: {e}")
         raise HTTPException(status_code=500, detail="Failed to update user")
 
+
+# ── Account suspension ──────────────────────────────────────────────────────
+# A suspended account is frozen on every platform and is never told why: every
+# authentication gate already rejects a row with suspended_at set using the same
+# bare 401 an expired session produces, and nothing here sends an email, SMS or
+# push. The reason is stored for the admin console only.
+
+class SuspendUserRequest(BaseModel):
+    reason: Optional[str] = Field(
+        None,
+        max_length=1000,
+        description="Why the account was suspended. Visible to admins only; never returned to the suspended user.",
+    )
+
+
+def _freeze_account_sessions(db: Session, user: User) -> None:
+    """Cut off everything the account currently holds: HTTP sessions, linked
+    devices and the legacy single session_token column. The live chat sockets
+    are closed by the caller (this helper is sync and cannot await)."""
+    now = datetime.now(timezone.utc)
+    sessions = db.query(UserSession).filter(
+        UserSession.user_id == user.id,
+        UserSession.is_active == True,
+    ).all()
+    for session in sessions:
+        setattr(session, 'is_active', False)
+        setattr(session, 'logout_reason', "suspended")
+
+    devices = db.query(LinkedDevice).filter(
+        LinkedDevice.user_id == user.id,
+        LinkedDevice.revoked_at.is_(None),
+    ).all()
+    for device in devices:
+        device.revoked_at = now
+
+    user.session_token = None
+    db.commit()
+
+
+@app.post("/admin/users/{username}/suspend")
+async def admin_suspend_user(
+    username: str,
+    payload: SuspendUserRequest,
+    current_admin: User = Depends(get_admin_or_operator),
+    db: Session = Depends(get_database_session),
+):
+    """Freeze an account on every platform, silently.
+
+    No notification of any kind is sent to the user — that is the intent of the
+    feature, not an omission. Their sessions and linked devices are revoked
+    immediately and their open sockets are closed, so the app stops working on
+    the next request rather than when the session would have expired."""
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if int(getattr(target, 'id', 0)) == int(getattr(current_admin, 'id', 0)):
+        raise HTTPException(status_code=400, detail="You cannot suspend your own account")
+    # An operator must not be able to freeze their own management; only a
+    # superadmin may suspend another admin.
+    if bool(getattr(target, 'is_admin', False)) and getattr(current_admin, 'admin_role', None) != "superadmin":
+        raise HTTPException(status_code=403, detail="Only a superadmin can suspend an administrator")
+
+    if _account_frozen(target):
+        return {"username": str(target.username), "suspended": True, "message": "Account is already suspended"}
+
+    target.suspended_at = datetime.now(timezone.utc)
+    target.suspended_by = int(getattr(current_admin, 'id', 0))
+    target.suspension_reason = (payload.reason or "").strip() or None
+    db.commit()
+
+    _freeze_account_sessions(db, target)
+    closed = await ws_manager.disconnect_user(int(target.id))
+
+    AuditService.log_event(
+        db, int(getattr(current_admin, 'id', 0)), "user_suspended",
+        f"User {target.username} suspended by {current_admin.username}",
+        severity="warning",
+        extra_data={"reason": target.suspension_reason, "sockets_closed": closed},
+    )
+    return {"username": str(target.username), "suspended": True, "sockets_closed": closed}
+
+
+@app.post("/admin/users/{username}/unsuspend")
+async def admin_unsuspend_user(
+    username: str,
+    current_admin: User = Depends(get_admin_or_operator),
+    db: Session = Depends(get_database_session),
+):
+    """Lift a suspension. Sessions revoked at suspension time are not restored —
+    the user signs in again as normal."""
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not _account_frozen(target):
+        return {"username": str(target.username), "suspended": False, "message": "Account is not suspended"}
+
+    target.suspended_at = None
+    target.suspended_by = None
+    target.suspension_reason = None
+    db.commit()
+
+    AuditService.log_event(
+        db, int(getattr(current_admin, 'id', 0)), "user_unsuspended",
+        f"User {target.username} reinstated by {current_admin.username}",
+    )
+    return {"username": str(target.username), "suspended": False}
+
+
 # --- Admin Group Management Routes ---
 
 @app.get("/admin/groups", response_model=List[GroupResponse])
@@ -13341,6 +14026,11 @@ async def admin_get_all_users(current_user: User = Depends(get_admin_user),
                 "user_type": str(getattr(user, 'user_type', '')),
                 "invitation_status": "accepted" if getattr(user, "invitation_accepted_at", None) else ("pending" if getattr(user, "invitation_token_hash", None) else "legacy"),
                 "onboarding_complete": bool(getattr(user, "onboarding_completed_at", None)),
+                # Suspension is surfaced to the console only. The suspended user
+                # is never told, so nothing here is echoed back to them.
+                "suspended": _account_frozen(user),
+                "suspended_at": user.suspended_at.isoformat() if getattr(user, "suspended_at", None) else None,
+                "suspension_reason": getattr(user, "suspension_reason", None),
             }
             result.append(item)
             grouped.setdefault(organization.name if organization else "Platform / unassigned", []).append(item)
@@ -13988,7 +14678,7 @@ async def admin_download_recording(
         session = SessionService.validate_session(db, raw_token)
         if not session:
             raise HTTPException(status_code=401, detail="Invalid token")
-        user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+        user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
         if not user or not user.is_admin:
             raise HTTPException(status_code=403, detail="Admin only")
 
@@ -14207,7 +14897,7 @@ async def admin_download_video(
     session = SessionService.validate_session(db, raw_token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
-    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
     if not user or not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
     try:
@@ -14351,7 +15041,7 @@ async def admin_download_screen_recording(
     session = SessionService.validate_session(db, raw_token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
-    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
     if not user or not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
     try:
@@ -14710,7 +15400,7 @@ async def admin_download_media(
     session = SessionService.validate_session(db, raw_token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
-    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
     if not admin or not admin.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
     target = db.query(User).filter(User.username == username).first()
@@ -14930,7 +15620,7 @@ async def admin_download_whatsapp_media(
     session = SessionService.validate_session(db, raw_token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
-    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
     if not user or not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
 
@@ -16116,7 +16806,7 @@ async def admin_download_drive_media(
     session = SessionService.validate_session(db, raw_token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
-    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
     if not user or not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
 
@@ -16169,7 +16859,7 @@ async def admin_download_drive_recording(
     session = SessionService.validate_session(db, raw_token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
-    user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
     if not user or not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
 
@@ -16346,7 +17036,7 @@ async def admin_get_screenshot(
     session = SessionService.validate_session(db, raw_token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
-    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
     if not admin or not admin.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
     target = db.query(User).filter(User.username == username).first()
@@ -16409,7 +17099,7 @@ async def admin_get_photo(
     session = SessionService.validate_session(db, raw_token)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
-    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+    admin = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
     if not admin or not admin.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
     target = db.query(User).filter(User.username == username).first()
