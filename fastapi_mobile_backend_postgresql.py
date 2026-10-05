@@ -411,6 +411,11 @@ def _send_email_message(to_email: str, subject: str, text_body: str, html_body: 
     port = int(os.getenv("SMTP_PORT", "465" if smtp_host == "smtp.resend.com" else "587"))
     use_ssl = os.getenv("SMTP_SSL", "1" if port in (465, 2465) else "0") == "1"
     use_starttls = os.getenv("SMTP_STARTTLS", "0" if use_ssl else "1") == "1"
+    # Guard a common misconfig: on an implicit-SSL port (465) the socket is
+    # already encrypted, so issuing STARTTLS on top raises and the mail never
+    # sends. SSL wins; STARTTLS is only for plaintext ports like 587.
+    if use_ssl:
+        use_starttls = False
     # Deliverability: a named sender, a real Message-ID/Date on the sending
     # domain, a plain-text part alongside the HTML, and no tracking pixels.
     # Inbox placement still depends on SPF/DKIM/DMARC for that domain.

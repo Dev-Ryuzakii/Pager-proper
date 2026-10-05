@@ -24,6 +24,15 @@ import urllib.error
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid, parseaddr
 
+# Load .env exactly like the running server does (database_models /
+# database_config both call load_dotenv() at import), so this test sees the
+# same config the server sees — no need to `set -a; . ./.env` first.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:  # noqa: BLE001
+    pass
+
 DEFAULT_EMAIL = "faladerasaq22@gmail.com"
 DEFAULT_PHONE = "07040746576"
 
