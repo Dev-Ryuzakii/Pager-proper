@@ -19,7 +19,8 @@ import smtplib
 import io
 import asyncio
 from email.message import EmailMessage
-from html import escape
+from html import escape, unescape
+from html.parser import HTMLParser
 from urllib.parse import quote_plus, unquote_plus
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
@@ -188,6 +189,102 @@ EMAIL_LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stat
 EMAIL_LOGO_CID = "dilarion-logo"
 
 
+# Formatting an admin may use in the organization compose box. Anything outside
+# this set is dropped, and tags are rebuilt from their names alone — no
+# attributes survive except a vetted href — so a composed message can never
+# smuggle a script, an event handler, or a remote image into a recipient's inbox.
+_MESSAGE_ALLOWED_TAGS = {
+    "p", "br", "div", "span", "b", "strong", "i", "em", "u", "s", "strike", "del",
+    "ul", "ol", "li", "blockquote", "pre", "code", "hr", "h1", "h2", "h3", "a",
+}
+_MESSAGE_VOID_TAGS = {"br", "hr"}
+# Dropped together with everything inside them — their text is markup or code,
+# not prose the recipient should read.
+_MESSAGE_DROP_SUBTREE = {
+    "script", "style", "iframe", "object", "embed", "svg", "math", "template",
+    "noscript", "head", "title", "form", "select", "textarea", "button",
+}
+_MESSAGE_SAFE_LINK_SCHEMES = ("http://", "https://", "mailto:")
+
+
+class _MessageHTMLSanitizer(HTMLParser):
+    """Rebuilds composed HTML down to the formatting whitelist above."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: List[str] = []
+        self._dropped = 0
+        self._open_links = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in _MESSAGE_DROP_SUBTREE:
+            self._dropped += 1
+            return
+        if self._dropped:
+            return
+        if tag not in _MESSAGE_ALLOWED_TAGS:
+            return
+        if tag == "a":
+            href = next((value for key, value in attrs if key == "href" and value), None)
+            if href and href.strip().lower().startswith(_MESSAGE_SAFE_LINK_SCHEMES):
+                self.parts.append(f'<a href="{escape(href.strip(), quote=True)}">')
+                self._open_links += 1
+            return
+        self.parts.append(f"<{tag}>")
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        if tag in _MESSAGE_VOID_TAGS:
+            self.handle_starttag(tag, attrs)
+            return
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _MESSAGE_DROP_SUBTREE:
+            self._dropped = max(0, self._dropped - 1)
+            return
+        if self._dropped or tag not in _MESSAGE_ALLOWED_TAGS or tag in _MESSAGE_VOID_TAGS:
+            return
+        if tag == "a":
+            # Only close a link this parser opened, so a stray </a> cannot
+            # swallow later text into someone else's link.
+            if self._open_links:
+                self.parts.append("</a>")
+                self._open_links -= 1
+            return
+        self.parts.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if self._dropped:
+            return
+        self.parts.append(escape(data))
+
+    def result(self) -> str:
+        # Close anything the composer left open so the branded shell stays intact.
+        return "".join(self.parts + ["</a>"] * self._open_links).strip()
+
+
+def _sanitize_message_html(raw: str) -> str:
+    """Whitelist the composed message down to safe formatting markup."""
+    parser = _MessageHTMLSanitizer()
+    try:
+        parser.feed(raw or "")
+        parser.close()
+    except Exception:
+        logger.warning("Composed message HTML failed to parse; falling back to plain text")
+        return f"<p>{escape(raw or '')}</p>"
+    return parser.result()
+
+
+def _html_to_text(raw_html: str) -> str:
+    """Plain-text alternative part, so the mail is readable without HTML."""
+    text = re.sub(r"(?i)<br\s*/?>", "\n", raw_html or "")
+    text = re.sub(r"(?i)</(p|div|li|h[1-3]|blockquote|tr)>", "\n", text)
+    text = re.sub(r"(?i)<li>", "• ", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"\n{3,}", "\n\n", unescape(text)).strip()
+
+
 def _email_template(
     title: str,
     greeting: str,
@@ -200,10 +297,14 @@ def _email_template(
     code_label: Optional[str] = None,
     code: Optional[str] = None,
     after: Optional[List[str]] = None,
+    body_html: Optional[str] = None,
 ) -> str:
     """Branded transactional email. The Dilarion logo is embedded inline (cid:)
     by _send_email_message, so it shows without the recipient having to
-    allow remote images — set DILARION_LOGO_URL to use a hosted copy instead."""
+    allow remote images — set DILARION_LOGO_URL to use a hosted copy instead.
+
+    `body_html` is inserted verbatim: pass it through _sanitize_message_html
+    first. Every other parameter is escaped here."""
     paragraph_html = "".join(
         f'<p style="margin:0 0 16px;color:#3f3638;font-size:15px;line-height:1.7">{escape(paragraph)}</p>'
         for paragraph in paragraphs
@@ -271,6 +372,7 @@ def _email_template(
           <div style="color:#9d1d36;font-size:11px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase">{escape(eyebrow)}</div>
           <h1 style="margin:10px 0 22px;font-size:24px;line-height:1.3;color:#24191b">{escape(title)}</h1>
           <p style="margin:0 0 16px;color:#24191b;font-size:15px">{escape(greeting)}</p>
+          {body_html or ""}
           {paragraph_html}{details_html}{code_html}{cta_html}{after_html}{closing_html}
         </td></tr>
         <tr><td style="padding:18px 30px;background:#faf7f4;border-top:1px solid #eee6e1">
@@ -477,6 +579,30 @@ async def _email_organization_decision(
             f"Hello {contact_name},\n\n" + "\n\n".join(paragraphs),
             _email_template("Request update", f"Hello {contact_name},", paragraphs),
         )
+
+
+async def _email_organization_message(
+    organization_name: str,
+    contact_name: str,
+    contact_email: str,
+    subject: str,
+    body_html: str,
+) -> None:
+    """Deliver an administrator's composed message in the branded shell.
+
+    body_html must already be sanitized by the caller — this only wraps it."""
+    await _send_transactional_email(
+        contact_email,
+        subject,
+        f"Hello {contact_name},\n\n{_html_to_text(body_html)}\n\nKind regards,\nThe Dilarion Team",
+        _email_template(
+            subject,
+            f"Hello {contact_name},",
+            [],
+            eyebrow=f"Message from Dilarion · {organization_name}",
+            body_html=body_html,
+        ),
+    )
 
 
 async def _email_admin_account_created(email: str, username: str, role: str) -> None:
@@ -5177,6 +5303,79 @@ async def resend_organization_decision_email(
     return {"status": row.status, "message": f"Decision email re-queued to {row.contact_email}"}
 
 
+class OrganizationMessage(BaseModel):
+    """A free-form message an administrator composes for an organization's
+    contact. body_html is rich text from the console's compose box (bold,
+    italics, lists, links) — never markdown — and is sanitized before sending."""
+    subject: str = Field(..., min_length=2, max_length=160)
+    body_html: str = Field(..., min_length=1, max_length=20000)
+
+
+def _queue_organization_message(
+    background_tasks: BackgroundTasks,
+    db: Session,
+    current_user: User,
+    payload: OrganizationMessage,
+    organization_name: str,
+    contact_name: str,
+    contact_email: str,
+    source: str,
+) -> Dict[str, Any]:
+    """Sanitize, queue, and audit one composed message. Shared by the
+    organization and request routes so both behave identically."""
+    body_html = _sanitize_message_html(payload.body_html)
+    if not _html_to_text(body_html).strip():
+        raise HTTPException(status_code=400, detail="The message body is empty")
+    background_tasks.add_task(
+        _email_organization_message,
+        organization_name, contact_name, contact_email, payload.subject.strip(), body_html,
+    )
+    AuditService.log_event(
+        db, int(current_user.id), "organization_message_sent",
+        f"Sent '{payload.subject.strip()}' to {organization_name} ({contact_email}) from {source}",
+    )
+    return {"message": f"Message queued to {contact_email}", "recipient": contact_email}
+
+
+@app.post("/admin/organizations/{organization_id}/message", status_code=202)
+async def admin_message_organization(
+    organization_id: int,
+    payload: OrganizationMessage,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Email the organization's contact from the admin console."""
+    organization = db.query(Organization).filter(Organization.id == organization_id).first()
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return _queue_organization_message(
+        background_tasks, db, current_user, payload,
+        organization.name, organization.contact_name, organization.contact_email,
+        f"organization {organization_id}",
+    )
+
+
+@app.post("/admin/organization-requests/{request_id}/message", status_code=202)
+async def admin_message_organization_request(
+    request_id: int,
+    payload: OrganizationMessage,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Email a requester before their organization exists — e.g. to ask for
+    corrected details."""
+    row = db.query(OrganizationAccessRequest).filter(OrganizationAccessRequest.id == request_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Organization request not found")
+    return _queue_organization_message(
+        background_tasks, db, current_user, payload,
+        row.organization_name, row.contact_name, row.contact_email,
+        f"request {request_id}",
+    )
+
+
 @app.post("/organization/auth/login")
 async def organization_account_login(
     payload: OrganizationAccountLogin,
@@ -5248,6 +5447,13 @@ async def admin_list_organizations(
     db: Session = Depends(get_database_session),
 ):
     organizations = db.query(Organization).order_by(Organization.name.asc()).all()
+    # One query for every request, then a map — so each organization card can
+    # offer "resend the approval email" for the request that created it.
+    latest_request: Dict[int, OrganizationAccessRequest] = {}
+    for row in db.query(OrganizationAccessRequest).filter(
+        OrganizationAccessRequest.organization_id.isnot(None)
+    ).order_by(OrganizationAccessRequest.submitted_at.asc()).all():
+        latest_request[int(row.organization_id)] = row
     return [{
         "id": int(org.id),
         "name": org.name,
@@ -5258,6 +5464,8 @@ async def admin_list_organizations(
         "is_active": bool(org.is_active),
         "staff_count": db.query(User).filter(User.organization_id == org.id, User.organization_role != "viewer").count(),
         "has_portal_account": db.query(User.id).filter(User.organization_id == org.id, User.organization_role == "viewer").first() is not None,
+        "request_id": int(latest_request[int(org.id)].id) if int(org.id) in latest_request else None,
+        "request_status": latest_request[int(org.id)].status if int(org.id) in latest_request else None,
     } for org in organizations]
 
 
