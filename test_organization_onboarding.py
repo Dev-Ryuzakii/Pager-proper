@@ -73,7 +73,7 @@ def test_organization_approval_activation_and_camera_onboarding(tmp_path, monkey
         )
         assert len(approval_background.tasks) == 1
         assert "password" not in repr(approved)
-        assert approved["organization_account"]["access"] == "read_only"
+        assert approved["organization_account"]["access"] == "invite"
 
         org_login = await api.organization_account_login(
             api.OrganizationAccountLogin(username="acme-portal", password="AcmePortalSecret!"), db
@@ -133,7 +133,31 @@ def test_organization_approval_activation_and_camera_onboarding(tmp_path, monkey
         roster = await api.get_organization_users_read_only(viewer, db)
         assert roster["count"] == 1
         assert roster["users"][0]["full_name"] == "Alice Example"
-        assert roster["access"] == "read_only"
+        assert roster["access"] == "invite"
+
+        # The organization's own portal can invite staff to itself, and resend
+        # a pending invite - but not to anyone outside the organization.
+        portal_background = BackgroundTasks()
+        invited = await api.organization_invite_staff(
+            api.AdminOrganizationStaffBatch(users=[api.OrganizationRequestedUser(
+                email="carol@acme.test", full_name="Carol Example",
+                phone_number="+2348333333333", department="Finance",
+            )]),
+            portal_background, viewer, db,
+        )
+        assert invited["invited_user_count"] == 1
+        carol = db.query(User).filter(User.email == "carol@acme.test").one()
+        assert carol.organization_id == viewer.organization_id
+        old_hash = carol.invitation_token_hash
+        resend_background = BackgroundTasks()
+        await api.organization_resend_staff_invite(carol.id, resend_background, viewer, db)
+        db.refresh(carol)
+        assert carol.invitation_token_hash != old_hash
+        assert len(resend_background.tasks) == 1
+        # Alice already activated: resending must be refused.
+        with pytest.raises(HTTPException) as activated_err:
+            await api.organization_resend_staff_invite(user.id, BackgroundTasks(), viewer, db)
+        assert activated_err.value.status_code == 409
 
     asyncio.run(scenario())
     db.close()

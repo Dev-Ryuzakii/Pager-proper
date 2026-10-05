@@ -616,6 +616,10 @@ class Call(Base):
     # Metadata
     duration = Column(Integer, default=0)  # talk time in seconds, counted from answer
     answered_at = Column(DateTime, nullable=True)  # when the callee picked up
+    # Which of the callee's devices picked up - lets every other device show
+    # "answered on another device" instead of a missed/unanswered call.
+    answered_device_id = Column(String(128), nullable=True)
+    answered_device_name = Column(String(120), nullable=True)
     encryption_key = Column(Text, nullable=True)  # Optional per-call encryption key
     
     # Timestamps

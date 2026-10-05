@@ -1312,6 +1312,11 @@ class CallAction(BaseModel):
     action: str = Field(..., pattern="^(accept|decline|end|busy|ringing)$", description="Action to perform on the call")
     answer_sdp: Optional[str] = Field(None, description="WebRTC answer SDP (required for accept)")
     mastertoken: Optional[str] = Field(None, description="Master token for authorization (required for accept)")
+    # The device taking the action (same id its WebSocket uses). On accept it
+    # is recorded so the user's other devices stop ringing and their history
+    # shows "answered on another device".
+    device_id: Optional[str] = Field(None, max_length=128)
+    device_name: Optional[str] = Field(None, max_length=120)
 
 class IceCandidatePayload(BaseModel):
     call_id: int = Field(..., description="ID of the call")
@@ -5577,7 +5582,7 @@ async def approve_organization_request(
     return {
         "status": "approved",
         "organization": {"id": int(organization.id), "name": organization.name, "slug": organization.slug},
-        "organization_account": {"username": organization_account.username, "access": "read_only"},
+        "organization_account": {"username": organization_account.username, "access": "invite"},
         "message": "Organization account approved. Platform admins/operators can now add staff to this organization.",
     }
 
@@ -5742,7 +5747,7 @@ async def organization_account_login(
     organization = db.query(Organization).filter(Organization.id == account.organization_id).first()
     return {
         "token": session.session_token,
-        "access": "read_only",
+        "access": "invite",
         "organization": {"id": int(organization.id), "name": organization.name} if organization else None,
     }
 
@@ -5761,7 +5766,10 @@ async def get_organization_portal_account(
         "contact_name": organization.contact_name,
         "contact_email": organization.contact_email,
         "contact_phone": organization.contact_phone,
-        "access": "read_only",
+        # Organizations can view their staff and invite new staff, but not
+        # edit or suspend anyone - that stays with Dilarion admins.
+        "access": "invite",
+        "permissions": {"view_staff": True, "invite_staff": True, "edit_staff": False, "suspend_staff": False},
     }
 
 
@@ -5775,7 +5783,7 @@ async def get_organization_users_read_only(
         User.organization_role != "viewer",
     ).order_by(User.full_name.asc(), User.username.asc()).all()
     return {
-        "access": "read_only",
+        "access": "invite",
         "users": [{
             "id": int(user.id),
             "username": user.username,
@@ -5789,6 +5797,42 @@ async def get_organization_users_read_only(
         } for user in users],
         "count": len(users),
     }
+
+
+@app.post("/organization/users", status_code=202)
+async def organization_invite_staff(
+    payload: AdminOrganizationStaffBatch,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_organization_viewer),
+    db: Session = Depends(get_database_session),
+):
+    """The organization's own portal adds (invites) staff to itself only.
+    Same rules as the admin console; editing and suspending are not offered."""
+    organization = db.query(Organization).filter(
+        Organization.id == current_user.organization_id, Organization.is_active == True
+    ).first()
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    count = _provision_organization_staff(db, organization, payload.users, background_tasks)
+    AuditService.log_event(db, int(current_user.id), "organization_staff_invited",
+                           f"Organization portal invited {count} staff to organization {organization.id}")
+    return {"invited_user_count": count, "message": "Invitations sent by email and SMS"}
+
+
+@app.post("/organization/users/{user_id}/resend-invite", status_code=202)
+async def organization_resend_staff_invite(
+    user_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_organization_viewer),
+    db: Session = Depends(get_database_session),
+):
+    """Resend an activation code to one of this organization's own staff."""
+    user = db.query(User).filter(User.id == user_id, User.organization_id == current_user.organization_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+    _resend_staff_invitation(db, user, background_tasks)
+    AuditService.log_event(db, int(current_user.id), "staff_invite_resent", f"Organization portal resent invitation to {user.username}")
+    return {"status": "queued", "message": "A new activation code was sent by email and SMS"}
 
 
 @app.get("/admin/organizations")
@@ -5863,20 +5907,13 @@ async def admin_create_organization(
     return {"id": int(organization.id), "name": organization.name, "slug": organization.slug}
 
 
-@app.post("/admin/organizations/{organization_id}/users", status_code=202)
-async def admin_add_organization_staff(
-    organization_id: int,
-    payload: AdminOrganizationStaffBatch,
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_admin_user),
-    db: Session = Depends(get_database_session),
-):
-    organization = db.query(Organization).filter(Organization.id == organization_id, Organization.is_active == True).first()
-    if not organization:
-        raise HTTPException(status_code=404, detail="Create the organization before adding staff")
+def _provision_organization_staff(db: Session, organization: Organization, users: List["OrganizationRequestedUser"], background_tasks: BackgroundTasks) -> int:
+    """Create invited staff under organization and queue their activation
+    codes by email + SMS. Shared by the admin console and the organization's
+    own portal, so both follow exactly the same rules."""
     seen_emails, seen_phones = set(), set()
     prepared = []
-    for item in payload.users:
+    for item in users:
         email = item.email.strip().lower()
         phone = normalize_phone_number(item.phone_number)
         if not _valid_email(email):
@@ -5915,8 +5952,59 @@ async def admin_add_organization_staff(
     db.commit()
     for user_id, code in invitations:
         background_tasks.add_task(_deliver_invitation, user_id, code)
-    AuditService.log_event(db, int(current_user.id), "organization_staff_added", f"Added {len(invitations)} staff to organization {organization_id}")
-    return {"organization_id": organization_id, "invited_user_count": len(invitations), "message": "Staff invitations queued by email and SMS"}
+    return len(invitations)
+
+
+def _resend_staff_invitation(db: Session, user: User, background_tasks: BackgroundTasks) -> None:
+    """Issue a fresh activation code (the old one stops working) and resend
+    it. Only for staff who haven't activated yet - an activated account needs
+    a token reset instead."""
+    if getattr(user, "invitation_accepted_at", None):
+        raise HTTPException(status_code=409, detail="This staff member has already activated their account. Use a token reset instead.")
+    if getattr(user, "is_admin", False) or getattr(user, "organization_role", None) == "viewer":
+        raise HTTPException(status_code=400, detail="Invitations are only for organization staff")
+    if not user.email:
+        raise HTTPException(status_code=400, detail="This staff member has no email address")
+    code = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    user.invitation_token_hash = _invitation_digest(code)
+    user.invitation_expires_at = now + timedelta(hours=72)
+    user.invited_at = now
+    user.invitation_delivery_errors = None
+    db.commit()
+    background_tasks.add_task(_deliver_invitation, int(user.id), code)
+
+
+@app.post("/admin/users/{user_id}/resend-invite", status_code=202)
+async def admin_resend_staff_invite(
+    user_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Resend a staff member's activation code (admins/operators)."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    _resend_staff_invitation(db, user, background_tasks)
+    AuditService.log_event(db, int(current_user.id), "staff_invite_resent", f"Resent invitation to {user.username}")
+    return {"status": "queued", "username": user.username, "message": "A new activation code was sent by email and SMS"}
+
+
+@app.post("/admin/organizations/{organization_id}/users", status_code=202)
+async def admin_add_organization_staff(
+    organization_id: int,
+    payload: AdminOrganizationStaffBatch,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    organization = db.query(Organization).filter(Organization.id == organization_id, Organization.is_active == True).first()
+    if not organization:
+        raise HTTPException(status_code=404, detail="Create the organization before adding staff")
+    count = _provision_organization_staff(db, organization, payload.users, background_tasks)
+    AuditService.log_event(db, int(current_user.id), "organization_staff_added", f"Added {count} staff to organization {organization_id}")
+    return {"organization_id": organization_id, "invited_user_count": count, "message": "Staff invitations queued by email and SMS"}
 
 
 @app.get("/brand/dilarion-logo.png", include_in_schema=False)
@@ -6808,6 +6896,24 @@ async def call_action(
         call = await CallService.update_call_status(
             db, action_data.call_id, user_id, action_data.action, action_data.answer_sdp
         )
+        if action_data.action == "accept" and int(call.recipient_id) == user_id:
+            device_id = (action_data.device_id or "").strip() or None
+            device_name = (action_data.device_name or "").strip() or None
+            if device_id and not call.answered_device_id:
+                call.answered_device_id = device_id
+                call.answered_device_name = device_name
+                db.commit()
+            # Every other device of the callee is still ringing - stop it there.
+            note = {"type": "call_answered_elsewhere", "data": {
+                "call_id": int(call.id), "device_name": device_name,
+            }}
+            for other_id, ws in list(ws_manager._connections.get(user_id, {}).items()):
+                if other_id == device_id:
+                    continue
+                try:
+                    await ws.send_text(json.dumps(note))
+                except Exception:
+                    pass
         monitor_record_event("calls", f"action.{action_data.action}", user_id=user_id)
         return {
             "call_id": int(call.id),
@@ -11214,6 +11320,7 @@ async def admin_get_user_onboarding_profile(
 
 @app.get("/calls/history")
 async def get_call_history(
+    device_id: Optional[str] = Query(None, max_length=128, description="The asking device, to flag calls answered on another one"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
@@ -11237,6 +11344,13 @@ async def get_call_history(
                 "duration": int(call.duration or 0),
                 "started_at": call.started_at.isoformat(),
                 "answered_at": call.answered_at.isoformat() if getattr(call, "answered_at", None) else None,
+                # Only meaningful for incoming calls the user answered.
+                "answered_device_name": getattr(call, "answered_device_name", None) if call.recipient_id == user_id else None,
+                "answered_elsewhere": bool(
+                    device_id and call.recipient_id == user_id
+                    and getattr(call, "answered_device_id", None)
+                    and call.answered_device_id != device_id
+                ),
                 "ended_at": call.ended_at.isoformat() if call.ended_at else None,
                 "is_caller": call.caller_id == user_id
             })
