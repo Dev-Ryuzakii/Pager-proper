@@ -3779,13 +3779,20 @@ class AdminService:
             User.is_active == True,
             User.suspended_at.is_(None),
         ).first()
-        if user and not bool(getattr(user, "is_admin", False)):
+        if user and bool(getattr(user, "is_admin", False)):
+            # Admins authenticate only via the dedicated password flow below.
+            # Clearing `user` here is essential: otherwise the account is found
+            # by username, the token check is skipped (it is gated on non-admin),
+            # and a truthy `user` would skip authenticate_admin too — letting ANY
+            # token sign an admin in.
+            user = None
+        elif user:
             valid_hash = bool(user.password_hash and verify_password(token, user.password_hash))
             valid_legacy = bool(user.token and hmac.compare_digest(str(user.token), token))
             if not (valid_hash or valid_legacy):
                 user = None
-        
-        # Admins continue to use the dedicated password flow.
+
+        # Admins (and anything not matched above) go through the password flow.
         if not user:
             user = AdminService.authenticate_admin(db, username, token, ip_address)
             
