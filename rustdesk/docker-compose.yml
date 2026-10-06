@@ -1,0 +1,28 @@
+# Self-hosted RustDesk relay for Dilarion in-meeting remote control.
+# hbbs = ID/rendezvous server, hbbr = relay. All control traffic stays on your
+# infrastructure; nothing touches RustDesk's public servers.
+#
+# Deploy on a VPS (can be the same box as the backend or a separate one):
+#   cd rustdesk && docker compose up -d
+# Then open these ports in the firewall:
+#   21115/tcp 21116/tcp 21116/udp 21117/tcp 21118/tcp 21119/tcp
+# After first start, grab the public key so clients can be pinned to this server:
+#   cat data/id_ed25519.pub
+services:
+  hbbs:
+    container_name: dilarion-hbbs
+    image: rustdesk/rustdesk-server:latest
+    command: hbbs -r ${RUSTDESK_RELAY_HOST}:21117
+    network_mode: host
+    volumes:
+      - ./data:/root
+    restart: unless-stopped
+
+  hbbr:
+    container_name: dilarion-hbbr
+    image: rustdesk/rustdesk-server:latest
+    command: hbbr
+    network_mode: host
+    volumes:
+      - ./data:/root
+    restart: unless-stopped

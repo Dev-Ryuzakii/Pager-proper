@@ -1007,6 +1007,12 @@ class RemoteControlEnd(BaseModel):
     conference_id: int
     other_username: str = Field(..., description="The other party in the control session — requester ending it, or target revoking it")
 
+class RemoteControlRustdeskSession(BaseModel):
+    conference_id: int
+    requester_username: str = Field(..., description="Who asked for control — receives the brokered session")
+    rustdesk_id: str = Field(..., max_length=64, description="The target's RustDesk ID")
+    otp: str = Field(..., max_length=64, description="One-time password the target set for this session")
+
 class MasterToken(BaseModel):
     mastertoken: str = Field(..., description="Master decryption token")
     two_fa_password: Optional[str] = Field(None, description="Required only if master-token 2FA is enabled for this account")
@@ -4576,9 +4582,25 @@ app = FastAPI(
 )
 
 # Add CORS middleware
+# A wildcard origin ("*") is INVALID together with allow_credentials=True: the
+# browser refuses the response and no Access-Control-Allow-Origin reaches the
+# page, which is why the web app's POSTs (waiting-room admit/deny, recording)
+# failed CORS from web.dilarion.xyz. List the real web origins explicitly (plus
+# a regex for any dilarion.xyz subdomain and local dev) so credentialed requests
+# get a concrete allowed origin. Native apps (desktop/iOS/Android) are not
+# subject to CORS.
+_cors_origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()] or [
+    "https://web.dilarion.xyz",
+    "https://dilarion.xyz",
+    "https://admin.dilarion.xyz",
+    "http://localhost:1420", "http://127.0.0.1:1420",
+    "http://localhost:5173", "http://127.0.0.1:5173",
+    "http://localhost:3000", "http://127.0.0.1:3000",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure for production
+    allow_origins=_cors_origins,
+    allow_origin_regex=r"https://([a-z0-9-]+\.)*dilarion\.xyz",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -9733,6 +9755,38 @@ async def end_remote_control(
         "data": {"conference_id": conference_id},
     })
     monitor_record_event("calls", "control.ended", user_id=sender_id)
+    return {"success": True}
+
+@app.post("/calls/conference/{conference_id}/control/rustdesk-session")
+async def relay_rustdesk_session(
+    conference_id: int,
+    payload: RemoteControlRustdeskSession,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """After approving control, the TARGET posts its RustDesk ID + a one-time
+    password here; the backend relays them to the requester so their client can
+    open the RustDesk session. Ephemeral signalling only — nothing is stored,
+    and the OTP is single-use (the target clears it when control ends)."""
+    target_id = int(getattr(current_user, 'id', 0))
+    requester = db.query(User).filter(User.username == payload.requester_username, User.is_active == True).first()
+    if not requester:
+        raise HTTPException(status_code=404, detail="Requester not found")
+    _require_same_organization(current_user, requester)
+    if not _both_active_in_conference(db, conference_id, target_id, int(requester.id)):
+        raise HTTPException(status_code=403, detail="Both parties must be active in this meeting")
+    sent = await ws_manager.send_to_user(int(requester.id), {
+        "type": "remote_control_rustdesk_session",
+        "data": {
+            "conference_id": conference_id,
+            "target_username": str(getattr(current_user, 'username', '')),
+            "rustdesk_id": payload.rustdesk_id,
+            "otp": payload.otp,
+        },
+    })
+    if not sent:
+        raise HTTPException(status_code=400, detail="Requester is not currently reachable")
+    monitor_record_event("calls", "control.rustdesk_session", user_id=target_id)
     return {"success": True}
 
 
