@@ -1,0 +1,10 @@
+port: 7880
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 60000
+  use_external_ip: true
+# Replace with your own generated key/secret (see README), and set the SAME
+# values in the backend .env as LIVEKIT_API_KEY / LIVEKIT_API_SECRET.
+keys:
+  APIprodChangeMe: prodSecretChangeMeToALongRandomString

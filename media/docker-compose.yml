@@ -1,0 +1,23 @@
+# Self-hosted media stack for Dilarion calls/meetings (prod).
+# LiveKit = SFU for group calls/meetings; coturn = TURN relay for 1:1 WebRTC.
+#   docker compose up -d
+# Open firewall: 7880/tcp 7881/tcp 50000-60000/udp (LiveKit),
+#                3478/tcp 3478/udp 5349/tcp 49160-49200/udp (coturn)
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: dilarion-livekit
+    command: --config /etc/livekit.yaml
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: dilarion-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/turnserver.conf:ro
+    command: ["-c", "/etc/turnserver.conf"]
