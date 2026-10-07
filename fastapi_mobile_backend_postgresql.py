@@ -5584,13 +5584,18 @@ async def approve_organization_request(
 
     if not row.requested_admin_username or not row.requested_admin_password_hash:
         raise HTTPException(status_code=409, detail="This legacy request has no organization account credentials")
-    account_conflict = db.query(User).filter(or_(
-        User.username == row.requested_admin_username,
-        User.email == row.contact_email,
-        User.phone_number == normalize_phone_number(row.contact_phone or ""),
-    )).first()
-    if account_conflict:
-        raise HTTPException(status_code=409, detail="The requested organization account conflicts with an existing account")
+    # Check each identifier separately so the admin is told exactly which one
+    # clashes (and with whom) instead of a generic "conflicts" message.
+    norm_phone = normalize_phone_number(row.contact_phone or "")
+    by_username = db.query(User).filter(User.username == row.requested_admin_username).first()
+    if by_username:
+        raise HTTPException(status_code=409, detail=f"The username '{row.requested_admin_username}' is already taken by another account.")
+    by_email = db.query(User).filter(User.email == row.contact_email).first() if row.contact_email else None
+    if by_email:
+        raise HTTPException(status_code=409, detail=f"The email {row.contact_email} is already registered to '{by_email.username}'. Use a different contact email for this organization.")
+    by_phone = db.query(User).filter(User.phone_number == norm_phone).first() if norm_phone else None
+    if by_phone:
+        raise HTTPException(status_code=409, detail=f"The phone number {row.contact_phone} is already registered to '{by_phone.username}'. Edit the request with a different number before approving.")
 
     if db.query(Organization.id).filter(Organization.name == row.organization_name).first():
         raise HTTPException(status_code=409, detail="An organization with this name already exists")
