@@ -13683,6 +13683,32 @@ class ClientEventRequest(BaseModel):
     status: str = Field(default="error", description="'ok' or 'error'")
     detail: Optional[str] = Field(None, max_length=500, description="Short error string — never plaintext content")
 
+@app.post("/webhooks/sendchamp")
+async def sendchamp_sms_webhook(request: Request):
+    """Receives Sendchamp SMS delivery reports (set this URL as the Live webhook
+    in the Sendchamp dashboard). Logs the real delivery status so accepted-but-
+    not-delivered messages show their reason, and records it in Service Health
+    under the 'devices' channel. Public endpoint — it only accepts status
+    reports and never trusts them for anything privileged."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    logger.info("Sendchamp webhook: %s", json.dumps(payload)[:1200])
+    try:
+        data = payload.get("data", payload) if isinstance(payload, dict) else {}
+        status = str(data.get("status") or data.get("delivery_status") or payload.get("status") or "").lower()
+        to = data.get("to") or data.get("phone_number") or data.get("recipient") or ""
+        reason = data.get("reason") or data.get("message") or ""
+        ok = status in ("delivered", "sent", "success", "dnd_delivered")
+        monitor_record_event("devices", "sms_status",
+                             status="ok" if ok else "error",
+                             detail=f"{to}: {status} {reason}".strip())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Sendchamp webhook parse error: %s", exc)
+    return {"received": True}
+
+
 @app.post("/monitoring/client-event")
 async def report_client_event(
     payload: ClientEventRequest,
