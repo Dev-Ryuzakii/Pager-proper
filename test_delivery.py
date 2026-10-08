@@ -62,65 +62,64 @@ def show_env():
     print()
 
 
+def _email_providers():
+    """Same order the server uses: configured SMTP first, Resend fallback."""
+    providers = []
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_from = os.getenv("SMTP_FROM")
+    if smtp_host and os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD") and smtp_from:
+        port = int(os.getenv("SMTP_PORT", "465" if smtp_host == "smtp.resend.com" else "587"))
+        use_ssl = os.getenv("SMTP_SSL", "1" if port in (465, 2465) else "0") == "1"
+        use_starttls = (os.getenv("SMTP_STARTTLS", "0" if use_ssl else "1") == "1") and not use_ssl
+        providers.append(("smtp", smtp_host, port, os.getenv("SMTP_USERNAME"),
+                          os.getenv("SMTP_PASSWORD"), use_ssl, use_starttls, smtp_from))
+    resend_key = os.getenv("RESEND_API_KEY")
+    resend_from = os.getenv("RESEND_FROM_EMAIL") or smtp_from
+    if resend_key and resend_from and smtp_host != "smtp.resend.com":
+        providers.append(("resend", "smtp.resend.com", 465, "resend",
+                          resend_key, True, False, resend_from))
+    return providers
+
+
 def test_email(to_email):
     print("=" * 64)
     print(f"EMAIL  ->  {to_email}")
     print("=" * 64)
-    resend_key = os.getenv("RESEND_API_KEY")
-    smtp_host = os.getenv("SMTP_HOST") or ("smtp.resend.com" if resend_key else None)
-    smtp_user = os.getenv("SMTP_USERNAME") or ("resend" if resend_key else None)
-    smtp_password = os.getenv("SMTP_PASSWORD") or resend_key
-    from_email = os.getenv("SMTP_FROM") or os.getenv("RESEND_FROM_EMAIL")
-
-    missing = [n for n, v in [
-        ("SMTP_HOST/RESEND_API_KEY", smtp_host),
-        ("SMTP_USERNAME/RESEND_API_KEY", smtp_user),
-        ("SMTP_PASSWORD/RESEND_API_KEY", smtp_password),
-        ("SMTP_FROM/RESEND_FROM_EMAIL", from_email),
-    ] if not v]
-    if missing:
-        print("  RESULT: NOT SENT — configuration incomplete.")
-        print("  Missing:", ", ".join(missing))
-        print("  (This is exactly why the server logs 'configuration is incomplete'.)")
+    providers = _email_providers()
+    if not providers:
+        print("  RESULT: NOT SENT — no SMTP/Resend provider configured.")
         print()
         return
 
-    port = int(os.getenv("SMTP_PORT", "465" if smtp_host == "smtp.resend.com" else "587"))
-    use_ssl = os.getenv("SMTP_SSL", "1" if port in (465, 2465) else "0") == "1"
-    use_starttls = os.getenv("SMTP_STARTTLS", "0" if use_ssl else "1") == "1"
-    # Mirror the server: STARTTLS on an implicit-SSL socket (465) always fails.
-    if use_ssl:
-        use_starttls = False
-    print(f"  host={smtp_host} port={port} ssl={use_ssl} starttls={use_starttls} user={smtp_user}")
-    print(f"  from={from_email}")
-
-    sender_name, sender_addr = parseaddr(from_email)
-    if not sender_name:
-        sender_name = os.getenv("SMTP_FROM_NAME", "Dilarion")
-    sender_domain = sender_addr.split("@", 1)[-1] if "@" in sender_addr else None
-
-    msg = EmailMessage()
-    msg["Subject"] = "Dilarion delivery test"
-    msg["From"] = formataddr((sender_name, sender_addr))
-    msg["To"] = to_email
-    msg["Date"] = formatdate(localtime=False)
-    msg["Message-ID"] = make_msgid(domain=sender_domain)
-    msg.set_content("This is a Dilarion email delivery test. If you received it, SMTP works.")
-
-    try:
-        smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
-        kwargs = {"timeout": 20}
-        if use_ssl:
-            kwargs["context"] = ssl.create_default_context()
-        with smtp_class(smtp_host, port, **kwargs) as server:
-            server.set_debuglevel(1)
-            if use_starttls:
-                server.starttls(context=ssl.create_default_context())
-            server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-        print("  RESULT: SENT OK — check the inbox (and spam).")
-    except Exception as exc:  # noqa: BLE001
-        print(f"  RESULT: FAILED — {type(exc).__name__}: {exc}")
+    for name, host, port, user, password, use_ssl, use_starttls, from_email in providers:
+        print(f"  [{name}] host={host} port={port} ssl={use_ssl} starttls={use_starttls} from={from_email}")
+        sender_name, sender_addr = parseaddr(from_email)
+        if not sender_name:
+            sender_name = os.getenv("SMTP_FROM_NAME", "Dilarion")
+        sender_domain = sender_addr.split("@", 1)[-1] if "@" in sender_addr else None
+        msg = EmailMessage()
+        msg["Subject"] = "Dilarion delivery test"
+        msg["From"] = formataddr((sender_name, sender_addr))
+        msg["To"] = to_email
+        msg["Date"] = formatdate(localtime=False)
+        msg["Message-ID"] = make_msgid(domain=sender_domain)
+        msg.set_content("This is a Dilarion email delivery test. If you received it, email works.")
+        try:
+            smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+            kwargs = {"timeout": 20}
+            if use_ssl:
+                kwargs["context"] = ssl.create_default_context()
+            with smtp_class(host, port, **kwargs) as server:
+                if use_starttls:
+                    server.starttls(context=ssl.create_default_context())
+                server.login(user, password)
+                server.send_message(msg)
+            print(f"  RESULT: SENT OK via {name} — check the inbox (and spam).")
+            print()
+            return
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [{name}] failed: {type(exc).__name__}: {exc} — trying next")
+    print("  RESULT: FAILED — every provider failed.")
     print()
 
 
