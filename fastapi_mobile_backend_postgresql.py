@@ -410,28 +410,31 @@ def _email_template(
 </body></html>"""
 
 
-def _send_email_message(to_email: str, subject: str, text_body: str, html_body: Optional[str] = None) -> bool:
-    """Send through configured SMTP. RESEND_API_KEY enables Resend defaults automatically."""
-    resend_key = os.getenv("RESEND_API_KEY")
-    smtp_host = os.getenv("SMTP_HOST") or ("smtp.resend.com" if resend_key else None)
-    smtp_user = os.getenv("SMTP_USERNAME") or ("resend" if resend_key else None)
-    smtp_password = os.getenv("SMTP_PASSWORD") or resend_key
-    from_email = os.getenv("SMTP_FROM") or os.getenv("RESEND_FROM_EMAIL")
-    if not smtp_host or not smtp_user or not smtp_password or not from_email:
-        logger.warning("Email not sent to %s: SMTP/Resend configuration is incomplete", to_email)
-        return False
+def _email_providers() -> list:
+    """Ordered list of email providers to try. The configured SMTP (e.g. your
+    cPanel mail) is tried first; Resend is the automatic fallback when its API
+    key is set. Each entry: (name, host, port, user, password, use_ssl,
+    use_starttls, from_email)."""
+    providers = []
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_from = os.getenv("SMTP_FROM")
+    if smtp_host and os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD") and smtp_from:
+        port = int(os.getenv("SMTP_PORT", "465" if smtp_host == "smtp.resend.com" else "587"))
+        use_ssl = os.getenv("SMTP_SSL", "1" if port in (465, 2465) else "0") == "1"
+        use_starttls = (os.getenv("SMTP_STARTTLS", "0" if use_ssl else "1") == "1") and not use_ssl
+        providers.append(("smtp", smtp_host, port, os.getenv("SMTP_USERNAME"),
+                          os.getenv("SMTP_PASSWORD"), use_ssl, use_starttls, smtp_from))
 
-    port = int(os.getenv("SMTP_PORT", "465" if smtp_host == "smtp.resend.com" else "587"))
-    use_ssl = os.getenv("SMTP_SSL", "1" if port in (465, 2465) else "0") == "1"
-    use_starttls = os.getenv("SMTP_STARTTLS", "0" if use_ssl else "1") == "1"
-    # Guard a common misconfig: on an implicit-SSL port (465) the socket is
-    # already encrypted, so issuing STARTTLS on top raises and the mail never
-    # sends. SSL wins; STARTTLS is only for plaintext ports like 587.
-    if use_ssl:
-        use_starttls = False
-    # Deliverability: a named sender, a real Message-ID/Date on the sending
-    # domain, a plain-text part alongside the HTML, and no tracking pixels.
-    # Inbox placement still depends on SPF/DKIM/DMARC for that domain.
+    resend_key = os.getenv("RESEND_API_KEY")
+    resend_from = os.getenv("RESEND_FROM_EMAIL") or smtp_from
+    # Add Resend as a fallback unless the primary SMTP already IS Resend.
+    if resend_key and resend_from and smtp_host != "smtp.resend.com":
+        providers.append(("resend", "smtp.resend.com", 465, "resend",
+                          resend_key, True, False, resend_from))
+    return providers
+
+
+def _build_email(to_email: str, subject: str, text_body: str, html_body: Optional[str], from_email: str) -> EmailMessage:
     from email.utils import formataddr, formatdate, make_msgid, parseaddr
     sender_name, sender_addr = parseaddr(from_email)
     if not sender_name:
@@ -456,15 +459,36 @@ def _send_email_message(to_email: str, subject: str, text_body: str, html_body: 
                     logo_file.read(), maintype="image", subtype="png",
                     cid=f"<{EMAIL_LOGO_CID}>", filename="dilarion-logo.png",
                 )
+    return msg
 
-    smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
-    with smtp_class(smtp_host, port, timeout=20) as server:
-        if use_starttls:
-            server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.send_message(msg)
-    logger.info("Transactional email queued through SMTP for %s: %s", to_email, subject)
-    return True
+
+def _send_email_message(to_email: str, subject: str, text_body: str, html_body: Optional[str] = None) -> bool:
+    """Send via the configured providers in order (cPanel SMTP first, Resend
+    fallback). Returns True as soon as one succeeds; only logs a failure once
+    every provider has been tried."""
+    providers = _email_providers()
+    if not providers:
+        logger.warning("Email not sent to %s: no SMTP/Resend provider configured", to_email)
+        return False
+
+    last_error = None
+    for name, host, port, user, password, use_ssl, use_starttls, from_email in providers:
+        try:
+            msg = _build_email(to_email, subject, text_body, html_body, from_email)
+            smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+            with smtp_class(host, port, timeout=20) as server:
+                if use_starttls:
+                    server.starttls()
+                server.login(user, password)
+                server.send_message(msg)
+            logger.info("Transactional email sent via %s (%s) to %s: %s", name, host, to_email, subject)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning("Email provider %s (%s) failed for %s: %s — trying next", name, host, to_email, exc)
+            continue
+    logger.error("Email not sent to %s: all providers failed (last: %s)", to_email, last_error)
+    return False
 
 
 def _sms_number(phone: str) -> str:
