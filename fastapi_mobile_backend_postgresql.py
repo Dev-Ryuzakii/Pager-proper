@@ -8409,8 +8409,8 @@ def _meeting_calendar_dict(m: Meeting, occurrence_at: datetime, creator_username
     return {
         "meeting_id": m.id,
         "title": m.title,
-        "occurrence_start": occurrence_at.isoformat(),
-        "occurrence_end": (occurrence_at + timedelta(minutes=m.duration_minutes or 60)).isoformat(),
+        "occurrence_start": _iso(occurrence_at),
+        "occurrence_end": _iso(occurrence_at + timedelta(minutes=m.duration_minutes or 60)),
         "duration_minutes": m.duration_minutes,
         "recurrence": m.recurrence,
         "status": m.status,
@@ -8426,8 +8426,8 @@ def _personal_plan_dict(p: PersonalPlan) -> Dict[str, Any]:
         "plan_id": p.id,
         "title": p.title,
         "notes": p.notes,
-        "starts_at": p.starts_at.isoformat() if p.starts_at else None,
-        "ends_at": p.ends_at.isoformat() if p.ends_at else None,
+        "starts_at": _iso(p.starts_at),
+        "ends_at": _iso(p.ends_at),
         "all_day": bool(p.all_day),
     }
 
@@ -9042,6 +9042,9 @@ async def create_task(
     user_id = int(getattr(current_user, 'id', 0))
     is_site_admin = bool(getattr(current_user, 'is_admin', False))
 
+    # Non-admins may create a personal task for themselves; assigning to others
+    # or through a group still needs admin / group-admin rights.
+    self_only = False
     if payload.group_id:
         if not (is_site_admin or _is_group_admin(db, payload.group_id, user_id)):
             raise HTTPException(status_code=403, detail="Only a group admin or site admin can assign tasks in this group")
@@ -9049,9 +9052,8 @@ async def create_task(
             m.user_id for m in db.query(GroupMember).filter(GroupMember.group_id == payload.group_id).all()
         }
     else:
-        if not is_site_admin:
-            raise HTTPException(status_code=403, detail="Only a site admin can assign a task without a group")
         group_member_ids = None
+        self_only = not is_site_admin
 
     task = Task(
         group_id=payload.group_id, created_by_id=user_id, title=payload.title,
@@ -9064,7 +9066,7 @@ async def create_task(
 
     notify_user_ids: List[int] = []
 
-    if payload.is_breakout and payload.breakout_groups:
+    if payload.is_breakout and payload.breakout_groups and not self_only:
         for grp in payload.breakout_groups:
             tg = TaskGroup(task_id=task.id, name=grp.get("name"))
             db.add(tg)
@@ -9080,7 +9082,10 @@ async def create_task(
                 notify_user_ids.append(u.id)
         db.commit()
     else:
-        for uname in payload.assignee_usernames:
+        # A non-admin's task is assigned to themselves only; admins assign to
+        # whoever they listed.
+        target_usernames = [str(getattr(current_user, 'username', ''))] if self_only else payload.assignee_usernames
+        for uname in target_usernames:
             u = db.query(User).filter(User.username == uname, User.is_active == True).first()
             if not u:
                 continue
