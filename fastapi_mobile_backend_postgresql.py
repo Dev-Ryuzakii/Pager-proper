@@ -65,7 +65,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import User, Organization, OrganizationAccessRequest, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, GoogleCalendarEventLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, ChatSettings, HiddenMessage
+from database_models import User, Organization, OrganizationAccessRequest, OrgAnnouncement, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, GoogleCalendarEventLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, ChatSettings, HiddenMessage
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -5047,7 +5047,12 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
                 detail="User not found",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        if getattr(user, "organization_role", None) == "viewer":
+        # The organization account (organization_role == "viewer",
+        # user_type == "organization") is now a full in-app account — it logs
+        # in with the same portal credentials and runs its organization from
+        # the app (broadcast, assign tasks, call control). Any other "viewer"
+        # (a legacy read-only account) is still kept out of the app.
+        if getattr(user, "organization_role", None) == "viewer" and getattr(user, "user_type", None) != "organization":
             raise HTTPException(status_code=403, detail="Use the read-only organization portal")
         if (not user.is_admin and user.organization_id is not None
                 and user.invitation_accepted_at is not None
@@ -5107,6 +5112,35 @@ async def get_organization_viewer(
     if not user or not user.organization_id:
         raise HTTPException(status_code=403, detail="Organization account access required")
     return user
+
+
+# ─── Organization-wide admin privileges ─────────────────────────────────────
+# Groups are self-run (GroupMember.role == "admin"). This is the separate,
+# organization-wide layer: the organization account delegates company-wide
+# powers to chosen staff. The organization account itself holds all of them.
+ORG_PRIVILEGES = {"broadcast", "assign_tasks", "call_control", "manage_staff", "manage_groups"}
+
+
+def _is_org_account(user) -> bool:
+    """True for the one delegated account that represents an organization."""
+    return (getattr(user, "user_type", None) == "organization"
+            or getattr(user, "organization_role", None) == "viewer")
+
+
+def _org_privilege_set(user) -> set:
+    """Effective org-wide privileges for a user. Site admins and the
+    organization account implicitly hold every privilege."""
+    if getattr(user, "is_admin", False) or _is_org_account(user):
+        return set(ORG_PRIVILEGES)
+    raw = getattr(user, "org_privileges", None) or []
+    if "*" in raw:
+        return set(ORG_PRIVILEGES)
+    return {p for p in raw if p in ORG_PRIVILEGES}
+
+
+def _has_org_privilege(user, name: str) -> bool:
+    return name in _org_privilege_set(user)
+
 
 # Add admin authentication dependency
 async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
@@ -6054,6 +6088,201 @@ async def organization_reset_staff_login(
     AuditService.log_event(db, int(current_user.id), "organization_staff_login_reset",
                            f"Organization portal reset login for {user.username}, all sessions invalidated")
     return {"status": "queued", "message": "Login reset. A one-time setup code was sent by email and SMS"}
+
+
+# ─── Organization-wide admin (the org account, in-app) ──────────────────────
+# The organization account logs into the app with its portal credentials and
+# runs the company from there: it delegates org-wide privileges to chosen
+# staff, broadcasts official messages, assigns tasks org-wide, and controls
+# the microphone of anyone in a meeting. Group admin is a separate, group-
+# scoped layer (GroupMember.role) and is unaffected by any of this.
+
+class OrgPrivilegeGrant(BaseModel):
+    # Any subset of ORG_PRIVILEGES. An empty list demotes the staff member
+    # back to an ordinary org member.
+    privileges: List[str] = Field(default_factory=list)
+
+
+class OrgBroadcast(BaseModel):
+    message: str
+    title: Optional[str] = None
+
+
+def _require_org_context(current_user) -> int:
+    org_id = getattr(current_user, "organization_id", None)
+    if not org_id:
+        raise HTTPException(status_code=403, detail="Your account is not attached to an organization")
+    return int(org_id)
+
+
+def _org_member_public(user: User) -> Dict[str, Any]:
+    privs = sorted(_org_privilege_set(user)) if (user.org_privileges or user.organization_role == "admin") else []
+    return {
+        "id": int(user.id),
+        "username": user.username,
+        "full_name": user.full_name,
+        "email": user.email,
+        "phone_number": user.phone_number,
+        "department": user.department,
+        "is_active": bool(user.is_active),
+        "org_privileges": privs,
+        "is_org_admin": bool(privs),
+    }
+
+
+@app.get("/organization/staff")
+async def list_organization_staff(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Roster with each member's granted org-wide privileges. Visible to the
+    organization account and to any staff with the "manage_staff" privilege."""
+    if not (_is_org_account(current_user) or _has_org_privilege(current_user, "manage_staff")):
+        raise HTTPException(status_code=403, detail="Organization admin access required")
+    org_id = _require_org_context(current_user)
+    members = db.query(User).filter(
+        User.organization_id == org_id,
+        User.organization_role != "viewer",
+        User.is_admin == False,
+    ).order_by(User.full_name.asc(), User.username.asc()).all()
+    return {
+        "available_privileges": sorted(ORG_PRIVILEGES),
+        "staff": [_org_member_public(u) for u in members],
+        "count": len(members),
+    }
+
+
+@app.post("/organization/staff/{username}/privileges")
+async def set_organization_staff_privileges(
+    username: str,
+    payload: OrgPrivilegeGrant,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Grant/replace a staff member's org-wide privileges. Only the
+    organization account, or a staff member with "manage_staff", may do this."""
+    if not (_is_org_account(current_user) or _has_org_privilege(current_user, "manage_staff")):
+        raise HTTPException(status_code=403, detail="Organization admin access required")
+    org_id = _require_org_context(current_user)
+
+    target = db.query(User).filter(
+        User.username == username.strip().lower(),
+        User.organization_id == org_id,
+        User.organization_role != "viewer",
+    ).first()
+    if not target or getattr(target, "is_admin", False):
+        raise HTTPException(status_code=404, detail="Staff member not found in your organization")
+    if int(target.id) == int(current_user.id):
+        raise HTTPException(status_code=400, detail="You cannot change your own privileges")
+
+    unknown = [p for p in payload.privileges if p not in ORG_PRIVILEGES]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown privilege(s): {', '.join(unknown)}")
+    granted = sorted(set(payload.privileges))
+
+    target.org_privileges = granted or None
+    target.organization_role = "admin" if granted else "member"
+    db.commit()
+    AuditService.log_event(
+        db, int(current_user.id), "org_privileges_set",
+        f"Set {target.username} org privileges to {granted or 'none'}",
+    )
+    await ws_manager.send_to_user(int(target.id), {
+        "type": "org_privileges_updated",
+        "data": {"privileges": granted},
+    })
+    return {"status": "updated", "username": target.username, "org_privileges": granted}
+
+
+@app.post("/organization/broadcast", status_code=201)
+async def organization_broadcast(
+    payload: OrgBroadcast,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Send an official company-wide announcement to every member of the
+    organization. Needs the "broadcast" privilege (the org account has it)."""
+    if not _has_org_privilege(current_user, "broadcast"):
+        raise HTTPException(status_code=403, detail="You do not have the broadcast privilege")
+    org_id = _require_org_context(current_user)
+    body = (payload.message or "").strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    organization = db.query(Organization).filter(Organization.id == org_id).first()
+    ann = OrgAnnouncement(
+        organization_id=org_id,
+        sender_id=int(current_user.id),
+        title=(payload.title or "").strip() or None,
+        body=body,
+    )
+    db.add(ann)
+    db.commit()
+    db.refresh(ann)
+
+    members = db.query(User).filter(
+        User.organization_id == org_id,
+        User.organization_role != "viewer",
+        User.is_active == True,
+        User.id != current_user.id,
+    ).all()
+    sender_name = organization.name if organization else (current_user.full_name or current_user.username)
+    event = {
+        "type": "org_broadcast",
+        "data": {
+            "id": int(ann.id),
+            "title": ann.title,
+            "message": ann.body,
+            "from": sender_name,
+            "created_at": _iso(ann.created_at),
+        },
+    }
+    delivered = 0
+    for m in members:
+        if await ws_manager.send_to_user(int(m.id), event):
+            delivered += 1
+        else:
+            await push_to_user(db, int(m.id), ann.title or f"{sender_name} announcement", body, sound="beep.caf")
+    AuditService.log_event(
+        db, int(current_user.id), "org_broadcast_sent",
+        f"Broadcast to organization {org_id} ({len(members)} members)",
+    )
+    return {"status": "sent", "id": int(ann.id), "recipients": len(members), "delivered_live": delivered}
+
+
+@app.get("/organization/me/privileges")
+async def my_org_privileges(
+    current_user: User = Depends(get_current_user),
+):
+    """The org-wide privileges the caller effectively holds — the app uses this
+    to decide whether to show broadcast / call-control / staff-admin UI."""
+    return {
+        "is_org_account": _is_org_account(current_user),
+        "privileges": sorted(_org_privilege_set(current_user)),
+    }
+
+
+@app.get("/organization/broadcasts")
+async def list_organization_broadcasts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Recent official announcements for the caller's organization."""
+    org_id = _require_org_context(current_user)
+    rows = db.query(OrgAnnouncement).filter(
+        OrgAnnouncement.organization_id == org_id,
+    ).order_by(OrgAnnouncement.created_at.desc()).limit(100).all()
+    out = []
+    for r in rows:
+        sender = db.query(User).filter(User.id == r.sender_id).first()
+        out.append({
+            "id": int(r.id),
+            "title": r.title,
+            "message": r.body,
+            "from": (sender.full_name or sender.username) if sender else None,
+            "created_at": _iso(r.created_at),
+        })
+    return {"broadcasts": out, "count": len(out)}
 
 
 @app.get("/admin/organizations")
@@ -9043,7 +9272,11 @@ async def create_task(
     is_site_admin = bool(getattr(current_user, 'is_admin', False))
 
     # Non-admins may create a personal task for themselves; assigning to others
-    # or through a group still needs admin / group-admin rights.
+    # or through a group still needs admin / group-admin rights. A staff member
+    # the organization granted "assign_tasks" (and the org account) may assign
+    # to anyone in their own organization, site-admin-style but org-scoped.
+    can_assign_org = _has_org_privilege(current_user, "assign_tasks")
+    actor_org_id = getattr(current_user, "organization_id", None)
     self_only = False
     if payload.group_id:
         if not (is_site_admin or _is_group_admin(db, payload.group_id, user_id)):
@@ -9053,7 +9286,7 @@ async def create_task(
         }
     else:
         group_member_ids = None
-        self_only = not is_site_admin
+        self_only = not (is_site_admin or can_assign_org)
 
     task = Task(
         group_id=payload.group_id, created_by_id=user_id, title=payload.title,
@@ -9091,6 +9324,10 @@ async def create_task(
                 continue
             if group_member_ids is not None and u.id not in group_member_ids:
                 continue
+            # An org assigner (not a site admin) is confined to its own org.
+            if can_assign_org and not is_site_admin and not self_only:
+                if getattr(u, "organization_id", None) != actor_org_id:
+                    continue
             db.add(TaskAssignee(task_id=task.id, user_id=u.id))
             notify_user_ids.append(u.id)
         db.commit()
@@ -9796,6 +10033,62 @@ async def end_remote_control(
     })
     monitor_record_event("calls", "control.ended", user_id=sender_id)
     return {"success": True}
+
+
+class ConferenceMuteRequest(BaseModel):
+    muted: bool = True
+
+
+@app.post("/calls/conference/{conference_id}/participants/{target_username}/mute")
+async def conference_mute_participant(
+    conference_id: int,
+    target_username: str,
+    payload: ConferenceMuteRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Mute (or unmute) another participant's microphone in a meeting. Allowed
+    for the meeting host, a site admin, or a staff member the organization
+    granted the "call_control" privilege. The participant is named by their
+    username (the LiveKit identity the client sees). Delivered as a websocket
+    command the target client enforces on its own mic track — so it works for
+    both the mesh (1:1/small) and LiveKit (meeting) transports."""
+    actor_id = int(getattr(current_user, 'id', 0))
+    is_host = _conference_host_id(db, conference_id) == actor_id
+    if not (is_host or _has_org_privilege(current_user, "call_control")):
+        raise HTTPException(status_code=403, detail="Only the host or an organization call moderator can mute others")
+
+    target = db.query(User).filter(User.username == target_username, User.is_active == True).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Participant not found")
+    target_user_id = int(target.id)
+    # A call moderator (not the host) may only act within their own org.
+    if not is_host and not getattr(current_user, "is_admin", False):
+        if getattr(target, "organization_id", None) != getattr(current_user, "organization_id", None):
+            raise HTTPException(status_code=403, detail="That participant is not in your organization")
+
+    participant = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.user_id == target_user_id,
+        ConferenceParticipant.is_active == True,
+    ).first()
+    if not participant:
+        raise HTTPException(status_code=404, detail="That participant is not in this meeting")
+
+    await ws_manager.send_to_user(target_user_id, {
+        "type": "conference_force_mute",
+        "data": {
+            "conference_id": conference_id,
+            "muted": bool(payload.muted),
+            "by": str(getattr(current_user, 'username', '')),
+        },
+    })
+    AuditService.log_event(
+        db, actor_id, "conference_participant_muted",
+        f"{'Muted' if payload.muted else 'Unmuted'} user {target_user_id} in conference {conference_id}",
+    )
+    return {"success": True, "muted": bool(payload.muted)}
+
 
 @app.post("/calls/conference/{conference_id}/control/rustdesk-session")
 async def relay_rustdesk_session(

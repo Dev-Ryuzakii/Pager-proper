@@ -27,7 +27,12 @@ class User(Base):
     full_name = Column(String(255), nullable=True)
     department = Column(String(120), nullable=True)
     organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
-    organization_role = Column(String(20), nullable=True)  # "owner" / "admin" / "member"
+    organization_role = Column(String(20), nullable=True)  # "viewer" (org account) / "admin" / "member"
+    # Org-wide admin privileges a staff member was granted by their organization
+    # account, e.g. ["broadcast","assign_tasks","call_control"]. Null/empty =
+    # ordinary member. The organization account itself (organization_role ==
+    # "viewer", user_type == "organization") implicitly holds every privilege.
+    org_privileges = Column(JSON, nullable=True)
     public_key = Column(Text, nullable=True)  # Make this optional - RSA public key in PEM format
     password_hash = Column(String(255), nullable=True)  # Optional password hash
     must_change_password = Column(Boolean, default=False)  # Flag to force password change on first login
@@ -150,6 +155,23 @@ class Organization(Base):
     created_at = Column(DateTime, default=func.now(), nullable=False)
 
     users = relationship("User", back_populates="organization", foreign_keys="User.organization_id")
+
+
+class OrgAnnouncement(Base):
+    """An official company-wide message sent by an organization account (or a
+    staff member it granted the "broadcast" privilege) to every member of the
+    organization. Not E2EE — it is an announcement, delivered live over the
+    websocket and stored here so members can read past announcements."""
+    __tablename__ = "org_announcements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False, index=True)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(200), nullable=True)
+    body = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False, index=True)
+
+    sender = relationship("User", foreign_keys=[sender_id])
 
 
 class OrganizationAccessRequest(Base):
