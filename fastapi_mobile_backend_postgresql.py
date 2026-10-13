@@ -65,6 +65,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
+from database_models import ServiceEvent, UptimeTarget, BlockedApp, PolicyViolationScreenshot
 from database_models import User, Organization, OrganizationAccessRequest, OrgAnnouncement, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, GoogleCalendarEventLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, ChatSettings, HiddenMessage
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
@@ -4113,6 +4114,105 @@ class AdminService:
                 db.query(GroupMessageRead).filter(
                     GroupMessageRead.message_id.in_(msg_ids)
                 ).delete(synchronize_session=False)
+
+            # ── 8b. Rows added to the schema after this function was last
+            # extended that still hold a FK to this user (or to the messages
+            # about to be deleted) ────────────────────────────────────────────
+            # Left behind, any one of them makes the final db.delete(user)
+            # fail with a foreign-key violation, which is the "Failed to delete
+            # user: ..." HTTP 500 the admin console shows when an
+            # account-deletion request is approved, and the reason a deleted
+            # user's phone number stays "already registered" (the whole
+            # transaction rolls back).
+            #
+            # Hidden messages are the viewer's own copy of a message — each
+            # side holds one — so they belong with step 9's Message delete,
+            # before it, not after.
+            db.query(HiddenMessage).filter(HiddenMessage.user_id == user_id).delete()
+            if msg_ids:
+                db.query(HiddenMessage).filter(
+                    HiddenMessage.message_id.in_(msg_ids)
+                ).delete(synchronize_session=False)
+
+            # Meetings. The user's own meetings go, taking their participant
+            # rows (other users) with them; meetings they only attended keep
+            # their seat removed. Those participant rows are cleared BEFORE the
+            # conference deletes in step 11b, and meeting_recordings before it
+            # too, because meeting_recordings.conference_id points at the
+            # conferences step 11b deletes — the order in this function is load
+            # bearing, not cosmetic.
+            recordings = db.query(MeetingRecording).filter(
+                MeetingRecording.started_by_user_id == user_id
+            ).all()
+            for rec in recordings:
+                fp = getattr(rec, 'file_path', None)
+                if fp and os.path.exists(fp):
+                    try:
+                        os.remove(fp)
+                    except Exception as e:
+                        logger.warning(f"Could not delete meeting recording {fp}: {e}")
+                db.delete(rec)
+
+            owned_meeting_ids = [
+                m.id for m in db.query(Meeting.id).filter(Meeting.creator_id == user_id).all()
+            ]
+            if owned_meeting_ids:
+                db.query(MeetingParticipant).filter(
+                    MeetingParticipant.meeting_id.in_(owned_meeting_ids)
+                ).delete(synchronize_session=False)
+                db.query(GoogleCalendarEventLink).filter(
+                    GoogleCalendarEventLink.source_type == "meeting",
+                    GoogleCalendarEventLink.source_id.in_(owned_meeting_ids),
+                ).delete(synchronize_session=False)
+                db.query(Meeting).filter(Meeting.id.in_(owned_meeting_ids)).delete(
+                    synchronize_session=False
+                )
+            db.query(MeetingParticipant).filter(
+                MeetingParticipant.user_id == user_id
+            ).delete(synchronize_session=False)
+            db.query(GoogleCalendarEventLink).filter(
+                GoogleCalendarEventLink.user_id == user_id
+            ).delete()
+
+            # Policy-violation screenshots: this user's own captures go, files
+            # included; captures some OTHER user made keep their row and only
+            # lose the reviewer when the deleted user is the admin who reviewed
+            # them (reviewed_by_admin_id is a second FK into users).
+            shots = db.query(PolicyViolationScreenshot).filter(
+                PolicyViolationScreenshot.user_id == user_id
+            ).all()
+            for shot in shots:
+                fp = getattr(shot, 'screenshot_path', None)
+                if fp and os.path.exists(fp):
+                    try:
+                        os.remove(fp)
+                    except Exception as e:
+                        logger.warning(f"Could not delete policy screenshot {fp}: {e}")
+                db.delete(shot)
+            db.query(PolicyViolationScreenshot).filter(
+                PolicyViolationScreenshot.reviewed_by_admin_id == user_id
+            ).update({"reviewed_by_admin_id": None}, synchronize_session=False)
+
+            # Service-health traces are this user's own activity stream, so
+            # they are deleted with them (the monitor's per-organization ok and
+            # error counts drop accordingly — nothing else references these).
+            db.query(ServiceEvent).filter(ServiceEvent.user_id == user_id).delete()
+
+            # Shared objects this user merely authored, reviewed or suspended —
+            # the object stays, the attribution goes (every column here is
+            # nullable, so a NULL is a complete fix).
+            db.query(UptimeTarget).filter(UptimeTarget.created_by == user_id).update(
+                {"created_by": None}, synchronize_session=False)
+            db.query(BlockedApp).filter(BlockedApp.added_by_admin_id == user_id).update(
+                {"added_by_admin_id": None}, synchronize_session=False)
+            db.query(OrganizationAccessRequest).filter(
+                OrganizationAccessRequest.reviewed_by_admin_id == user_id
+            ).update({"reviewed_by_admin_id": None}, synchronize_session=False)
+            db.query(User).filter(User.suspended_by == user_id).update(
+                {"suspended_by": None}, synchronize_session=False)
+            # An organization announcement belongs to the organization, not to
+            # its author, but sender_id is NOT NULL — it cannot outlive them.
+            db.query(OrgAnnouncement).filter(OrgAnnouncement.sender_id == user_id).delete()
 
             # ── 9. Messages ───────────────────────────────────────────────────
             db.query(Message).filter(
