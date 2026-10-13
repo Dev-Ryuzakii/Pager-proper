@@ -4799,6 +4799,19 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Log the exact field(s) behind every 422 so client "Login failed (422)" style
+# errors can be traced to the offending request body instead of guessing.
+from fastapi.exceptions import RequestValidationError as _RequestValidationError
+
+
+@app.exception_handler(_RequestValidationError)
+async def _log_validation_error(request, exc):
+    try:
+        logger.warning(f"422 validation on {request.method} {request.url.path}: {exc.errors()}")
+    except Exception:
+        pass
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 # Add CORS middleware
 # A wildcard origin ("*") is INVALID together with allow_credentials=True: the
 # browser refuses the response and no Access-Control-Allow-Origin reaches the
