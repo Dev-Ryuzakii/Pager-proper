@@ -4210,6 +4210,13 @@ class AdminService:
             ).update({"reviewed_by_admin_id": None}, synchronize_session=False)
             db.query(User).filter(User.suspended_by == user_id).update(
                 {"suspended_by": None}, synchronize_session=False)
+            # Pinning is the one per-user column on a message that is NOT the
+            # message's sender or recipient: a group message between two other
+            # people that this user pinned survives step 9's delete entirely,
+            # so its pinned_by_id has to be dropped or it blocks the final
+            # db.delete(user).
+            db.query(Message).filter(Message.pinned_by_id == user_id).update(
+                {"pinned_by_id": None}, synchronize_session=False)
             # An organization announcement belongs to the organization, not to
             # its author, but sender_id is NOT NULL — it cannot outlive them.
             db.query(OrgAnnouncement).filter(OrgAnnouncement.sender_id == user_id).delete()
