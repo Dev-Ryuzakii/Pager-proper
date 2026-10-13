@@ -4222,6 +4222,20 @@ class AdminService:
             db.query(OrgAnnouncement).filter(OrgAnnouncement.sender_id == user_id).delete()
 
             # ── 9. Messages ───────────────────────────────────────────────────
+            # messages.reply_to_message_id and forwarded_from_message_id are
+            # self-FKs into messages.id: a reply or forward BY SOMEONE ELSE that
+            # points at one of this user's messages survives the delete below
+            # and its FK then blocks it (ForeignKeyViolation →
+            # messages_reply_to_message_id_fkey). Detach those references first.
+            if msg_ids:
+                db.query(Message).filter(
+                    Message.reply_to_message_id.in_(msg_ids)
+                ).update({"reply_to_message_id": None}, synchronize_session=False)
+                db.query(Message).filter(
+                    Message.forwarded_from_message_id.in_(msg_ids)
+                ).update({"forwarded_from_message_id": None}, synchronize_session=False)
+                db.flush()
+
             db.query(Message).filter(
                 or_(Message.sender_id == user_id, Message.recipient_id == user_id)
             ).delete()
