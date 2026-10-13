@@ -117,19 +117,46 @@ class APNsClient:
 apns_client = APNsClient()
 
 
-async def push_to_user(db, user_id: int, title: str, body: str, sound: str = "beep.caf") -> bool:
+def _notifications_suppressed(user) -> bool:
+    """Whether the user's notification controls currently silence a non-urgent
+    push: a manual 'pause all' toggle, 'Do Not Disturb' availability, or being
+    inside their quiet-hours window (computed in their local time via the
+    stored UTC offset). Calls pass bypass_quiet=True to ignore this."""
+    if getattr(user, "mute_all_notifications", False):
+        return True
+    if getattr(user, "availability_status", None) == "dnd":
+        return True
+    if getattr(user, "quiet_hours_enabled", False):
+        start = getattr(user, "quiet_hours_start", None)
+        end = getattr(user, "quiet_hours_end", None)
+        if start is not None and end is not None and start != end:
+            from datetime import datetime, timezone, timedelta
+            offset = getattr(user, "quiet_hours_utc_offset", 0) or 0
+            local_hour = (datetime.now(timezone.utc) + timedelta(minutes=offset)).hour
+            within = (start <= local_hour < end) if start < end else (local_hour >= start or local_hour < end)
+            if within:
+                return True
+    return False
+
+
+async def push_to_user(db, user_id: int, title: str, body: str, sound: str = "beep.caf", bypass_quiet: bool = False) -> bool:
     """
     Send an APNs push to a user's registered device.
 
     push_token column stores '<platform>:<token>'; only iOS tokens are pushed
     (Android stays connected via its foreground service WebSocket).
     Clears the stored token if APNs reports it invalid.
+
+    Respects the user's notification controls (quiet hours / DND / mute-all)
+    unless bypass_quiet is set — calls pass it so they always ring.
     """
     if not apns_client.enabled:
         return False
     from database_models import User
 
     user = db.query(User).filter(User.id == user_id).first()
+    if user and not bypass_quiet and _notifications_suppressed(user):
+        return False
     stored = getattr(user, "push_token", None) if user else None
     if not stored or not stored.startswith("ios:"):
         return False

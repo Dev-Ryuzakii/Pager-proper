@@ -119,6 +119,18 @@ class User(Base):
     emergency_contact_name = Column(String(255), nullable=True)
     emergency_contact_phone = Column(String(20), nullable=True)
 
+    # Notification controls (Phase 2). Quiet hours suppress non-urgent pushes
+    # (messages, tasks, meeting reminders) during the user's chosen local
+    # window; calls bypass them. Stored as local-time hours [0-23) plus the
+    # client's UTC offset in minutes so the server can tell the current local
+    # hour without a stored timezone name. mute_all is a manual "pause all
+    # notifications" toggle, independent of quiet hours and of availability DND.
+    quiet_hours_enabled = Column(Boolean, default=False)
+    quiet_hours_start = Column(Integer, nullable=True)   # local hour, inclusive
+    quiet_hours_end = Column(Integer, nullable=True)     # local hour, exclusive
+    quiet_hours_utc_offset = Column(Integer, default=0)  # minutes east of UTC
+    mute_all_notifications = Column(Boolean, default=False)
+
     # Availability status, independent of online/offline presence (which is
     # WS-connection-derived, not stored here) — "available"/"busy"/"dnd"/
     # "away"/"offline" is the fixed set the UI renders an icon for;

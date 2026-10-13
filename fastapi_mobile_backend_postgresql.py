@@ -11060,7 +11060,7 @@ async def start_group_call(
         sent = await ws_manager.send_to_user(uid, invite)
         if not sent:
             try:
-                await push_to_user(db, uid, str(group.name), f"{caller_username} started a group {label} call", sound="ringingtone.caf")
+                await push_to_user(db, uid, str(group.name), f"{caller_username} started a group {label} call", sound="ringingtone.caf", bypass_quiet=True)
             except Exception as e:
                 logger.warning(f"Group call push failed: {e}")
 
@@ -12405,6 +12405,46 @@ async def set_availability_status(
         })
 
     return {"availability_status": payload.availability_status, "status_text": payload.status_text}
+
+
+class NotificationSettingsUpdate(BaseModel):
+    mute_all_notifications: Optional[bool] = None
+    quiet_hours_enabled: Optional[bool] = None
+    quiet_hours_start: Optional[int] = Field(None, ge=0, le=23)
+    quiet_hours_end: Optional[int] = Field(None, ge=0, le=23)
+    quiet_hours_utc_offset: Optional[int] = Field(None, ge=-840, le=840, description="Client UTC offset in minutes")
+
+
+def _notification_settings_dict(u: User) -> Dict[str, Any]:
+    return {
+        "mute_all_notifications": bool(getattr(u, "mute_all_notifications", False)),
+        "quiet_hours_enabled": bool(getattr(u, "quiet_hours_enabled", False)),
+        "quiet_hours_start": getattr(u, "quiet_hours_start", None),
+        "quiet_hours_end": getattr(u, "quiet_hours_end", None),
+        "quiet_hours_utc_offset": getattr(u, "quiet_hours_utc_offset", 0) or 0,
+    }
+
+
+@app.get("/users/me/notification-settings")
+async def get_notification_settings(current_user: User = Depends(get_current_user)):
+    return _notification_settings_dict(current_user)
+
+
+@app.put("/users/me/notification-settings")
+async def update_notification_settings(
+    payload: NotificationSettingsUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Quiet hours / pause-all. Omitted fields are left unchanged. Calls always
+    ring regardless of these; they only silence messages, tasks and reminders."""
+    for field in ("mute_all_notifications", "quiet_hours_enabled", "quiet_hours_start",
+                  "quiet_hours_end", "quiet_hours_utc_offset"):
+        val = getattr(payload, field)
+        if val is not None:
+            setattr(current_user, field, val)
+    db.commit()
+    return _notification_settings_dict(current_user)
 
 
 class UsernameUpdate(BaseModel):
