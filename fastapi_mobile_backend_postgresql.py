@@ -12447,6 +12447,70 @@ async def update_notification_settings(
     return _notification_settings_dict(current_user)
 
 
+@app.get("/search")
+async def unified_search(
+    q: str = Query(..., min_length=1, max_length=100, description="Search text"),
+    limit: int = Query(20, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Server-side search across people, the caller's groups, and shared files.
+    Message *bodies* are end-to-end encrypted and never searchable server-side —
+    clients search their own decrypted history locally and merge it in."""
+    user_id = int(getattr(current_user, 'id', 0))
+    term = q.strip()
+    like = f"%{term.lower()}%"
+    org_id = getattr(current_user, "organization_id", None)
+
+    # People — same org (or all, if the caller has no org), active, not self.
+    people_q = db.query(User).filter(
+        User.is_active == True,
+        User.id != user_id,
+        User.organization_role != "viewer",
+        or_(
+            func.lower(User.username).like(like),
+            func.lower(func.coalesce(User.full_name, "")).like(like),
+            func.lower(func.coalesce(User.department, "")).like(like),
+        ),
+    )
+    if org_id:
+        people_q = people_q.filter(User.organization_id == org_id)
+    people = [{
+        "username": u.username,
+        "full_name": u.full_name,
+        "department": u.department,
+        "availability_status": u.availability_status,
+    } for u in people_q.limit(limit).all()]
+
+    # Groups the caller belongs to, matched by name/description.
+    my_group_ids = {m.group_id for m in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()}
+    groups = []
+    if my_group_ids:
+        for g in db.query(Group).filter(
+            Group.id.in_(my_group_ids),
+            or_(func.lower(Group.name).like(like), func.lower(func.coalesce(Group.description, "")).like(like)),
+        ).limit(limit).all():
+            member_count = db.query(GroupMember).filter(GroupMember.group_id == g.id).count()
+            groups.append({"id": int(g.id), "name": g.name, "description": g.description, "member_count": member_count})
+
+    # Files the caller sent or received, matched by filename.
+    files = [{
+        "media_id": m.media_id,
+        "filename": m.filename,
+        "media_type": m.media_type,
+        "content_type": m.content_type,
+        "file_size": m.file_size,
+        "group_id": m.group_id,
+        "created_at": _iso(m.created_at),
+    } for m in db.query(Media).filter(
+        or_(Media.sender_id == user_id, Media.recipient_id == user_id),
+        Media.is_active == True,
+        func.lower(Media.filename).like(like),
+    ).order_by(Media.created_at.desc()).limit(limit).all()]
+
+    return {"query": term, "people": people, "groups": groups, "files": files}
+
+
 class UsernameUpdate(BaseModel):
     new_username: str = Field(..., min_length=3, max_length=50)
 
