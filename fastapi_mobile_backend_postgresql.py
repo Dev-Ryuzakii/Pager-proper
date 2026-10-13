@@ -4026,6 +4026,36 @@ class AdminService:
         user_id = int(getattr(user, 'id', 0))
 
         try:
+            def _purge_messages(ids):
+                """Delete a set of messages together with EVERY row that
+                foreign-keys them, so the final message DELETE can't trip a
+                constraint. Reused for the user's own messages and for the
+                messages inside groups/conferences the user owns (which may be
+                authored by other people)."""
+                ids = [i for i in ids if i is not None]
+                if not ids:
+                    return
+                # self-FKs: replies/forwards (by anyone) pointing at these
+                db.query(Message).filter(Message.reply_to_message_id.in_(ids)).update(
+                    {"reply_to_message_id": None}, synchronize_session=False)
+                db.query(Message).filter(Message.forwarded_from_message_id.in_(ids)).update(
+                    {"forwarded_from_message_id": None}, synchronize_session=False)
+                db.query(GroupMessageRead).filter(GroupMessageRead.message_id.in_(ids)).delete(synchronize_session=False)
+                db.query(HiddenMessage).filter(HiddenMessage.message_id.in_(ids)).delete(synchronize_session=False)
+                db.query(MessageReaction).filter(MessageReaction.message_id.in_(ids)).delete(synchronize_session=False)
+                db.query(StarredMessage).filter(StarredMessage.message_id.in_(ids)).delete(synchronize_session=False)
+                for m in db.query(Media).filter(Media.message_id.in_(ids)).all():
+                    fp = getattr(m, 'encrypted_file_path', None)
+                    if fp and os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except Exception as e:
+                            logger.warning(f"Could not delete media file {fp}: {e}")
+                    db.delete(m)
+                db.flush()
+                db.query(Message).filter(Message.id.in_(ids)).delete(synchronize_session=False)
+                db.flush()
+
             # ── 1. Leaf tables (no children) ──────────────────────────────────
             db.query(GroupMember).filter(GroupMember.user_id == user_id).delete()
             db.query(UserSession).filter(UserSession.user_id == user_id).delete()
@@ -4221,24 +4251,10 @@ class AdminService:
             # its author, but sender_id is NOT NULL — it cannot outlive them.
             db.query(OrgAnnouncement).filter(OrgAnnouncement.sender_id == user_id).delete()
 
-            # ── 9. Messages ───────────────────────────────────────────────────
-            # messages.reply_to_message_id and forwarded_from_message_id are
-            # self-FKs into messages.id: a reply or forward BY SOMEONE ELSE that
-            # points at one of this user's messages survives the delete below
-            # and its FK then blocks it (ForeignKeyViolation →
-            # messages_reply_to_message_id_fkey). Detach those references first.
-            if msg_ids:
-                db.query(Message).filter(
-                    Message.reply_to_message_id.in_(msg_ids)
-                ).update({"reply_to_message_id": None}, synchronize_session=False)
-                db.query(Message).filter(
-                    Message.forwarded_from_message_id.in_(msg_ids)
-                ).update({"forwarded_from_message_id": None}, synchronize_session=False)
-                db.flush()
-
-            db.query(Message).filter(
-                or_(Message.sender_id == user_id, Message.recipient_id == user_id)
-            ).delete()
+            # ── 9. Messages (this user's own) + every child that references them
+            # (reads, hidden copies, reactions, stars, media, reply/forward
+            # self-FKs). _purge_messages handles all of it in the right order.
+            _purge_messages(msg_ids)
 
             # ── 10. Calls ─────────────────────────────────────────────────────
             # conference_sessions.original_call_id references calls.id, and a
@@ -4310,6 +4326,18 @@ class AdminService:
                         except Exception as e:
                             logger.warning(f"Could not delete meeting recording {fp}: {e}")
                     db.delete(rec)
+                # Conference chat messages (by anyone) FK conference_id, and a
+                # Meeting row can point at the conference too — both block the
+                # conference delete otherwise.
+                conf_msg_ids = [
+                    m.id for m in db.query(Message.id).filter(
+                        Message.conference_id.in_(owned_conference_ids)
+                    ).all()
+                ]
+                _purge_messages(conf_msg_ids)
+                db.query(Meeting).filter(
+                    Meeting.conference_id.in_(owned_conference_ids)
+                ).update({"conference_id": None}, synchronize_session=False)
                 db.flush()
             db.query(ConferenceSession).filter(
                 ConferenceSession.created_by_user_id == user_id
@@ -4335,31 +4363,57 @@ class AdminService:
                 g.id for g in db.query(Group.id).filter(Group.created_by == user_id).all()
             ]
             if owned_group_ids:
+                # Everything that FK-references a group the user created must go
+                # before the group itself: its messages (by anyone) + their
+                # children, media, chat settings, meetings (ref nulled), and the
+                # group's tasks with their children.
+                grp_msg_ids = [
+                    m.id for m in db.query(Message.id).filter(
+                        Message.group_id.in_(owned_group_ids)
+                    ).all()
+                ]
+                _purge_messages(grp_msg_ids)
+                for m in db.query(Media).filter(Media.group_id.in_(owned_group_ids)).all():
+                    fp = getattr(m, 'encrypted_file_path', None)
+                    if fp and os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except Exception as e:
+                            logger.warning(f"Could not delete media file {fp}: {e}")
+                    db.delete(m)
+                db.query(ChatSettings).filter(
+                    ChatSettings.group_id.in_(owned_group_ids)
+                ).delete(synchronize_session=False)
+                db.query(Meeting).filter(
+                    Meeting.group_id.in_(owned_group_ids)
+                ).update({"group_id": None}, synchronize_session=False)
+                grp_task_ids = [
+                    t.id for t in db.query(Task.id).filter(Task.group_id.in_(owned_group_ids)).all()
+                ]
+                if grp_task_ids:
+                    grp_tg_ids = [
+                        g.id for g in db.query(TaskGroup.id).filter(TaskGroup.task_id.in_(grp_task_ids)).all()
+                    ]
+                    if grp_tg_ids:
+                        db.query(TaskGroupMember).filter(
+                            TaskGroupMember.task_group_id.in_(grp_tg_ids)
+                        ).delete(synchronize_session=False)
+                        db.query(TaskGroup).filter(TaskGroup.id.in_(grp_tg_ids)).delete(synchronize_session=False)
+                    db.query(TaskAssignee).filter(TaskAssignee.task_id.in_(grp_task_ids)).delete(synchronize_session=False)
+                    db.query(Task).filter(Task.id.in_(grp_task_ids)).delete(synchronize_session=False)
                 db.query(GroupMember).filter(
                     GroupMember.group_id.in_(owned_group_ids)
                 ).delete(synchronize_session=False)
+                db.flush()
                 db.query(Group).filter(Group.id.in_(owned_group_ids)).delete(
                     synchronize_session=False
                 )
 
-            # ── 11c. Reactions/stars on messages that are about to be deleted ──
-            # Not just this user's own reactions/stars — ANYONE's reaction/star
-            # on a message this user sent or received also FK-references that
-            # message, so it has to go before the Message delete in step 9 runs
-            # (which already happened above — these two tables were added after
-            # delete_user was last touched, so they were never wired in, and a
-            # user with any reacted-to/starred message failed this whole delete
-            # with an FK violation, which rolled back the entire transaction —
-            # the actual cause of "admin can't delete this user" and "the old
-            # phone number still shows as taken" being the same bug).
-            db.query(MessageReaction).filter(
-                or_(MessageReaction.user_id == user_id,
-                    MessageReaction.message_id.in_(msg_ids) if msg_ids else False)
-            ).delete(synchronize_session=False)
-            db.query(StarredMessage).filter(
-                or_(StarredMessage.user_id == user_id,
-                    StarredMessage.message_id.in_(msg_ids) if msg_ids else False)
-            ).delete(synchronize_session=False)
+            # ── 11c. This user's own reactions/stars on OTHER people's messages
+            # (reactions/stars ON the user's own messages were cleared with
+            # those messages in step 9 via _purge_messages).
+            db.query(MessageReaction).filter(MessageReaction.user_id == user_id).delete(synchronize_session=False)
+            db.query(StarredMessage).filter(StarredMessage.user_id == user_id).delete(synchronize_session=False)
 
             # ── 11d. Org features (calendar/tasks/breakout) — also never wired
             # into this function before now ────────────────────────────────────
