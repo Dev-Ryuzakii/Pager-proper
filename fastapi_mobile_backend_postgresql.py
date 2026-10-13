@@ -4011,9 +4011,13 @@ class AdminService:
         return user
     
     @staticmethod
-    def delete_user(db: Session, admin_user_id: int, phone_number: str) -> bool:
-        """Delete a user account and ALL associated data (admin only)."""
-        if not AdminService.is_admin(db, admin_user_id):
+    def delete_user(db: Session, admin_user_id: int, phone_number: str, skip_admin_check: bool = False) -> bool:
+        """Delete a user account and ALL associated data. Admin only, unless the
+        caller already authorized the delete another way (skip_admin_check) —
+        e.g. an organization account approving a deletion request for one of its
+        own staff. admin_user_id is still used for attribution and the
+        can't-delete-yourself guard."""
+        if not skip_admin_check and not AdminService.is_admin(db, admin_user_id):
             raise HTTPException(status_code=403, detail="Only admin users can delete accounts")
 
         user = db.query(User).filter(User.phone_number == phone_number).first()
@@ -5325,7 +5329,7 @@ async def get_organization_viewer(
 # Groups are self-run (GroupMember.role == "admin"). This is the separate,
 # organization-wide layer: the organization account delegates company-wide
 # powers to chosen staff. The organization account itself holds all of them.
-ORG_PRIVILEGES = {"broadcast", "assign_tasks", "call_control", "manage_staff", "manage_groups"}
+ORG_PRIVILEGES = {"broadcast", "assign_tasks", "call_control", "manage_staff", "manage_groups", "approve_deletions"}
 
 
 def _is_org_account(user) -> bool:
@@ -6490,6 +6494,101 @@ async def list_organization_broadcasts(
             "created_at": _iso(r.created_at),
         })
     return {"broadcasts": out, "count": len(out)}
+
+
+# ─── Org-scoped account-deletion approvals ──────────────────────────────────
+# The organization account (or a staff member granted "approve_deletions") can
+# review and approve/deny deletion requests for its OWN staff, so an org can
+# offboard people without waiting on a Dilarion platform admin. Scope is always
+# the caller's organization, never admins or the org account itself.
+
+def _org_deletion_target(db: Session, current_user: User, request_id: int):
+    org_id = _require_org_context(current_user)
+    if not _has_org_privilege(current_user, "approve_deletions"):
+        raise HTTPException(status_code=403, detail="You do not have the approve-deletions privilege")
+    req = db.query(AccountDeletionRequest).filter(AccountDeletionRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Request already {req.status}")
+    target = db.query(User).filter(User.id == req.user_id).first()
+    if not target or target.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="That request is not for a member of your organization")
+    if getattr(target, "is_admin", False) or getattr(target, "organization_role", None) == "viewer":
+        raise HTTPException(status_code=403, detail="You cannot delete this account")
+    return req, target
+
+
+@app.get("/organization/account-deletion-requests")
+async def org_list_account_deletion_requests(
+    status: Optional[str] = Query(None, description="pending/approved/denied — omit for all"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Deletion requests from the caller's own staff."""
+    org_id = _require_org_context(current_user)
+    if not _has_org_privilege(current_user, "approve_deletions"):
+        raise HTTPException(status_code=403, detail="You do not have the approve-deletions privilege")
+    member_ids = {u.id for u in db.query(User.id).filter(User.organization_id == org_id).all()}
+    q = db.query(AccountDeletionRequest).filter(AccountDeletionRequest.user_id.in_(member_ids) if member_ids else False)
+    if status:
+        q = q.filter(AccountDeletionRequest.status == status)
+    rows = q.order_by(AccountDeletionRequest.requested_at.desc()).all()
+    out = []
+    for r in rows:
+        requester = db.query(User).filter(User.id == r.user_id).first()
+        processor = db.query(User).filter(User.id == r.processed_by_id).first() if r.processed_by_id else None
+        out.append({
+            "id": r.id,
+            "username": str(getattr(requester, 'username', '')) if requester else "unknown",
+            "full_name": getattr(requester, 'full_name', None) if requester else None,
+            "reason": r.reason,
+            "status": r.status,
+            "requested_at": _iso(r.requested_at),
+            "processed_by": str(getattr(processor, 'username', '')) if processor else None,
+            "processed_at": _iso(r.processed_at),
+        })
+    return {"requests": out, "count": len(out)}
+
+
+@app.post("/organization/account-deletion-requests/{request_id}/approve")
+async def org_approve_account_deletion(
+    request_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Approve (and delete) one of the organization's own staff accounts."""
+    req, target = _org_deletion_target(db, current_user, request_id)
+    actor_id = int(getattr(current_user, 'id', 0))
+    setattr(req, 'status', 'approved')
+    setattr(req, 'processed_by_id', actor_id)
+    setattr(req, 'processed_at', datetime.now(timezone.utc))
+    db.commit()
+    AuditService.log_event(db, actor_id, "org_account_deletion_approved",
+                           f"Org approved deletion of {target.username} (request {request_id})")
+    AdminService.delete_user(db, actor_id, str(target.phone_number), skip_admin_check=True)
+    return {"status": "approved", "deleted": True}
+
+
+@app.post("/organization/account-deletion-requests/{request_id}/deny")
+async def org_deny_account_deletion(
+    request_id: int,
+    payload: AccountDeletionDecision,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Deny one of the organization's own staff deletion requests."""
+    req, target = _org_deletion_target(db, current_user, request_id)
+    actor_id = int(getattr(current_user, 'id', 0))
+    setattr(req, 'status', 'denied')
+    setattr(req, 'processed_by_id', actor_id)
+    setattr(req, 'processed_at', datetime.now(timezone.utc))
+    db.commit()
+    await ws_manager.send_to_user(req.user_id, {
+        "type": "account_deletion_denied",
+        "data": {"request_id": req.id, "reason": payload.reason},
+    })
+    return {"status": "denied"}
 
 
 @app.get("/admin/organizations")
