@@ -4292,6 +4292,25 @@ class AdminService:
                 db.query(ConferenceSession).filter(
                     ConferenceSession.parent_conference_id.in_(owned_conference_ids)
                 ).update({"parent_conference_id": None}, synchronize_session=False)
+                # A conference this user created can hold OTHER users' participant
+                # rows and recordings; step at 4279 only removed THIS user's seat,
+                # so those remaining children (conference_participants,
+                # meeting_recordings → conference_id) block the conference delete.
+                db.query(ConferenceParticipant).filter(
+                    ConferenceParticipant.conference_id.in_(owned_conference_ids)
+                ).delete(synchronize_session=False)
+                owned_conf_recs = db.query(MeetingRecording).filter(
+                    MeetingRecording.conference_id.in_(owned_conference_ids)
+                ).all()
+                for rec in owned_conf_recs:
+                    fp = getattr(rec, 'file_path', None)
+                    if fp and os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except Exception as e:
+                            logger.warning(f"Could not delete meeting recording {fp}: {e}")
+                    db.delete(rec)
+                db.flush()
             db.query(ConferenceSession).filter(
                 ConferenceSession.created_by_user_id == user_id
             ).delete()
