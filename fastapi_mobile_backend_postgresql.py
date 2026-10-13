@@ -12380,6 +12380,22 @@ async def confirm_mastertoken(token_data: MasterToken,
         raise HTTPException(status_code=500, detail="Failed to confirm master token")
 
 
+@app.get("/mastertoken/status")
+async def mastertoken_status(current_user: User = Depends(get_current_user), db: Session = Depends(get_database_session)):
+    """Whether this account has an active master token (and 2FA on it). Used by
+    the first-run setup wizard to auto-skip steps already completed."""
+    user_id = int(getattr(current_user, 'id', 0))
+    exists = db.query(DBMasterToken.id).filter(
+        DBMasterToken.user_id == user_id,
+        DBMasterToken.is_active == True,
+    ).first() is not None
+    user_row = db.query(User).filter(User.id == user_id).first()
+    return {
+        "exists": exists,
+        "twofa_enabled": bool(getattr(user_row, 'mastertoken_2fa_enabled', False)),
+    }
+
+
 @app.get("/mastertoken/2fa/status")
 async def mastertoken_2fa_status(current_user: User = Depends(get_current_user), db: Session = Depends(get_database_session)):
     user_id = int(getattr(current_user, 'id', 0))
