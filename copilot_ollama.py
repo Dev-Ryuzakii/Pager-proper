@@ -243,25 +243,75 @@ async def translate_text(text: str, target_language: str) -> Optional[str]:
     return result.strip() if result else None
 
 
-_COMPILE_TASK_REPORTS_PROMPT = """You compile several sub-team reports on the same task into one combined report for the task owner. Each sub-team's report is labeled with their team name. Produce a single coherent report that:
-- Summarizes what each team covered, without just concatenating them verbatim
+_COMPILE_TASK_REPORTS_PROMPT = """You compile several sub-team reports on the same task into one combined report for the task owner. Each sub-team's report is labeled with their team name in square brackets. Produce a single coherent report that:
+- Summarizes what the teams covered, organized by topic, without just concatenating them verbatim
 - Calls out overlaps, contradictions, or gaps between teams' findings if any exist
 - Ends with a short overall summary
 
-Respond with ONLY the compiled report — no preamble, no meta-commentary about this instruction."""
+For every section, list which team(s) the content came from, using the team names EXACTLY as labeled.
+
+Respond with ONLY a JSON object, no other text, no markdown fences, matching exactly this shape:
+{"sections": [{"heading": string, "body": string, "sources": [team name, ...]}], "overall_summary": string}"""
 
 
-async def compile_task_reports(reports: List[Dict[str, str]]) -> Optional[str]:
+def _match_team(name: Any, team_names: List[str]) -> Optional[str]:
+    """Maps a team name the model echoed back onto one we actually sent —
+    case/bracket/whitespace-insensitive. Anything else is dropped rather
+    than shown as a source, so the tree never names a team that doesn't exist."""
+    key = str(name or "").strip().strip("[]").strip().lower()
+    for t in team_names:
+        if t.strip().lower() == key:
+            return t
+    return None
+
+
+async def compile_task_reports(reports: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
     """
     Compiles breakout sub-team reports for a task into one combined report.
     `reports` is a list of {"team_name": ..., "report_text": ...} the caller
     has already gathered server-side (task reports aren't E2E encrypted,
-    unlike chat, so this can read them directly). Returns None on failure.
+    unlike chat, so this can read them directly).
+
+    Returns {"text": str, "sections": [{"heading", "body", "sources"}]}, or
+    None on failure. `sources` are team names drawn only from `reports`;
+    if the model doesn't return usable JSON, falls back to its raw text with
+    no sections (the caller can still show the team/staff tree, just without
+    per-section attribution).
     """
     usable = [r for r in reports if r.get("report_text", "").strip()]
     if not usable:
         return None
-    parts = [f"[{r.get('team_name') or 'Team'}]\n{r['report_text'].strip()}" for r in usable]
+    team_names = [r.get("team_name") or "Team" for r in usable]
+    parts = [f"[{name}]\n{r['report_text'].strip()}" for name, r in zip(team_names, usable)]
     combined = "\n\n".join(parts)[:_MAX_INPUT_CHARS]
-    result = await _ollama_generate(_COMPILE_TASK_REPORTS_PROMPT, combined)
-    return result.strip() if result else None
+    raw = await _ollama_generate(_COMPILE_TASK_REPORTS_PROMPT, combined, json_mode=True, timeout=120.0)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning(f"[copilot] compile_task_reports got non-JSON response: {raw[:200]!r}")
+        return {"text": raw.strip(), "sections": []} if raw.strip() else None
+    if not isinstance(parsed, dict):
+        return None
+
+    sections: List[Dict[str, Any]] = []
+    for sec in parsed.get("sections") or []:
+        if not isinstance(sec, dict):
+            continue
+        body = str(sec.get("body") or "").strip()
+        if not body:
+            continue
+        sources: List[str] = []
+        for src in sec.get("sources") or []:
+            t = _match_team(src, team_names)
+            if t and t not in sources:
+                sources.append(t)
+        sections.append({"heading": str(sec.get("heading") or "").strip() or "Section", "body": body, "sources": sources})
+    summary = str(parsed.get("overall_summary") or "").strip()
+    if summary:
+        sections.append({"heading": "Overall summary", "body": summary, "sources": list(team_names)})
+    if not sections:
+        return None
+    text = "\n\n".join(f"{s['heading']}\n{s['body']}" for s in sections)
+    return {"text": text, "sections": sections}

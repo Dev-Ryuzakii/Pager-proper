@@ -1,3 +1,5 @@
 pycryptodome>=3.15.0
 opencv-python-headless>=4.8.0,<5
 numpy>=1.24.0
+# Breakout task report export (.docx with report tree)
+python-docx>=1.1.0

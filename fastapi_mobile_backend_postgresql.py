@@ -9485,6 +9485,7 @@ def _task_dict(db: Session, task: Task) -> Dict[str, Any]:
             "report_submitted_by": str(getattr(submitter, 'username', '')) if submitter else None,
             "report_submitted_at": g.report_submitted_at.isoformat() if g.report_submitted_at else None,
         })
+    sections = _task_compiled_sections(task)
     return {
         "task_id": task.id,
         "title": task.title,
@@ -9499,8 +9500,48 @@ def _task_dict(db: Session, task: Task) -> Dict[str, Any]:
         "breakout_groups": group_out,
         "compiled_report": task.compiled_report,
         "compiled_report_at": task.compiled_report_at.isoformat() if task.compiled_report_at else None,
+        "compiled_sections": sections,
+        "report_tree": _task_report_tree(group_out, sections) if task.is_breakout else [],
         "recurrence": task.recurrence,
     }
+
+
+def _task_compiled_sections(task: Task) -> List[Dict[str, Any]]:
+    """tasks.compiled_sections decoded — [] for tasks compiled before the
+    column existed (or never compiled), never raises on a bad row."""
+    if not task.compiled_sections:
+        return []
+    try:
+        data = json.loads(task.compiled_sections)
+    except (ValueError, TypeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _task_report_tree(group_out: List[Dict[str, Any]], sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The breakout report "tree": each team -> its staff -> the compiled
+    report sections its report fed into. Built from group_out (already
+    serialized by _task_dict) so the apps and the .docx export agree."""
+    tree = []
+    for g in group_out:
+        team_name = g["name"] or f"Group {g['group_id']}"
+        tree.append({
+            "group_id": g["group_id"],
+            "team_name": team_name,
+            "staff": [
+                {"username": u, "is_submitter": u == g["report_submitted_by"]}
+                for u in g["member_usernames"]
+            ],
+            "has_report": bool(g["report_text"]),
+            "report_submitted_by": g["report_submitted_by"],
+            "report_submitted_at": g["report_submitted_at"],
+            "sections": [
+                {"index": i, "heading": sec.get("heading") or "Section"}
+                for i, sec in enumerate(sections)
+                if team_name in (sec.get("sources") or [])
+            ],
+        })
+    return tree
 
 
 def _advance_by_recurrence(dt: datetime, recurrence: str) -> datetime:
@@ -9809,10 +9850,149 @@ async def compile_task(
     if not compiled:
         raise HTTPException(status_code=422, detail="No submitted reports to compile yet, or the AI service is unavailable")
 
-    setattr(task, 'compiled_report', compiled)
+    setattr(task, 'compiled_report', compiled["text"])
+    setattr(task, 'compiled_sections', json.dumps(compiled["sections"]))
     setattr(task, 'compiled_report_at', datetime.now(timezone.utc))
     db.commit()
     return _task_dict(db, task)
+
+
+def _can_view_task(db: Session, task: Task, current_user: User) -> bool:
+    """Same visibility as GET /tasks: creator, admin, assignee, breakout
+    team member, or member of the task's group."""
+    user_id = int(getattr(current_user, 'id', 0))
+    if getattr(current_user, 'is_admin', False) or task.created_by_id == user_id:
+        return True
+    if db.query(TaskAssignee).filter(TaskAssignee.task_id == task.id, TaskAssignee.user_id == user_id).first():
+        return True
+    if db.query(TaskGroupMember).join(TaskGroup, TaskGroup.id == TaskGroupMember.task_group_id).filter(
+        TaskGroup.task_id == task.id, TaskGroupMember.user_id == user_id
+    ).first():
+        return True
+    if task.group_id and db.query(GroupMember).filter(
+        GroupMember.group_id == task.group_id, GroupMember.user_id == user_id
+    ).first():
+        return True
+    return False
+
+
+@app.get("/tasks/{task_id}/report.docx")
+async def export_task_report_docx(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """The AI-compiled breakout report as a Word document: the compiled
+    report (each section labeled with the team(s) it came from), then a
+    "Report Tree" page — team -> staff -> sections they fed — then each
+    team's original report as an appendix."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not _can_view_task(db, task, current_user):
+        raise HTTPException(status_code=403, detail="You don't have access to this task")
+    if not task.is_breakout:
+        raise HTTPException(status_code=400, detail="Only breakout tasks have a compiled report")
+    if not task.compiled_report:
+        raise HTTPException(status_code=400, detail="Compile the report first")
+
+    data = _task_dict(db, task)
+    buf = io.BytesIO()
+    _build_task_report_docx(data).save(buf)
+    safe_title = re.sub(r'[^A-Za-z0-9._-]+', '_', task.title or 'report').strip('_')[:60] or 'report'
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}_report.docx"'},
+    )
+
+
+def _build_task_report_docx(data: Dict[str, Any]):
+    from docx import Document
+    from docx.enum.text import WD_BREAK
+    from docx.shared import Pt, RGBColor
+
+    muted = RGBColor(0x60, 0x60, 0x60)
+    accent = RGBColor(0x7C, 0x3A, 0xED)
+    doc = Document()
+    doc.styles['Normal'].font.name = 'Calibri'
+    doc.styles['Normal'].font.size = Pt(11)
+
+    def meta(text: str):
+        p = doc.add_paragraph()
+        r = p.add_run(text)
+        r.italic = True
+        r.font.size = Pt(9)
+        r.font.color.rgb = muted
+        return p
+
+    doc.add_heading(data["title"], level=0)
+    compiled_at = (data.get("compiled_report_at") or "")[:16].replace("T", " ")
+    meta(f"Breakout task report · created by {data['created_by']}" + (f" · compiled {compiled_at} UTC" if compiled_at else ""))
+    if data.get("description"):
+        doc.add_paragraph(data["description"])
+
+    # ── Compiled report ──
+    sections = data.get("compiled_sections") or []
+    doc.add_heading("Compiled report", level=1)
+    if sections:
+        for sec in sections:
+            doc.add_heading(sec.get("heading") or "Section", level=2)
+            p = doc.add_paragraph()
+            r = p.add_run("From: " + (", ".join(sec.get("sources") or []) or "unattributed"))
+            r.bold = True
+            r.font.size = Pt(9)
+            r.font.color.rgb = accent
+            for para in str(sec.get("body") or "").split("\n"):
+                if para.strip():
+                    doc.add_paragraph(para.strip())
+    else:
+        for para in (data.get("compiled_report") or "").split("\n"):
+            if para.strip():
+                doc.add_paragraph(para.strip())
+
+    # ── Report tree ──
+    doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+    doc.add_heading("Report Tree", level=1)
+    meta("Which part of the compiled report came from which breakout team, and who was on each team. "
+         "★ marks the staff member who submitted the team's report.")
+    root = doc.add_paragraph()
+    root.add_run(data["title"]).bold = True
+    for team in data.get("report_tree") or []:
+        tp = doc.add_paragraph(style='List Bullet')
+        tp.add_run(team["team_name"]).bold = True
+        if not team["has_report"]:
+            r = tp.add_run("  (no report submitted)")
+            r.italic = True
+            r.font.color.rgb = muted
+        sp = doc.add_paragraph(style='List Bullet 2')
+        sp.add_run("Staff: ").bold = True
+        sp.add_run(", ".join(
+            ("★ " if s["is_submitter"] else "") + s["username"] for s in team["staff"]
+        ) or "—")
+        cp = doc.add_paragraph(style='List Bullet 2')
+        cp.add_run("Contributed to: ").bold = True
+        if team["sections"]:
+            cp.add_run("; ".join(f"§{s['index'] + 1} {s['heading']}" for s in team["sections"]))
+        elif sections:
+            cp.add_run("no section attributed").italic = True
+        else:
+            cp.add_run("recompile to see section attribution").italic = True
+
+    # ── Source reports ──
+    doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+    doc.add_heading("Appendix: original team reports", level=1)
+    for g in data.get("breakout_groups") or []:
+        doc.add_heading(g["name"] or f"Group {g['group_id']}", level=2)
+        if g.get("report_text"):
+            when = (g.get("report_submitted_at") or "")[:16].replace("T", " ")
+            meta(f"Submitted by {g.get('report_submitted_by') or '—'}" + (f" · {when} UTC" if when else ""))
+            for para in g["report_text"].split("\n"):
+                if para.strip():
+                    doc.add_paragraph(para.strip())
+        else:
+            meta("No report submitted.")
+    return doc
 
 
 @app.get("/meetings/calendar")

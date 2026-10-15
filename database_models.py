@@ -1204,6 +1204,10 @@ class Task(Base):
     is_breakout = Column(Boolean, default=False)
     compiled_report = Column(Text, nullable=True)  # AI-compiled summary across all TaskGroup reports
     compiled_report_at = Column(DateTime, nullable=True)
+    # JSON list of {"heading", "body", "sources": [team names]} — which
+    # breakout team(s) each part of compiled_report came from. Drives the
+    # report "tree" (section ← team ← staff) in the apps and the .docx export.
+    compiled_sections = Column(Text, nullable=True)
     created_at = Column(DateTime, default=func.now())
     # null/"daily"/"weekly"/"monthly" — same vocabulary as Meeting.recurrence.
     # On completion, a recurring task spawns its next occurrence (fresh row,
