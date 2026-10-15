@@ -154,6 +154,47 @@ async def parse_schedule_text(text: str, current_time_iso: str) -> Optional[Dict
     }
 
 
+_CHAT_SYSTEM_PROMPT = """You are Dilarion Copilot, a friendly in-app assistant for a secure team messaging and meeting app.
+
+Decide what the user wants and respond with ONLY a JSON object, no markdown fences, matching exactly:
+{"intent": "schedule" or "general", "reply": string}
+
+Rules:
+- Set intent to "schedule" ONLY when the user is clearly asking to set up / book / arrange a meeting or call at some time (e.g. "meet the team tomorrow at 3", "schedule a call Friday"). For "schedule", "reply" may be a short confirmation like "Sure — drafting that meeting." (the app fills in the details separately).
+- For ANYTHING else — greetings ("hi", "hello"), questions, chit-chat, help requests, "what can you do" — set intent to "general" and put a genuine, helpful, concise answer in "reply". Answer the user normally. Do NOT turn a normal message into a meeting.
+- Keep "reply" short (1-4 sentences) and plain-text, no markdown.
+"""
+
+
+async def chat_assistant(text: str, current_time_iso: str) -> Optional[Dict[str, Any]]:
+    """
+    General copilot chat. Classifies the message: a real scheduling request
+    returns {"intent": "schedule", "reply": str}; anything else (greetings,
+    questions, chit-chat) returns {"intent": "general", "reply": str} with a
+    normal helpful answer. Returns None only when Ollama is unreachable, so
+    the caller can show a clear "assistant unavailable" message. The caller
+    runs parse_schedule_text itself when intent is "schedule"."""
+    trimmed = (text or "").strip()[:_MAX_INPUT_CHARS]
+    if not trimmed:
+        return {"intent": "general", "reply": "Hi! Ask me anything, or tell me about a meeting and I'll draft it."}
+    prompt = f"Current date and time: {current_time_iso}\n\nUser message: {trimmed}"
+    raw = await _ollama_generate(_CHAT_SYSTEM_PROMPT, prompt, json_mode=True)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Model ignored JSON mode — treat whatever it said as a general reply.
+        return {"intent": "general", "reply": raw.strip()[:1200] or "I'm not sure how to help with that."}
+    if not isinstance(parsed, dict):
+        return {"intent": "general", "reply": "I'm not sure how to help with that."}
+    intent = parsed.get("intent") if parsed.get("intent") in ("schedule", "general") else "general"
+    reply = str(parsed.get("reply") or "").strip()[:1200]
+    if not reply:
+        reply = "Sure — drafting that meeting." if intent == "schedule" else "I'm here to help. What do you need?"
+    return {"intent": intent, "reply": reply}
+
+
 _SUMMARIZE_PROMPT = """You summarize a chat conversation. You will be given the decrypted text of a thread, in chronological order, one message per line.
 
 Write a short summary: 3-6 sentences, or a short bullet list if there are distinct topics. Call out any decisions made or action items mentioned. Do not invent anything not in the text. Respond with ONLY the summary — no preamble like "Here is a summary", no markdown headers."""

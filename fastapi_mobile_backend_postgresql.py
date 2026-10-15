@@ -76,6 +76,7 @@ from decoy_web_media import fetch_web_decoy_image
 from push_notifications import push_to_user
 from copilot_ollama import (
     parse_schedule_text,
+    chat_assistant,
     summarize_thread,
     compose_reply,
     answer_document_question,
@@ -1105,6 +1106,10 @@ class TaskCreate(BaseModel):
 
 class TaskStatusUpdate(BaseModel):
     status: str = Field(..., description="open/in_progress/completed/cancelled")
+
+class TaskAssigneesAdd(BaseModel):
+    usernames: List[str] = Field(..., min_length=1, description="Usernames to add to an existing task")
+    group_name: Optional[str] = Field(None, description="For a breakout task: which sub-team to add them to (defaults to the first)")
 
 class TaskGroupReportSubmit(BaseModel):
     report_text: str = Field(..., min_length=1, max_length=20000)
@@ -8520,6 +8525,34 @@ async def copilot_parse_schedule(
     return result
 
 
+@app.post("/copilot/chat")
+async def copilot_chat(
+    payload: CopilotScheduleRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    General copilot chat. Answers normal messages ("hi", questions, help)
+    normally, and only when the user is actually asking to schedule a meeting
+    does it hand back a prefilled schedule draft — so the copilot box is a real
+    assistant, not a meeting-only form. Returns one of:
+      {"kind": "reply",    "text": str}
+      {"kind": "schedule", "text": str, "schedule": {title, scheduled_at, ...}}
+    Never reads message content; `text` is whatever the user typed in the box.
+    """
+    decision = await chat_assistant(payload.text, payload.current_time)
+    if decision is None:
+        monitor_record_event("copilot", "chat", status="error", detail="Ollama returned no result", user_id=current_user.id)
+        raise HTTPException(status_code=502, detail="Copilot is unavailable right now — please try again")
+    if decision.get("intent") == "schedule":
+        sched = await parse_schedule_text(payload.text, payload.current_time)
+        if sched is not None:
+            monitor_record_event("copilot", "chat", user_id=current_user.id)
+            return {"kind": "schedule", "text": decision.get("reply") or "Here's a draft.", "schedule": sched}
+        # Classified as scheduling but couldn't extract a time — fall back to a reply.
+    monitor_record_event("copilot", "chat", user_id=current_user.id)
+    return {"kind": "reply", "text": decision.get("reply") or "I'm here to help."}
+
+
 @app.post("/copilot/summarize")
 async def copilot_summarize(
     payload: CopilotSummarizeRequest,
@@ -9645,6 +9678,18 @@ async def create_task(
     db.refresh(task)
 
     notify_user_ids: List[int] = []
+    # Usernames the caller asked to assign but we couldn't, with a reason. The
+    # client surfaces these so an assignment that quietly dropped someone (user
+    # not found, not in the group, outside the org) is visible instead of the
+    # assignee simply "never getting the task".
+    skipped: List[Dict[str, str]] = []
+
+    if self_only and (payload.assignee_usernames or payload.breakout_groups):
+        # A non-privileged creator listed other people but may only assign to
+        # themselves — tell them why instead of silently self-assigning.
+        for uname in payload.assignee_usernames or []:
+            if uname and uname != str(getattr(current_user, 'username', '')):
+                skipped.append({"username": uname, "reason": "You don't have permission to assign tasks to others"})
 
     if payload.is_breakout and payload.breakout_groups and not self_only:
         for grp in payload.breakout_groups:
@@ -9655,8 +9700,10 @@ async def create_task(
             for uname in grp.get("usernames", []):
                 u = db.query(User).filter(User.username == uname, User.is_active == True).first()
                 if not u:
+                    skipped.append({"username": uname, "reason": "No active user with that username"})
                     continue
                 if group_member_ids is not None and u.id not in group_member_ids:
+                    skipped.append({"username": uname, "reason": "Not a member of this group"})
                     continue
                 db.add(TaskGroupMember(task_group_id=tg.id, user_id=u.id))
                 notify_user_ids.append(u.id)
@@ -9668,12 +9715,15 @@ async def create_task(
         for uname in target_usernames:
             u = db.query(User).filter(User.username == uname, User.is_active == True).first()
             if not u:
+                skipped.append({"username": uname, "reason": "No active user with that username"})
                 continue
             if group_member_ids is not None and u.id not in group_member_ids:
+                skipped.append({"username": uname, "reason": "Not a member of this group"})
                 continue
             # An org assigner (not a site admin) is confined to its own org.
             if can_assign_org and not is_site_admin and not self_only:
                 if getattr(u, "organization_id", None) != actor_org_id:
+                    skipped.append({"username": uname, "reason": "Not in your organization"})
                     continue
             db.add(TaskAssignee(task_id=task.id, user_id=u.id))
             notify_user_ids.append(u.id)
@@ -9690,7 +9740,104 @@ async def create_task(
 
     AuditService.log_event(db, user_id, "task_created", f"Task '{task.title}' (ID {task.id}) created")
     background_tasks.add_task(_sync_task_to_google, int(task.id))
-    return _task_dict(db, task)
+    result = _task_dict(db, task)
+    result["skipped_assignees"] = skipped
+    return result
+
+
+@app.post("/tasks/{task_id}/assignees")
+async def add_task_assignees(
+    task_id: int,
+    payload: TaskAssigneesAdd,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Add more people to an existing task. Same rights as creating one:
+    site admin, the task creator, a group admin of the task's group, or an
+    org account/staff with 'assign_tasks' (confined to its own org). For a
+    breakout task they join a sub-team; otherwise they become direct
+    assignees. Returns the updated task plus any usernames that were skipped."""
+    user_id = int(getattr(current_user, 'id', 0))
+    is_site_admin = bool(getattr(current_user, 'is_admin', False))
+    can_assign_org = _has_org_privilege(current_user, "assign_tasks")
+    actor_org_id = getattr(current_user, "organization_id", None)
+
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    is_creator = task.created_by_id == user_id
+    is_grp_admin = bool(task.group_id) and _is_group_admin(db, task.group_id, user_id)
+    if not (is_site_admin or is_creator or is_grp_admin or can_assign_org):
+        raise HTTPException(status_code=403, detail="Only the task creator or an admin can add people to a task")
+
+    group_member_ids = None
+    if task.group_id:
+        group_member_ids = {
+            m.user_id for m in db.query(GroupMember).filter(GroupMember.group_id == task.group_id).all()
+        }
+
+    notify_user_ids: List[int] = []
+    skipped: List[Dict[str, str]] = []
+
+    target_group = None
+    if task.is_breakout:
+        groups = db.query(TaskGroup).filter(TaskGroup.task_id == task.id).all()
+        if payload.group_name:
+            target_group = next((g for g in groups if (g.name or "") == payload.group_name), None)
+        if target_group is None:
+            target_group = groups[0] if groups else None
+        if target_group is None:
+            # A breakout task with no sub-teams yet — make one so people land somewhere.
+            target_group = TaskGroup(task_id=task.id, name=payload.group_name or "Team A")
+            db.add(target_group)
+            db.commit()
+            db.refresh(target_group)
+
+    for uname in payload.usernames:
+        u = db.query(User).filter(User.username == uname, User.is_active == True).first()
+        if not u:
+            skipped.append({"username": uname, "reason": "No active user with that username"})
+            continue
+        if group_member_ids is not None and u.id not in group_member_ids:
+            skipped.append({"username": uname, "reason": "Not a member of this group"})
+            continue
+        if can_assign_org and not is_site_admin and not is_creator and not is_grp_admin:
+            if getattr(u, "organization_id", None) != actor_org_id:
+                skipped.append({"username": uname, "reason": "Not in your organization"})
+                continue
+        if task.is_breakout:
+            exists = db.query(TaskGroupMember).filter(
+                TaskGroupMember.task_group_id == target_group.id, TaskGroupMember.user_id == u.id
+            ).first()
+            if exists:
+                continue
+            db.add(TaskGroupMember(task_group_id=target_group.id, user_id=u.id))
+        else:
+            exists = db.query(TaskAssignee).filter(
+                TaskAssignee.task_id == task.id, TaskAssignee.user_id == u.id
+            ).first()
+            if exists:
+                continue
+            db.add(TaskAssignee(task_id=task.id, user_id=u.id))
+        notify_user_ids.append(u.id)
+    db.commit()
+
+    creator_username = str(getattr(current_user, 'username', ''))
+    for uid in set(notify_user_ids):
+        sent = await ws_manager.send_to_user(uid, {
+            "type": "task_assigned",
+            "data": {"task_id": task.id, "title": task.title, "assigned_by": creator_username},
+        })
+        if not sent:
+            await push_to_user(db, uid, "New task", f"{creator_username} assigned you: {task.title}")
+
+    AuditService.log_event(db, user_id, "task_assignees_added",
+                           f"Added {len(notify_user_ids)} to task '{task.title}' (ID {task.id})")
+    db.refresh(task)
+    result = _task_dict(db, task)
+    result["skipped_assignees"] = skipped
+    return result
 
 
 @app.get("/tasks")
