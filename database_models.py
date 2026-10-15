@@ -1263,6 +1263,12 @@ class TaskGroupMember(Base):
     id = Column(Integer, primary_key=True, index=True)
     task_group_id = Column(Integer, ForeignKey("task_groups.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    # Each staff member on a breakout team now submits their OWN report; the
+    # team's report is the collection of these, and the AI compiler cites each
+    # staffer's contribution. (TaskGroup.report_text stays for legacy tasks
+    # that submitted one shared team report before this change.)
+    report_text = Column(Text, nullable=True)
+    report_submitted_at = Column(DateTime, nullable=True)
 
     task_group = relationship("TaskGroup", back_populates="members")
     user = relationship("User", foreign_keys=[user_id])

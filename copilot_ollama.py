@@ -284,47 +284,72 @@ async def translate_text(text: str, target_language: str) -> Optional[str]:
     return result.strip() if result else None
 
 
-_COMPILE_TASK_REPORTS_PROMPT = """You compile several sub-team reports on the same task into one combined report for the task owner. Each sub-team's report is labeled with their team name in square brackets. Produce a single coherent report that:
-- Summarizes what the teams covered, organized by topic, without just concatenating them verbatim
-- Calls out overlaps, contradictions, or gaps between teams' findings if any exist
+_COMPILE_TASK_REPORTS_PROMPT = """You compile the individual reports that staff members submitted for one task into a single, meaningful combined report for the task owner.
+
+The input lists each team, and under each team each staff member's own report, labeled like:
+=== Team: <team name> ===
+<@username> <their report text>
+
+Produce a coherent report organized by topic (NOT one section per person, and NOT verbatim concatenation) that:
+- Synthesizes what was actually accomplished and found, weaving contributions together by theme
+- Credits specific people where a point comes from their report — like citations — so the owner can see who contributed what
+- Calls out overlaps, agreements, contradictions, or gaps between people/teams where they exist
 - Ends with a short overall summary
 
-For every section, list which team(s) the content came from, using the team names EXACTLY as labeled.
+For every section, list in "sources" the EXACT @usernames whose reports that section draws from (just the usernames, with or without the @). Only use usernames that appear in the input.
 
 Respond with ONLY a JSON object, no other text, no markdown fences, matching exactly this shape:
-{"sections": [{"heading": string, "body": string, "sources": [team name, ...]}], "overall_summary": string}"""
+{"sections": [{"heading": string, "body": string, "sources": [username, ...]}], "overall_summary": string}"""
 
 
-def _match_team(name: Any, team_names: List[str]) -> Optional[str]:
-    """Maps a team name the model echoed back onto one we actually sent —
-    case/bracket/whitespace-insensitive. Anything else is dropped rather
-    than shown as a source, so the tree never names a team that doesn't exist."""
-    key = str(name or "").strip().strip("[]").strip().lower()
-    for t in team_names:
+def _match_name(name: Any, known: List[str]) -> Optional[str]:
+    """Maps a name the model echoed back (a @username, or a team name for
+    legacy tasks) onto one we actually sent — case/@/bracket/whitespace-
+    insensitive. Anything else is dropped so the tree never cites someone who
+    wasn't an input."""
+    key = str(name or "").strip().lstrip("@").strip().strip("[]").strip().lower()
+    for t in known:
         if t.strip().lower() == key:
             return t
     return None
 
 
-async def compile_task_reports(reports: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+async def compile_task_reports(teams: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
-    Compiles breakout sub-team reports for a task into one combined report.
-    `reports` is a list of {"team_name": ..., "report_text": ...} the caller
-    has already gathered server-side (task reports aren't E2E encrypted,
-    unlike chat, so this can read them directly).
+    Compiles the per-staff breakout reports of a task into one combined report
+    with per-person citations.
 
-    Returns {"text": str, "sections": [{"heading", "body", "sources"}]}, or
-    None on failure. `sources` are team names drawn only from `reports`;
-    if the model doesn't return usable JSON, falls back to its raw text with
-    no sections (the caller can still show the team/staff tree, just without
-    per-section attribution).
-    """
-    usable = [r for r in reports if r.get("report_text", "").strip()]
-    if not usable:
+    `teams` is a list of:
+        {"team_name": str, "contributions": [{"author": username, "text": str}, ...]}
+    gathered server-side (task reports aren't E2E encrypted, unlike chat, so
+    this can read them directly). Legacy tasks pass a single contribution whose
+    author is the team name.
+
+    Returns {"text": str, "sections": [{"heading", "body", "sources"}]} where
+    `sources` are the @usernames (or legacy team names) cited in that section,
+    or None on failure. If the model returns unusable JSON, falls back to its
+    raw text with no sections (the apps still show the team/staff tree)."""
+    # Flatten, keeping the set of valid citation names (usernames + team names).
+    known_names: List[str] = []
+    blocks: List[str] = []
+    for t in teams or []:
+        team_name = str(t.get("team_name") or "Team")
+        contribs = [c for c in (t.get("contributions") or []) if str(c.get("text", "")).strip()]
+        if not contribs:
+            continue
+        if team_name not in known_names:
+            known_names.append(team_name)
+        lines = [f"=== Team: {team_name} ==="]
+        for c in contribs:
+            author = str(c.get("author") or "staff")
+            if author not in known_names:
+                known_names.append(author)
+            lines.append(f"<@{author}> {str(c['text']).strip()}")
+        blocks.append("\n".join(lines))
+
+    if not blocks:
         return None
-    team_names = [r.get("team_name") or "Team" for r in usable]
-    parts = [f"[{name}]\n{r['report_text'].strip()}" for name, r in zip(team_names, usable)]
-    combined = "\n\n".join(parts)[:_MAX_INPUT_CHARS]
+    combined = "\n\n".join(blocks)[:_MAX_INPUT_CHARS]
     raw = await _ollama_generate(_COMPILE_TASK_REPORTS_PROMPT, combined, json_mode=True, timeout=120.0)
     if not raw:
         return None
@@ -345,13 +370,13 @@ async def compile_task_reports(reports: List[Dict[str, str]]) -> Optional[Dict[s
             continue
         sources: List[str] = []
         for src in sec.get("sources") or []:
-            t = _match_team(src, team_names)
+            t = _match_name(src, known_names)
             if t and t not in sources:
                 sources.append(t)
         sections.append({"heading": str(sec.get("heading") or "").strip() or "Section", "body": body, "sources": sources})
     summary = str(parsed.get("overall_summary") or "").strip()
     if summary:
-        sections.append({"heading": "Overall summary", "body": summary, "sources": list(team_names)})
+        sections.append({"heading": "Overall summary", "body": summary, "sources": list(known_names)})
     if not sections:
         return None
     text = "\n\n".join(f"{s['heading']}\n{s['body']}" for s in sections)

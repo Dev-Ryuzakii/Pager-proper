@@ -16,6 +16,7 @@ import random
 import httpx
 import re
 import smtplib
+import ssl
 import io
 import asyncio
 from email.message import EmailMessage
@@ -419,7 +420,10 @@ def _email_providers() -> list:
     use_starttls, from_email)."""
     providers = []
     smtp_host = os.getenv("SMTP_HOST")
-    smtp_from = os.getenv("SMTP_FROM")
+    # Accept SMTP_FROM or the cPanel-style SMTP_FROM_ADDRESS; fall back to the
+    # username (which is the full mailbox address) so a missing From never
+    # silently drops the whole SMTP provider.
+    smtp_from = os.getenv("SMTP_FROM") or os.getenv("SMTP_FROM_ADDRESS") or os.getenv("SMTP_USERNAME")
     if smtp_host and os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD") and smtp_from:
         port = int(os.getenv("SMTP_PORT", "465" if smtp_host == "smtp.resend.com" else "587"))
         use_ssl = os.getenv("SMTP_SSL", "1" if port in (465, 2465) else "0") == "1"
@@ -477,10 +481,14 @@ def _send_email_message(to_email: str, subject: str, text_body: str, html_body: 
     for name, host, port, user, password, use_ssl, use_starttls, from_email in providers:
         try:
             msg = _build_email(to_email, subject, text_body, html_body, from_email)
-            smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
-            with smtp_class(host, port, timeout=20) as server:
+            ssl_context = ssl.create_default_context()
+            if use_ssl:
+                server_cm = smtplib.SMTP_SSL(host, port, context=ssl_context, timeout=30)
+            else:
+                server_cm = smtplib.SMTP(host, port, timeout=30)
+            with server_cm as server:
                 if use_starttls:
-                    server.starttls()
+                    server.starttls(context=ssl_context)
                 server.login(user, password)
                 server.send_message(msg)
             logger.info("Transactional email sent via %s (%s) to %s: %s", name, host, to_email, subject)
@@ -4836,6 +4844,7 @@ _cors_origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",
     # Production lives on eibstratoc.com (admin console, web platform, portal).
     "https://admindilarion.eibstratoc.com",
     "https://webdilarion.eibstratoc.com",
+    "https://web-dilarion.eibstratoc.com",
     "https://web.dilarion.eibstratoc.com",
     "https://dilarion.eibstratoc.com",
     "http://localhost:1420", "http://127.0.0.1:1420",
@@ -9508,13 +9517,28 @@ def _task_dict(db: Session, task: Task) -> Dict[str, Any]:
     for g in groups:
         members = db.query(TaskGroupMember).filter(TaskGroupMember.task_group_id == g.id).all()
         member_usernames = []
+        members_out = []
         for m in members:
             u = db.query(User).filter(User.id == m.user_id).first()
-            member_usernames.append(str(getattr(u, 'username', '')))
+            uname = str(getattr(u, 'username', ''))
+            member_usernames.append(uname)
+            members_out.append({
+                "user_id": m.user_id,
+                "username": uname,
+                "report_text": m.report_text,
+                "submitted": bool(m.report_text),
+                "report_submitted_at": m.report_submitted_at.isoformat() if m.report_submitted_at else None,
+            })
         submitter = db.query(User).filter(User.id == g.report_submitted_by_id).first() if g.report_submitted_by_id else None
+        # A team "has a report" when any staffer has submitted theirs (new flow)
+        # or a legacy shared team report exists.
+        any_member_report = any(mo["submitted"] for mo in members_out)
         group_out.append({
             "group_id": g.id, "name": g.name, "member_usernames": member_usernames,
+            "members": members_out,
+            # Legacy shared team report (pre per-staff). Kept for old tasks.
             "report_text": g.report_text,
+            "has_report": bool(g.report_text) or any_member_report,
             "report_submitted_by": str(getattr(submitter, 'username', '')) if submitter else None,
             "report_submitted_at": g.report_submitted_at.isoformat() if g.report_submitted_at else None,
         })
@@ -9553,26 +9577,47 @@ def _task_compiled_sections(task: Task) -> List[Dict[str, Any]]:
 
 def _task_report_tree(group_out: List[Dict[str, Any]], sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The breakout report "tree": each team -> its staff -> the compiled
-    report sections its report fed into. Built from group_out (already
-    serialized by _task_dict) so the apps and the .docx export agree."""
+    report sections that staffer's own report fed into (by citation). Built
+    from group_out (already serialized by _task_dict) so the apps and the
+    .docx export agree.
+
+    A compiled section's `sources` are staff usernames the AI cited; for legacy
+    tasks they may be team names, so both are matched."""
     tree = []
     for g in group_out:
         team_name = g["name"] or f"Group {g['group_id']}"
+        members = g.get("members") or [
+            {"username": u, "submitted": False} for u in g.get("member_usernames", [])
+        ]
+
+        def sections_for(keys: set) -> List[Dict[str, Any]]:
+            out = []
+            for i, sec in enumerate(sections):
+                src = set(sec.get("sources") or [])
+                if src & keys:
+                    out.append({"index": i, "heading": sec.get("heading") or "Section"})
+            return out
+
+        staff = []
+        for m in members:
+            uname = m["username"]
+            staff.append({
+                "username": uname,
+                "submitted": bool(m.get("submitted")),
+                "report_submitted_at": m.get("report_submitted_at"),
+                # Sections this staffer's own report was cited in.
+                "sections": sections_for({uname}),
+            })
+        # Team-level sections: anything citing this team or any of its staff.
+        team_keys = {team_name} | {m["username"] for m in members}
         tree.append({
             "group_id": g["group_id"],
             "team_name": team_name,
-            "staff": [
-                {"username": u, "is_submitter": u == g["report_submitted_by"]}
-                for u in g["member_usernames"]
-            ],
-            "has_report": bool(g["report_text"]),
-            "report_submitted_by": g["report_submitted_by"],
-            "report_submitted_at": g["report_submitted_at"],
-            "sections": [
-                {"index": i, "heading": sec.get("heading") or "Section"}
-                for i, sec in enumerate(sections)
-                if team_name in (sec.get("sources") or [])
-            ],
+            "staff": staff,
+            "has_report": bool(g.get("has_report")),
+            "report_submitted_by": g.get("report_submitted_by"),
+            "report_submitted_at": g.get("report_submitted_at"),
+            "sections": sections_for(team_keys),
         })
     return tree
 
@@ -9784,15 +9829,22 @@ async def add_task_assignees(
     if task.is_breakout:
         groups = db.query(TaskGroup).filter(TaskGroup.task_id == task.id).all()
         if payload.group_name:
+            # A named team: use it if it exists, otherwise CREATE it — this is
+            # how "add people" doubles as "create a new team".
             target_group = next((g for g in groups if (g.name or "") == payload.group_name), None)
-        if target_group is None:
+            if target_group is None:
+                target_group = TaskGroup(task_id=task.id, name=payload.group_name)
+                db.add(target_group)
+                db.commit()
+                db.refresh(target_group)
+        else:
+            # No team named — fall back to the first, or make a default one.
             target_group = groups[0] if groups else None
-        if target_group is None:
-            # A breakout task with no sub-teams yet — make one so people land somewhere.
-            target_group = TaskGroup(task_id=task.id, name=payload.group_name or "Team A")
-            db.add(target_group)
-            db.commit()
-            db.refresh(target_group)
+            if target_group is None:
+                target_group = TaskGroup(task_id=task.id, name="Team A")
+                db.add(target_group)
+                db.commit()
+                db.refresh(target_group)
 
     for uname in payload.usernames:
         u = db.query(User).filter(User.username == uname, User.is_active == True).first()
@@ -9879,6 +9931,35 @@ async def get_task(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return _task_dict(db, task)
+
+
+@app.delete("/tasks/{task_id}")
+async def delete_task(
+    task_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Delete a task. Only the creator, a site admin, or the task group's admin
+    may delete. Cascades to assignees, breakout teams, team members and their
+    reports (ORM cascade on the Task relationships)."""
+    user_id = int(getattr(current_user, 'id', 0))
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    is_site_admin = bool(getattr(current_user, 'is_admin', False))
+    is_creator = task.created_by_id == user_id
+    is_grp_admin = bool(task.group_id) and _is_group_admin(db, task.group_id, user_id)
+    if not (is_site_admin or is_creator or is_grp_admin):
+        raise HTTPException(status_code=403, detail="Only the task creator or an admin can delete this task")
+
+    title = task.title
+    # Pull its calendar event (if any) before the row is gone.
+    background_tasks.add_task(_sync_task_to_google, task_id, True)
+    db.delete(task)
+    db.commit()
+    AuditService.log_event(db, user_id, "task_deleted", f"Task '{title}' (ID {task_id}) deleted")
+    return {"status": "deleted", "task_id": task_id}
 
 
 @app.put("/tasks/{task_id}/status")
@@ -9969,6 +10050,35 @@ async def submit_breakout_report(
     return _task_dict(db, task)
 
 
+@app.post("/tasks/{task_id}/my-report")
+async def submit_my_breakout_report(
+    task_id: int,
+    payload: TaskGroupReportSubmit,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """A staff member submits their OWN report for the breakout team they're on
+    in this task. Each member reports individually; the AI compiler later cites
+    each person's contribution."""
+    user_id = int(getattr(current_user, 'id', 0))
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    # Find the caller's membership in any of this task's breakout teams.
+    member = (
+        db.query(TaskGroupMember)
+        .join(TaskGroup, TaskGroup.id == TaskGroupMember.task_group_id)
+        .filter(TaskGroup.task_id == task_id, TaskGroupMember.user_id == user_id)
+        .first()
+    )
+    if not member:
+        raise HTTPException(status_code=403, detail="You are not on a breakout team for this task")
+    setattr(member, 'report_text', payload.report_text)
+    setattr(member, 'report_submitted_at', datetime.now(timezone.utc))
+    db.commit()
+    return _task_dict(db, task)
+
+
 @app.post("/tasks/{task_id}/compile")
 async def compile_task(
     task_id: int,
@@ -9991,9 +10101,23 @@ async def compile_task(
     if not (is_site_admin or is_creator or is_grp_admin):
         raise HTTPException(status_code=403, detail="Only the task creator or an admin can compile the report")
 
+    # Gather per-staff reports grouped by team. Each team carries each member's
+    # own report (new flow); a legacy shared team report is folded in as a
+    # pseudo-contributor so old tasks still compile.
     groups = db.query(TaskGroup).filter(TaskGroup.task_id == task_id).all()
-    reports = [{"team_name": g.name or f"Group {g.id}", "report_text": g.report_text or ""} for g in groups]
-    compiled = await compile_task_reports(reports)
+    teams: List[Dict[str, Any]] = []
+    for g in groups:
+        contributions = []
+        for m in db.query(TaskGroupMember).filter(TaskGroupMember.task_group_id == g.id).all():
+            if (m.report_text or "").strip():
+                u = db.query(User).filter(User.id == m.user_id).first()
+                contributions.append({"author": str(getattr(u, 'username', 'staff')), "text": m.report_text.strip()})
+        if not contributions and (g.report_text or "").strip():
+            contributions.append({"author": g.name or "Team", "text": g.report_text.strip()})
+        if contributions:
+            teams.append({"team_name": g.name or f"Group {g.id}", "contributions": contributions})
+
+    compiled = await compile_task_reports(teams)
     if not compiled:
         raise HTTPException(status_code=422, detail="No submitted reports to compile yet, or the AI service is unavailable")
 
@@ -10101,44 +10225,56 @@ def _build_task_report_docx(data: Dict[str, Any]):
     # ── Report tree ──
     doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
     doc.add_heading("Report Tree", level=1)
-    meta("Which part of the compiled report came from which breakout team, and who was on each team. "
-         "★ marks the staff member who submitted the team's report.")
+    meta("How the compiled report was built: each team, each staff member on it, "
+         "and which sections of the report cite that person's own submission. "
+         "★ marks staff who have submitted their report.")
     root = doc.add_paragraph()
     root.add_run(data["title"]).bold = True
     for team in data.get("report_tree") or []:
         tp = doc.add_paragraph(style='List Bullet')
         tp.add_run(team["team_name"]).bold = True
-        if not team["has_report"]:
-            r = tp.add_run("  (no report submitted)")
+        if not team.get("has_report"):
+            r = tp.add_run("  (no reports submitted)")
             r.italic = True
             r.font.color.rgb = muted
-        sp = doc.add_paragraph(style='List Bullet 2')
-        sp.add_run("Staff: ").bold = True
-        sp.add_run(", ".join(
-            ("★ " if s["is_submitter"] else "") + s["username"] for s in team["staff"]
-        ) or "—")
-        cp = doc.add_paragraph(style='List Bullet 2')
-        cp.add_run("Contributed to: ").bold = True
-        if team["sections"]:
-            cp.add_run("; ".join(f"§{s['index'] + 1} {s['heading']}" for s in team["sections"]))
-        elif sections:
-            cp.add_run("no section attributed").italic = True
-        else:
-            cp.add_run("recompile to see section attribution").italic = True
+        for s in team.get("staff") or []:
+            sp = doc.add_paragraph(style='List Bullet 2')
+            sp.add_run(("★ " if s.get("submitted") else "") + s["username"]).bold = True
+            if s.get("sections"):
+                sp.add_run("  — cited in " + "; ".join(
+                    f"§{sec['index'] + 1} {sec['heading']}" for sec in s["sections"]
+                ))
+            elif not s.get("submitted"):
+                r = sp.add_run("  (no report yet)"); r.italic = True; r.font.color.rgb = muted
 
-    # ── Source reports ──
+    # ── Source reports: each staff member's own submission ──
     doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
-    doc.add_heading("Appendix: original team reports", level=1)
+    doc.add_heading("Appendix: staff reports", level=1)
     for g in data.get("breakout_groups") or []:
         doc.add_heading(g["name"] or f"Group {g['group_id']}", level=2)
+        members = g.get("members") or []
+        any_submitted = False
+        for m in members:
+            if not m.get("report_text"):
+                continue
+            any_submitted = True
+            doc.add_heading(m["username"], level=3)
+            when = (m.get("report_submitted_at") or "")[:16].replace("T", " ")
+            if when:
+                meta(f"Submitted {when} UTC")
+            for para in m["report_text"].split("\n"):
+                if para.strip():
+                    doc.add_paragraph(para.strip())
+        # Legacy shared team report, if present.
         if g.get("report_text"):
+            any_submitted = True
             when = (g.get("report_submitted_at") or "")[:16].replace("T", " ")
-            meta(f"Submitted by {g.get('report_submitted_by') or '—'}" + (f" · {when} UTC" if when else ""))
+            meta(f"Team report by {g.get('report_submitted_by') or '—'}" + (f" · {when} UTC" if when else ""))
             for para in g["report_text"].split("\n"):
                 if para.strip():
                     doc.add_paragraph(para.strip())
-        else:
-            meta("No report submitted.")
+        if not any_submitted:
+            meta("No reports submitted.")
     return doc
 
 

@@ -66,7 +66,7 @@ def _email_providers():
     """Same order the server uses: configured SMTP first, Resend fallback."""
     providers = []
     smtp_host = os.getenv("SMTP_HOST")
-    smtp_from = os.getenv("SMTP_FROM")
+    smtp_from = os.getenv("SMTP_FROM") or os.getenv("SMTP_FROM_ADDRESS") or os.getenv("SMTP_USERNAME")
     if smtp_host and os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD") and smtp_from:
         port = int(os.getenv("SMTP_PORT", "465" if smtp_host == "smtp.resend.com" else "587"))
         use_ssl = os.getenv("SMTP_SSL", "1" if port in (465, 2465) else "0") == "1"
