@@ -798,11 +798,12 @@ class DeviceWipeCommand(Base):
     # Null while status='awaiting_approval' — set to the approving admin's id on approval.
     issued_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     reason = Column(Text, nullable=True)
-    # awaiting_approval, pending, delivered, confirmed, rejected, failed
+    # awaiting_approval, awaiting_backup, backup_failed, pending, delivered,
+    # executing, confirmed, rejected, failed
     status = Column(String(20), default="pending")
-    # app_data: soft wipe, app's own local DB only (existing behavior)
+    # app_data: Android clears this app's local data
     # duress_selective: Device Owner clears named 3rd-party apps' data + contacts/SMS/media, no reset screen
-    # factory_reset: full MDM wipe via Headwind, device reboots to setup screen
+    # factory_reset: Device Owner resets the device to its setup screen
     wipe_mode = Column(String(20), default="app_data")
     target_packages = Column(JSON, nullable=True)  # package names to clear for duress_selective; None = server default list
     batch_id = Column(String(64), nullable=True, index=True)  # groups commands issued together (e.g. mass wipe)
@@ -818,6 +819,14 @@ class DeviceWipeCommand(Base):
     issued_at = Column(DateTime, default=func.now())
     delivered_at = Column(DateTime, nullable=True)
     confirmed_at = Column(DateTime, nullable=True)
+    # A wipe is not dispatched until the device uploads a verified archive.
+    backup_path = Column(String(1024), nullable=True)
+    backup_sha256 = Column(String(64), nullable=True)
+    backup_size_bytes = Column(BigInteger, nullable=True)
+    backup_device_id = Column(String(128), nullable=True)
+    requested_device_id = Column(String(128), nullable=True)
+    backup_completed_at = Column(DateTime, nullable=True)
+    failure_reason = Column(String(300), nullable=True)
 
     target_user = relationship("User", foreign_keys=[target_user_id])
     issued_by = relationship("User", foreign_keys=[issued_by_admin_id])
@@ -1272,6 +1281,21 @@ class TaskGroupMember(Base):
 
     task_group = relationship("TaskGroup", back_populates="members")
     user = relationship("User", foreign_keys=[user_id])
+    revisions = relationship("TaskMemberReportRevision", back_populates="member", cascade="all, delete-orphan")
+
+
+class TaskMemberReportRevision(Base):
+    """One saved version of a staff member's breakout report. A new row is
+    appended every time they (re)submit, so the apps can show a "branch tree"
+    of how the report evolved — who changed what, when."""
+    __tablename__ = "task_member_report_revisions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_group_member_id = Column(Integer, ForeignKey("task_group_members.id"), nullable=False)
+    report_text = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+    member = relationship("TaskGroupMember", back_populates="revisions")
 
 
 class CommandAuditLog(Base):

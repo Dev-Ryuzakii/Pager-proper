@@ -14,6 +14,7 @@ import (
 
 var headwindServerURL = os.Getenv("HEADWIND_SERVER_URL")
 var headwindAPIKey = os.Getenv("HEADWIND_API_KEY")
+var connectorToken = os.Getenv("MDM_CONNECTOR_TOKEN")
 
 // EnrollRequest represents the JSON payload to enroll a device.
 type EnrollRequest struct {
@@ -22,24 +23,30 @@ type EnrollRequest struct {
 	UserID   int    `json:"user_id"`
 }
 
-// WipeRequest represents the JSON payload to wipe a device.
-type WipeRequest struct {
-	DeviceID string `json:"device_id"`
-	Reason   string `json:"reason"`
-}
-
 func main() {
 	if headwindServerURL == "" {
-		headwindServerURL = "http://localhost:8080/rest"
+		headwindServerURL = "http://localhost:8080"
 	}
 
 	r := gin.Default()
+	r.Use(func(c *gin.Context) {
+		if connectorToken == "" {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "MDM connector token is not configured"})
+			return
+		}
+		if c.GetHeader("X-MDM-Connector-Token") != connectorToken {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			return
+		}
+		c.Next()
+	})
 
 	// Ensure uploads directory exists for forensic logs
 	os.MkdirAll("./forensic_uploads", os.ModePerm)
 
 	r.POST("/mdm/enroll", handleEnroll)
-	r.POST("/mdm/wipe", handleWipe)
+	// Factory resets are issued by the Device Owner app after the backend
+	// verifies its backup. Do not expose a connector route that bypasses it.
 	r.POST("/mdm/forensic-upload", handleForensicUpload)
 
 	port := os.Getenv("PORT")
@@ -74,45 +81,17 @@ func handleEnroll(c *gin.Context) {
 
 	if err != nil {
 		log.Printf("Headwind API error: %v", err)
-		// For prototyping, we'll return success even if Headwind isn't reachable
-		c.JSON(http.StatusOK, gin.H{"status": "simulated_success", "device_id": req.DeviceID})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Headwind enrollment failed"})
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("Headwind enrollment rejected device=%s status=%d", req.DeviceID, resp.StatusCode)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Headwind rejected enrollment"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "enrolled", "device_id": req.DeviceID})
-}
-
-func handleWipe(c *gin.Context) {
-	var req WipeRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	log.Printf("Wiping device: %s Reason: %s", req.DeviceID, req.Reason)
-
-	// Simulate Headwind API wipe command
-	// Headwind API typically uses something like /plugins/device/rest/wipe or MQTT
-	payload, _ := json.Marshal(map[string]interface{}{
-		"deviceId": req.DeviceID,
-		"action":   "factory_reset",
-	})
-
-	resp, err := http.Post(
-		fmt.Sprintf("%s/plugins/device/rest/command", headwindServerURL),
-		"application/json",
-		bytes.NewBuffer(payload),
-	)
-
-	if err != nil {
-		log.Printf("Headwind API error: %v", err)
-		c.JSON(http.StatusOK, gin.H{"status": "simulated_wipe_triggered", "device_id": req.DeviceID})
-		return
-	}
-	defer resp.Body.Close()
-
-	c.JSON(http.StatusOK, gin.H{"status": "wipe_triggered", "device_id": req.DeviceID})
 }
 
 func handleForensicUpload(c *gin.Context) {

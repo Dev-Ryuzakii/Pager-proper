@@ -22,6 +22,13 @@ ALTER_STATEMENTS = [
     "ALTER TABLE device_wipe_commands ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMP",
     "ALTER TABLE device_wipe_commands ADD COLUMN IF NOT EXISTS rejection_note TEXT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS can_approve_duress_wipe BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE device_wipe_commands ADD COLUMN IF NOT EXISTS backup_path VARCHAR(1024)",
+    "ALTER TABLE device_wipe_commands ADD COLUMN IF NOT EXISTS backup_sha256 VARCHAR(64)",
+    "ALTER TABLE device_wipe_commands ADD COLUMN IF NOT EXISTS backup_size_bytes BIGINT",
+    "ALTER TABLE device_wipe_commands ADD COLUMN IF NOT EXISTS backup_device_id VARCHAR(128)",
+    "ALTER TABLE device_wipe_commands ADD COLUMN IF NOT EXISTS requested_device_id VARCHAR(128)",
+    "ALTER TABLE device_wipe_commands ADD COLUMN IF NOT EXISTS backup_completed_at TIMESTAMP",
+    "ALTER TABLE device_wipe_commands ADD COLUMN IF NOT EXISTS failure_reason VARCHAR(300)",
 ]
 
 def migrate():

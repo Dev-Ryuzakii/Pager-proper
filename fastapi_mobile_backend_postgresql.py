@@ -67,7 +67,7 @@ if os.path.exists('.env'):
 # Import required modules
 from database_config import get_database_session, db_config
 from database_models import ServiceEvent, UptimeTarget, BlockedApp, PolicyViolationScreenshot
-from database_models import User, Organization, OrganizationAccessRequest, OrgAnnouncement, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, GoogleCalendarEventLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, ChatSettings, HiddenMessage
+from database_models import User, Organization, OrganizationAccessRequest, OrgAnnouncement, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, GoogleCalendarEventLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, TaskMemberReportRevision, ChatSettings, HiddenMessage
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -1297,6 +1297,7 @@ class DeviceWipeRequest(BaseModel):
     reason: Optional[str] = None
     wipe_mode: str = Field(default="app_data", pattern="^(app_data|duress_selective|factory_reset)$")
     target_packages: Optional[List[str]] = None  # only used for duress_selective; None = server default list
+    device_id: Optional[str] = Field(None, max_length=128)
 
 class MassWipeRequest(BaseModel):
     reason: str  # required — mass wipe always needs a stated reason for the audit trail
@@ -3168,7 +3169,7 @@ class RemoteCommandService:
 class DeviceWipeService:
     @staticmethod
     def purge_user_data(db: Session, user_id: int) -> dict:
-        """Delete ALL server-side data for a user. Runs immediately on wipe issue."""
+        """Legacy server purge helper. Device-only wipes do not call this."""
         counts = {}
 
         # Collect message IDs for this user BEFORE deleting — needed to clean up FK dependencies
@@ -3276,6 +3277,7 @@ class DeviceWipeService:
         requested_by_user_id: Optional[int],
         issued_by_admin_id: Optional[int],
         status: str,
+        requested_device_id: Optional[str] = None,
     ) -> DeviceWipeCommand:
         cmd = DeviceWipeCommand(
             target_user_id=target_user_id,
@@ -3287,6 +3289,7 @@ class DeviceWipeService:
             batch_id=batch_id,
             trigger_source=trigger_source,
             requested_by_user_id=requested_by_user_id,
+            requested_device_id=requested_device_id,
         )
         db.add(cmd)
         db.commit()
@@ -3295,12 +3298,10 @@ class DeviceWipeService:
 
     @staticmethod
     async def _deliver(db: Session, cmd: DeviceWipeCommand) -> DeviceWipeCommand:
-        """Purges server-side data and pushes the wipe payload to the device. Only
-        call this once a command is authorized to actually execute — i.e. it was
-        either issued directly by an admin/superadmin, or an awaiting_approval
-        request has just been approved."""
+        """Dispatch only after the device backup is stored and verified."""
+        if not cmd.backup_path or not cmd.backup_sha256:
+            raise HTTPException(status_code=409, detail="Verified device backup required before wipe")
         target_user_id = int(cmd.target_user_id)
-        purge_counts = DeviceWipeService.purge_user_data(db, target_user_id)
 
         payload = {
             "type": "device_wipe",
@@ -3313,7 +3314,7 @@ class DeviceWipeService:
             }
         }
 
-        sent = await ws_manager.send_to_user(target_user_id, payload)
+        sent = await ws_manager.send_to_device(target_user_id, cmd.backup_device_id, payload, strict=True)
         if sent:
             cmd.status = "delivered"
             cmd.delivered_at = datetime.utcnow()
@@ -3321,9 +3322,26 @@ class DeviceWipeService:
             db.refresh(cmd)
 
         logger.warning(
-            f"DEVICE WIPE delivered: target={target_user_id}, wipe_id={cmd.id}, "
-            f"mode={cmd.wipe_mode}, source={cmd.trigger_source}, batch={cmd.batch_id}, purged={purge_counts}"
+            f"DEVICE WIPE dispatch: target={target_user_id}, wipe_id={cmd.id}, "
+            f"mode={cmd.wipe_mode}, sent={sent}, source={cmd.trigger_source}, batch={cmd.batch_id}"
         )
+        return cmd
+
+    @staticmethod
+    async def _request_backup(db: Session, cmd: DeviceWipeCommand) -> DeviceWipeCommand:
+        cmd.status = "awaiting_backup"
+        db.commit()
+        db.refresh(cmd)
+        prepare_payload = {
+            "type": "device_wipe_prepare",
+            "data": {"wipe_id": int(cmd.id), "wipe_mode": cmd.wipe_mode,
+                     "target_packages": cmd.target_packages},
+        }
+        if cmd.requested_device_id:
+            await ws_manager.send_to_device(int(cmd.target_user_id), cmd.requested_device_id,
+                                                 prepare_payload, strict=True)
+        else:
+            await ws_manager.send_to_user(int(cmd.target_user_id), prepare_payload)
         return cmd
 
     @staticmethod
@@ -3335,14 +3353,15 @@ class DeviceWipeService:
         wipe_mode: str = "app_data",
         target_packages: Optional[list] = None,
         batch_id: Optional[str] = None,
+        requested_device_id: Optional[str] = None,
     ) -> DeviceWipeCommand:
-        """Direct admin-issued wipe — immediate, no approval step. The admin role
-        gate on the calling endpoint IS the authorization here."""
+        """Direct admin request; device execution still waits for backup."""
         target = db.query(User).filter(User.username == username, User.is_active == True).first()
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
         return await DeviceWipeService._issue_wipe_for_user(
-            db, admin_id, int(target.id), reason, wipe_mode, target_packages, batch_id
+            db, admin_id, int(target.id), reason, wipe_mode, target_packages, batch_id,
+            requested_device_id=requested_device_id,
         )
 
     @staticmethod
@@ -3355,15 +3374,16 @@ class DeviceWipeService:
         target_packages: Optional[list] = None,
         batch_id: Optional[str] = None,
         trigger_source: str = "admin",
+        requested_device_id: Optional[str] = None,
     ) -> DeviceWipeCommand:
-        """Immediate path — used for direct admin wipes and superadmin mass wipes,
-        both of which are already a deliberate human decision by an authorized role."""
+        """Authorized admin path: create a request and ask the device to back up."""
         cmd = DeviceWipeService._create_command(
             db, target_user_id, reason, wipe_mode, target_packages, batch_id,
             trigger_source=trigger_source, requested_by_user_id=None,
-            issued_by_admin_id=admin_id, status="pending",
+            issued_by_admin_id=admin_id, status="awaiting_backup",
+            requested_device_id=requested_device_id,
         )
-        return await DeviceWipeService._deliver(db, cmd)
+        return await DeviceWipeService._request_backup(db, cmd)
 
     @staticmethod
     def request_approval(
@@ -3376,7 +3396,7 @@ class DeviceWipeService:
         requested_by_user_id: int,
     ) -> DeviceWipeCommand:
         """SOS and geofence-exit both land here instead of wiping directly — no
-        server purge, no device push, until an authorized approver acts on it.
+        backup request or device wipe until an authorized approver acts on it.
         This exists specifically so a missed off-duty geofence removal, a false
         alarm, or a coerced/malicious SOS press doesn't destroy real data on its
         own; an admin sees WHY before anything is touched."""
@@ -3398,38 +3418,8 @@ class DeviceWipeService:
         cmd.approved_at = datetime.utcnow()
         cmd.issued_by_admin_id = approving_admin_id
 
-        if str(cmd.wipe_mode) == "factory_reset":
-            # Loud escalation path: dispatched via the Headwind MDM connector,
-            # not the app's own push channel.
-            profile = db.query(MDMDeviceProfile).filter(MDMDeviceProfile.user_id == cmd.target_user_id).first()
-            if profile and profile.headwind_device_id:
-                try:
-                    import httpx, os
-                    MDM_MICROSERVICE_URL = os.getenv("MDM_MICROSERVICE_URL", "http://localhost:8001")
-                    async with httpx.AsyncClient() as client:
-                        await client.post(
-                            f"{MDM_MICROSERVICE_URL}/mdm/wipe",
-                            json={"device_id": profile.headwind_device_id, "reason": cmd.reason},
-                            timeout=5.0,
-                        )
-                    cmd.status = "delivered"
-                    cmd.delivered_at = datetime.utcnow()
-                except Exception as e:
-                    logger.error(f"factory_reset dispatch failed for wipe_id={wipe_id}: {e}")
-                    cmd.status = "failed"
-            else:
-                logger.error(f"factory_reset approved but no MDM profile for user_id={cmd.target_user_id}")
-                cmd.status = "failed"
-            db.commit()
-            db.refresh(cmd)
-            logger.warning(f"WIPE APPROVED (factory_reset): wipe_id={wipe_id}, approver={approving_admin_id}")
-            return cmd
-
-        cmd.status = "pending"
-        db.commit()
-        db.refresh(cmd)
         logger.warning(f"WIPE APPROVED: wipe_id={wipe_id}, approver={approving_admin_id}, mode={cmd.wipe_mode}")
-        return await DeviceWipeService._deliver(db, cmd)
+        return await DeviceWipeService._request_backup(db, cmd)
 
     @staticmethod
     def reject_wipe(db: Session, wipe_id: int, rejecting_admin_id: int, note: Optional[str]) -> DeviceWipeCommand:
@@ -3457,12 +3447,16 @@ class DeviceWipeService:
         )
 
     @staticmethod
-    def confirm_wipe(db: Session, wipe_id: int, user_id: int) -> DeviceWipeCommand:
+    def confirm_wipe(db: Session, wipe_id: int, user_id: int, device_id: str) -> DeviceWipeCommand:
         cmd = db.query(DeviceWipeCommand).filter(DeviceWipeCommand.id == wipe_id).first()
         if not cmd:
             raise HTTPException(status_code=404, detail="Wipe command not found")
         if int(cmd.target_user_id) != user_id:
             raise HTTPException(status_code=403, detail="Not authorized")
+        if cmd.backup_device_id != device_id:
+            raise HTTPException(status_code=403, detail="Wrong device for this wipe")
+        if cmd.status not in ("delivered", "pending") or not cmd.backup_path:
+            raise HTTPException(status_code=409, detail="Wipe was not dispatched after backup")
         cmd.status = "confirmed"
         cmd.confirmed_at = datetime.utcnow()
         db.commit()
@@ -3470,12 +3464,17 @@ class DeviceWipeService:
         return cmd
 
     @staticmethod
-    def pending_for_user(db: Session, user_id: int) -> list:
+    def pending_for_user(db: Session, user_id: int, device_id: str) -> list:
         """App calls this on reconnect to fetch wipe commands missed while offline —
         critical for the case where the device was offline when the command was issued."""
         return (
             db.query(DeviceWipeCommand)
-            .filter(DeviceWipeCommand.target_user_id == user_id, DeviceWipeCommand.status == "pending")
+            .filter(DeviceWipeCommand.target_user_id == user_id,
+                    or_(DeviceWipeCommand.requested_device_id.is_(None),
+                        DeviceWipeCommand.requested_device_id == device_id),
+                    or_(DeviceWipeCommand.status == "awaiting_backup",
+                        and_(DeviceWipeCommand.status.in_(["pending", "delivered"]),
+                             DeviceWipeCommand.backup_device_id == device_id)))
             .order_by(DeviceWipeCommand.issued_at.asc())
             .all()
         )
@@ -5168,11 +5167,13 @@ class ConnectionManager:
             self._usernames.pop(user_id, None)
         return sent
 
-    async def send_to_device(self, user_id: int, device_id: str, data: dict) -> bool:
+    async def send_to_device(self, user_id: int, device_id: str, data: dict, strict: bool = False) -> bool:
         """Send to a specific device. Falls back to all devices if device_id not found."""
         devices = self._connections.get(user_id, {})
         ws = devices.get(device_id)
         if not ws:
+            if strict:
+                return False
             return await self.send_to_user(user_id, data)
         payload = json.dumps(data, default=str)
         try:
@@ -9522,12 +9523,16 @@ def _task_dict(db: Session, task: Task) -> Dict[str, Any]:
             u = db.query(User).filter(User.id == m.user_id).first()
             uname = str(getattr(u, 'username', ''))
             member_usernames.append(uname)
+            rev_count = db.query(TaskMemberReportRevision).filter(
+                TaskMemberReportRevision.task_group_member_id == m.id
+            ).count()
             members_out.append({
                 "user_id": m.user_id,
                 "username": uname,
                 "report_text": m.report_text,
                 "submitted": bool(m.report_text),
                 "report_submitted_at": m.report_submitted_at.isoformat() if m.report_submitted_at else None,
+                "revision_count": rev_count,
             })
         submitter = db.query(User).filter(User.id == g.report_submitted_by_id).first() if g.report_submitted_by_id else None
         # A team "has a report" when any staffer has submitted theirs (new flow)
@@ -10075,8 +10080,50 @@ async def submit_my_breakout_report(
         raise HTTPException(status_code=403, detail="You are not on a breakout team for this task")
     setattr(member, 'report_text', payload.report_text)
     setattr(member, 'report_submitted_at', datetime.now(timezone.utc))
+    # Append a revision so the report's edit history ("branch tree") is kept.
+    db.add(TaskMemberReportRevision(task_group_member_id=member.id, report_text=payload.report_text))
     db.commit()
     return _task_dict(db, task)
+
+
+@app.get("/tasks/{task_id}/members/{username}/report-history")
+async def get_member_report_history(
+    task_id: int,
+    username: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Every saved version of a staff member's breakout report, newest first —
+    the "branch tree" of how their report evolved. Visible to anyone who can
+    view the task."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not _can_view_task(db, task, current_user):
+        raise HTTPException(status_code=403, detail="Not allowed to view this task")
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    member = (
+        db.query(TaskGroupMember)
+        .join(TaskGroup, TaskGroup.id == TaskGroupMember.task_group_id)
+        .filter(TaskGroup.task_id == task_id, TaskGroupMember.user_id == target.id)
+        .first()
+    )
+    if not member:
+        return {"username": username, "revisions": []}
+    revs = (
+        db.query(TaskMemberReportRevision)
+        .filter(TaskMemberReportRevision.task_group_member_id == member.id)
+        .order_by(TaskMemberReportRevision.created_at.desc(), TaskMemberReportRevision.id.desc())
+        .all()
+    )
+    out = [
+        {"version": len(revs) - i, "report_text": r.report_text,
+         "created_at": r.created_at.isoformat() if r.created_at else None}
+        for i, r in enumerate(revs)
+    ]
+    return {"username": username, "revisions": out}
 
 
 @app.post("/tasks/{task_id}/compile")
@@ -17981,17 +18028,115 @@ async def super_admin_command_audit(
 
 # ─── Remote Device Wipe Endpoints ─────────────────────────────────────────────
 
+@app.post("/device/wipe/{wipe_id}/backup")
+async def upload_pre_wipe_backup(
+    wipe_id: int,
+    file: UploadFile = File(...),
+    sha256: str = Form(...),
+    device_id: str = Form(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Verify and encrypt the device archive before dispatching any wipe."""
+    from device_backup import inspect_archive, store_archive, backup_key, backup_root
+    cmd = db.query(DeviceWipeCommand).filter(
+        DeviceWipeCommand.id == wipe_id,
+        DeviceWipeCommand.target_user_id == current_user.id,
+    ).with_for_update().first()
+    if not cmd:
+        raise HTTPException(status_code=404, detail="Wipe request not found")
+    if cmd.requested_device_id and cmd.requested_device_id != device_id:
+        raise HTTPException(status_code=403, detail="Wrong device for this wipe")
+    if cmd.backup_sha256 and cmd.backup_sha256 == sha256:
+        return {"wipe_id": wipe_id, "sha256": cmd.backup_sha256, "status": cmd.status}
+    if cmd.status != "awaiting_backup":
+        raise HTTPException(status_code=409, detail=f"Wipe is {cmd.status}, not awaiting backup")
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise HTTPException(status_code=400, detail="Invalid SHA-256 checksum")
+    if not device_id or len(device_id) > 128:
+        raise HTTPException(status_code=400, detail="Invalid device ID")
+    try:
+        backup_key()
+        backup_root()
+        manifest = inspect_archive(file.file)
+        if manifest.get("wipe_id") != wipe_id or manifest.get("wipe_mode") != cmd.wipe_mode:
+            raise ValueError("Backup does not match the wipe request")
+        if cmd.wipe_mode != "app_data" and manifest.get("unavailable"):
+            raise ValueError("Backup is missing device data required before this wipe")
+        path, actual_sha, size = store_archive(file.file, int(current_user.id), wipe_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.error("Pre-wipe backup storage unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail="Encrypted backup storage is not configured") from exc
+    if actual_sha != sha256:
+        os.remove(path)
+        raise HTTPException(status_code=422, detail="Backup checksum mismatch")
+    cmd.backup_path = path
+    cmd.backup_sha256 = actual_sha
+    cmd.backup_size_bytes = size
+    cmd.backup_device_id = device_id
+    cmd.backup_completed_at = datetime.utcnow()
+    cmd.failure_reason = None
+    cmd.status = "pending"
+    db.commit()
+    await DeviceWipeService._deliver(db, cmd)
+    return {"wipe_id": wipe_id, "sha256": actual_sha, "size_bytes": size,
+            "categories": manifest["categories"], "status": cmd.status}
+
+
+@app.get("/admin/device/wipe/{wipe_id}/backup")
+async def download_pre_wipe_backup(
+    wipe_id: int,
+    admin_user: User = Depends(get_superadmin_only),
+    db: Session = Depends(get_database_session),
+):
+    """Admin downloads a verified archive for controlled restoration."""
+    from fastapi.responses import StreamingResponse
+    from device_backup import decrypt_archive
+    cmd = db.query(DeviceWipeCommand).filter(DeviceWipeCommand.id == wipe_id).first()
+    if not cmd or not cmd.backup_path or not os.path.isfile(cmd.backup_path):
+        raise HTTPException(status_code=404, detail="Backup not found")
+    return StreamingResponse(
+        decrypt_archive(cmd.backup_path), media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="wipe_{wipe_id}_backup.zip"'},
+    )
+
+
+@app.post("/device/wipe/{wipe_id}/backup-failed")
+async def report_pre_wipe_backup_failure(
+    wipe_id: int,
+    reason: str = Body(..., embed=True, max_length=300),
+    device_id: str = Query(..., min_length=1, max_length=128),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    cmd = db.query(DeviceWipeCommand).filter(
+        DeviceWipeCommand.id == wipe_id,
+        DeviceWipeCommand.target_user_id == current_user.id,
+        DeviceWipeCommand.status == "awaiting_backup",
+    ).first()
+    if not cmd:
+        raise HTTPException(status_code=404, detail="Pending backup request not found")
+    if cmd.requested_device_id and cmd.requested_device_id != device_id:
+        raise HTTPException(status_code=403, detail="Wrong device for this wipe")
+    cmd.status = "backup_failed"
+    cmd.failure_reason = f"Backup on {device_id}: {reason}"[:300]
+    db.commit()
+    return {"wipe_id": wipe_id, "status": "backup_failed"}
+
 @app.post("/admin/device/wipe")
 async def admin_issue_wipe(
     data: DeviceWipeRequest,
     admin_user: User = Depends(get_admin_only),
     db: Session = Depends(get_database_session)
 ):
-    """Admin issues remote wipe command. Delivered via WebSocket instantly; poll fallback if offline."""
+    """Admin requests a wipe; execution waits for a verified device backup."""
     try:
         admin_id = int(getattr(admin_user, 'id', 0))
         cmd = await DeviceWipeService.issue_wipe(
-            db, admin_id, data.username, data.reason, data.wipe_mode, data.target_packages
+            db, admin_id, data.username, data.reason, data.wipe_mode, data.target_packages,
+            requested_device_id=data.device_id,
         )
         db.add(CommandAuditLog(
             admin_id=admin_id,
@@ -18099,8 +18244,7 @@ async def admin_approve_wipe(
     approver: User = Depends(get_wipe_approver),
     db: Session = Depends(get_database_session)
 ):
-    """Approver authorizes a pending SOS/geofence wipe request — this is the only
-    point at which those requests actually purge data and push to the device."""
+    """Approver authorizes a pending SOS/geofence backup-before-wipe request."""
     try:
         approver_id = int(getattr(approver, 'id', 0))
         cmd = await DeviceWipeService.approve_wipe(db, wipe_id, approver_id)
@@ -18174,13 +18318,14 @@ async def set_wipe_approver(
 @app.post("/device/wipe/confirm")
 async def confirm_device_wipe(
     wipe_id: int = Body(...),
+    device_id: str = Query(..., min_length=1, max_length=128),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
     """App calls this after completing local wipe to confirm execution."""
     try:
         user_id = int(getattr(current_user, 'id', 0))
-        cmd = DeviceWipeService.confirm_wipe(db, wipe_id, user_id)
+        cmd = DeviceWipeService.confirm_wipe(db, wipe_id, user_id, device_id)
         return {"wipe_id": int(cmd.id), "status": "confirmed"}
     except HTTPException:
         raise
@@ -18189,8 +18334,56 @@ async def confirm_device_wipe(
         raise HTTPException(status_code=500, detail="Failed to confirm wipe")
 
 
+@app.post("/device/wipe/{wipe_id}/started")
+async def device_wipe_started(
+    wipe_id: int,
+    device_id: str = Query(..., min_length=1, max_length=128),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Record that Android is about to clear app data or reset the device.
+    Completion cannot be attested after Android kills that process."""
+    cmd = db.query(DeviceWipeCommand).filter(
+        DeviceWipeCommand.id == wipe_id,
+        DeviceWipeCommand.target_user_id == current_user.id,
+    ).first()
+    if not cmd:
+        raise HTTPException(status_code=404, detail="Wipe command not found")
+    if cmd.backup_device_id != device_id:
+        raise HTTPException(status_code=403, detail="Wrong device for this wipe")
+    if cmd.wipe_mode not in ("app_data", "factory_reset") or cmd.status not in ("pending", "delivered") or not cmd.backup_path:
+        raise HTTPException(status_code=409, detail="Device wipe is not ready")
+    cmd.status = "executing"
+    db.commit()
+    return {"wipe_id": wipe_id, "status": "executing"}
+
+
+@app.post("/device/wipe/{wipe_id}/failed")
+async def device_wipe_failed(
+    wipe_id: int,
+    reason: str = Body(..., embed=True, max_length=300),
+    device_id: str = Query(..., min_length=1, max_length=128),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    cmd = db.query(DeviceWipeCommand).filter(
+        DeviceWipeCommand.id == wipe_id,
+        DeviceWipeCommand.target_user_id == current_user.id,
+        DeviceWipeCommand.backup_device_id == device_id,
+    ).first()
+    if not cmd:
+        raise HTTPException(status_code=404, detail="Wipe command not found")
+    if cmd.status not in ("pending", "delivered", "executing"):
+        raise HTTPException(status_code=409, detail="Wipe cannot be marked failed")
+    cmd.status = "failed"
+    cmd.failure_reason = reason[:300]
+    db.commit()
+    return {"wipe_id": wipe_id, "status": "failed"}
+
+
 @app.get("/device/wipe/pending")
 async def get_pending_wipes(
+    device_id: str = Query(..., min_length=1, max_length=128),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
@@ -18198,10 +18391,11 @@ async def get_pending_wipes(
     same pattern as /device/command/pending, critical for the phone-regains-signal case."""
     try:
         user_id = int(getattr(current_user, 'id', 0))
-        cmds = DeviceWipeService.pending_for_user(db, user_id)
+        cmds = DeviceWipeService.pending_for_user(db, user_id, device_id)
         return [
             {
                 "wipe_id": int(c.id),
+                "status": c.status,
                 "wipe_mode": c.wipe_mode,
                 "target_packages": c.target_packages,
                 "reason": c.reason,
@@ -18234,6 +18428,12 @@ async def admin_wipe_history(
                 "batch_id": c.batch_id,
                 "issued_at": c.issued_at.isoformat(),
                 "confirmed_at": c.confirmed_at.isoformat() if c.confirmed_at else None,
+                "backup_completed_at": c.backup_completed_at.isoformat() if c.backup_completed_at else None,
+                "backup_size_bytes": c.backup_size_bytes,
+                "backup_sha256": c.backup_sha256,
+                "backup_device_id": c.backup_device_id,
+                "requested_device_id": c.requested_device_id,
+                "failure_reason": c.failure_reason,
             })
         return result
     except Exception as e:
@@ -19266,21 +19466,25 @@ async def mdm_enroll(
         )
         db.add(profile)
     
-    db.commit()
-    
-    # Forward to Go microservice
+    # Confirm upstream enrollment before recording this profile as enrolled.
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{MDM_MICROSERVICE_URL}/mdm/enroll",
                 json={"device_id": request.headwind_device_id, "imei": request.imei, "user_id": current_user.id},
+                headers={"X-MDM-Connector-Token": os.getenv("MDM_CONNECTOR_TOKEN", "")},
                 timeout=5.0
             )
-            return {"status": "enrolled", "microservice_response": resp.json()}
+            resp.raise_for_status()
+            upstream = resp.json()
+            if upstream.get("status") != "enrolled":
+                raise ValueError("Connector did not confirm enrollment")
+            db.commit()
+            return {"status": "enrolled", "microservice_response": upstream}
     except Exception as e:
-        logger.error(f"MDM Microservice error: {e}")
-        # Still return success for local profile creation
-        return {"status": "enrolled_local_only", "error": str(e)}
+        db.rollback()
+        logger.error(f"MDM enrollment failed: {e}")
+        raise HTTPException(status_code=502, detail="MDM enrollment was not confirmed")
 
 @app.post("/api/v1/mdm/wipe")
 async def mdm_wipe(
@@ -19288,7 +19492,7 @@ async def mdm_wipe(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
-    """Trigger a device wipe command. Admin or Emergency only."""
+    """Legacy MDM entry point, routed through backup-first wipe approval."""
     target_user_id = request.user_id if request.user_id else current_user.id
     
     # Must be admin to wipe someone else
@@ -19296,21 +19500,16 @@ async def mdm_wipe(
         raise HTTPException(status_code=403, detail="Not authorized to wipe this device")
         
     profile = db.query(MDMDeviceProfile).filter(MDMDeviceProfile.user_id == target_user_id).first()
-    if not profile:
+    if not profile or not profile.headwind_device_id:
         raise HTTPException(status_code=404, detail="MDM profile not found for user")
-        
-    profile.wipe_requested = True
-    profile.wipe_reason = request.reason
-    db.commit()
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{MDM_MICROSERVICE_URL}/mdm/wipe",
-                json={"device_id": profile.headwind_device_id, "reason": request.reason},
-                timeout=5.0
-            )
-            return {"status": "wipe_triggered", "microservice_response": resp.json()}
-    except Exception as e:
-        logger.error(f"MDM Microservice wipe error: {e}")
-        return {"status": "wipe_queued_local", "error": str(e)}
+    if current_user.is_admin:
+        cmd = await DeviceWipeService._issue_wipe_for_user(
+            db, int(current_user.id), int(target_user_id), request.reason,
+            wipe_mode="factory_reset",
+        )
+    else:
+        cmd = DeviceWipeService.request_approval(
+            db, int(target_user_id), request.reason, "factory_reset", None,
+            "sos", int(current_user.id),
+        )
+    return {"status": cmd.status, "wipe_id": int(cmd.id)}
