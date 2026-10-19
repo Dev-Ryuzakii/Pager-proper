@@ -7019,6 +7019,8 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
         monitor_record_event("auth", "login", user_id=user_id)
         return {
             "username": str(getattr(user, 'username', '')),
+            # Android 2.0.2 also reads this unannotated response field as "a".
+            "a": str(getattr(user, 'username', '')),
             "token": str(getattr(session, 'session_token', '')),
             "is_admin": bool(getattr(user, 'is_admin', False)),
             "organization_id": getattr(user, "organization_id", None),
