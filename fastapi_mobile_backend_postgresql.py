@@ -32,6 +32,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
+from starlette.concurrency import run_in_threadpool
 import uvicorn
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func, case
@@ -70,7 +71,11 @@ from database_models import ServiceEvent, UptimeTarget, BlockedApp, PolicyViolat
 from database_models import User, Organization, OrganizationAccessRequest, OrgAnnouncement, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, ManagedAndroidDevice, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, GoogleCalendarEventLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, TaskMemberReportRevision, ChatSettings, HiddenMessage
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
-from voice_scrambler import generate_voice_decoy
+from voice_scrambler import (
+    VOICE_DECOY_GENERATOR_VERSION,
+    generate_voice_decoy,
+    normalize_voice_sample,
+)
 from decoy_document import generate_decoy_document
 from decoy_image import generate_decoy_image, IMAGE_DECOY_KINDS
 from decoy_web_media import fetch_web_decoy_image
@@ -12796,31 +12801,44 @@ async def upload_voice_identity(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
-    """Upload a voice identity sample for scrambled decoys"""
+    """Save a decoded speaker reference for cloned voice decoys."""
+    user_dir = os.path.join(UPLOAD_DIR, f"user_{current_user.id}")
+    os.makedirs(user_dir, exist_ok=True)
+    source_path = os.path.join(user_dir, f".voice_upload_{uuid.uuid4().hex}")
+    converted_path = os.path.join(user_dir, f".voice_converted_{uuid.uuid4().hex}.wav")
     try:
-        user_dir = os.path.join(UPLOAD_DIR, f"user_{current_user.id}")
-        os.makedirs(user_dir, exist_ok=True)
-        
-        file_path = os.path.join(user_dir, "voice_identity.m4a")
         content = await file.read()
-        
-        with open(file_path, "wb") as f:
+        if not content or len(content) > 10_000_000:
+            raise HTTPException(status_code=400, detail="Voice sample must be between 1 byte and 10 MB")
+        with open(source_path, "wb") as f:
             f.write(content)
-            
+        if not await run_in_threadpool(normalize_voice_sample, source_path, converted_path):
+            raise HTTPException(status_code=400, detail="Voice sample is not valid audio")
+
+        file_path = os.path.join(user_dir, "voice_identity.wav")
+        os.replace(converted_path, file_path)
         current_user.voice_identity_path = file_path
         db.commit()
-        
-        return {"message": "Voice identity uploaded successfully", "path": file_path}
+        return {"message": "Voice identity uploaded successfully"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Voice identity upload error: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload voice identity")
+    finally:
+        for path in (source_path, converted_path):
+            if os.path.exists(path):
+                os.remove(path)
 
 @app.get("/users/{username}/voice-identity")
 async def get_user_voice_identity(
     username: str,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
-    """Get the voice identity of a specific user (for decoys)"""
+    """Let a user check or play back only their own voice identity."""
+    if current_user.username != username:
+        raise HTTPException(status_code=403, detail="Voice identity belongs to another user")
     user = db.query(User).filter(User.username == username).first()
     if not user or not user.voice_identity_path:
         raise HTTPException(status_code=404, detail="Voice identity not found")
@@ -13188,7 +13206,7 @@ async def get_decoy_voice(
     db: Session = Depends(get_database_session),
     current_user: User = Depends(get_current_user)
 ):
-    """Generate a fresh decoy using the SENDER'S voice identity"""
+    """Generate new speech using the sender's enrolled voice identity."""
     # media_id arrives exactly as stored (it includes the extension —
     # Media.media_id is written as f"{uuid}{ext}" at upload time, same as
     # get_decoy_file above), so look it up as-is. Only the cache filename
@@ -13199,33 +13217,34 @@ async def get_decoy_voice(
     media = db.query(Media).filter(Media.media_id == media_id).first()
     if not media:
         raise HTTPException(status_code=404, detail="Media not found")
-        
-    # 2. Pick the voice to imitate: the sender's identity sample when they have
-    # recorded one, otherwise the note itself — a decoy in roughly the right
-    # voice beats no decoy at all, which is what the old 404 produced.
+    if str(media.media_type).lower() != "voice":
+        raise HTTPException(status_code=400, detail="Media is not a voice note")
+
+    # The recorded note is encrypted and must never be replayed or remixed as
+    # a decoy. Only the enrollment sample may be used as a speaker reference.
     sender = media.sender
-    source = None
-    if sender and sender.voice_identity_path and os.path.exists(sender.voice_identity_path):
-        source = sender.voice_identity_path
-    elif media.encrypted_file_path and os.path.exists(media.encrypted_file_path):
-        source = media.encrypted_file_path
-    if not source:
-        raise HTTPException(status_code=404, detail="No audio available to build a decoy from")
+    source = sender.voice_identity_path if sender else None
+    if not source or not os.path.exists(source):
+        raise HTTPException(status_code=409, detail="Sender has not enrolled a voice sample")
 
     # 3. Serve a cached decoy when we already built one. The same note must
     # always play back the same words — a decoy that changes between replays
     # tells the listener it is fake.
     os.makedirs(DECOY_CACHE_DIR, exist_ok=True)
-    cached = os.path.join(DECOY_CACHE_DIR, f"{clean_media_id}.m4a")
+    source_stat = os.stat(source)
+    voice_version = hashlib.sha256(
+        f"{VOICE_DECOY_GENERATOR_VERSION}:{source_stat.st_mtime_ns}:{source_stat.st_size}".encode()
+    ).hexdigest()[:12]
+    cached = os.path.join(DECOY_CACHE_DIR, f"{clean_media_id}_{voice_version}.m4a")
     if not os.path.exists(cached):
         tmp = os.path.join(DECOY_CACHE_DIR, f".tmp_{uuid.uuid4().hex}.m4a")
-        if not generate_voice_decoy(source, tmp, seed=clean_media_id):
+        if not await run_in_threadpool(generate_voice_decoy, source, tmp, seed=clean_media_id):
             if os.path.exists(tmp):
                 os.remove(tmp)
-            raise HTTPException(status_code=500, detail="Failed to build voice decoy")
+            raise HTTPException(status_code=503, detail="Voice cloning is unavailable on the server")
         os.replace(tmp, cached)
 
-    return FileResponse(cached, media_type="audio/m4a")
+    return FileResponse(cached, media_type="audio/mp4")
 
 @app.post("/mastertoken/create")
 async def create_mastertoken(token_data: MasterToken,

@@ -1,29 +1,27 @@
 """
-Voice decoy generator.
+Voice decoy generator using XTTS-v2.
 
-Three tiers, best first:
-  1. Coqui XTTS-v2 — clones the sender's voice, speaks a fake phrase.
-  2. Piper        — coherent speech in a generic voice, ~50 MB model, CPU real-time.
-  3. ffmpeg       — shuffles/pitch-shifts the original. Incoherent; last resort.
+The enrollment recording is only a speaker reference. Never return or remix
+its audio as a decoy; if synthesis is unavailable, report failure.
 
 Two properties matter as much as the audio itself:
 
   * Determinism. The same voice note must always produce the same decoy. A note
     that says something different on each replay is an obvious tell.
-  * Duration. A 4-second decoy standing in for a 40-second note is equally
-    obvious, so phrases are chosen to fill the original's length.
+  * Duration. Phrases are chosen to roughly fill the requested length.
 """
 
 import hashlib
 import logging
 import os
 import random
-import shutil
 import subprocess
-import uuid
+import tempfile
+import threading
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
+VOICE_DECOY_GENERATOR_VERSION = "xtts-v2-voice-v2"
 
 # Pool of generic security-context phrases.
 # Each decoy picks one at random — caller hears a convincingly voiced fake message.
@@ -48,10 +46,10 @@ _DECOY_PHRASES = [
 # Roughly how long one phrase takes to speak, for filling a target duration.
 _SECONDS_PER_PHRASE = 3.5
 
-# Lazy-loaded TTS engine — first call takes ~30s to download model
+# Lazy-loaded TTS engine; the first call may download the model.
 _tts_engine: Optional[object] = None
 _tts_available = True  # set False on first import failure
-_piper_voice: Optional[str] = None  # path to a .onnx voice model, if found
+_tts_lock = threading.Lock()
 
 
 def _rng(seed: Optional[str]) -> random.Random:
@@ -66,9 +64,9 @@ def _probe_duration(path: str) -> Optional[float]:
         out = subprocess.check_output([
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", path
-        ], stderr=subprocess.DEVNULL)
+        ], stderr=subprocess.DEVNULL, timeout=15)
         return float(out.decode().strip())
-    except Exception:
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
@@ -94,162 +92,65 @@ def _get_tts():
     try:
         from TTS.api import TTS  # type: ignore
         # XTTS-v2 is multilingual and clones voice from a single sample
-        _tts_engine = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
+        _tts_engine = TTS("tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=False).to("cpu")
         logger.info("[voice_decoy] XTTS-v2 model loaded")
         return _tts_engine
     except Exception as e:
-        logger.warning(f"[voice_decoy] TTS unavailable ({e}), trying piper")
+        logger.error("[voice_decoy] XTTS-v2 unavailable: %s", e)
         _tts_available = False
         return None
 
 
+def normalize_voice_sample(source_path: str, wav_path: str) -> bool:
+    """Decode Android AAC or desktop WebM into a mono WAV XTTS can read."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", source_path, "-vn", "-t", "30",
+             "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", wav_path],
+            capture_output=True, timeout=45,
+        )
+        if result.returncode == 0 and os.path.getsize(wav_path) > 1024:
+            return True
+        logger.error("[voice_decoy] Sample conversion failed: %s", result.stderr.decode(errors="replace")[-500:])
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.error("[voice_decoy] Sample conversion failed: %s", exc)
+    return False
+
+
 def _to_m4a(wav_path: str, output_path: str) -> bool:
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", wav_path, "-c:a", "aac", "-b:a", "64k", output_path],
-        capture_output=True,
-    )
-    if os.path.exists(wav_path):
-        os.remove(wav_path)
-    return os.path.exists(output_path)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", wav_path, "-c:a", "aac",
+             "-b:a", "64k", output_path],
+            capture_output=True, timeout=45,
+        )
+        return result.returncode == 0 and os.path.getsize(output_path) > 1024
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _generate_tts_decoy(source_path: str, output_path: str, text: str) -> bool:
     """XTTS-v2: synthesise the fake phrases in the sender's cloned voice."""
-    tts = _get_tts()
-    if tts is None:
-        return False
-    try:
-        wav_path = output_path.replace(".m4a", ".wav")
-        tts.tts_to_file(
-            text=text,
-            speaker_wav=source_path,
-            language="en",
-            file_path=wav_path,
-        )
-        if not os.path.exists(wav_path):
+    with _tts_lock:
+        tts = _get_tts()
+        if tts is None:
             return False
-        return _to_m4a(wav_path, output_path)
-    except Exception as e:
-        logger.error(f"[voice_decoy] TTS synthesis failed: {e}")
-        return False
-
-
-def _find_piper_voice() -> Optional[str]:
-    """Locate a piper .onnx voice model, if one is installed."""
-    global _piper_voice
-    if _piper_voice is not None:
-        return _piper_voice or None
-    search = [
-        os.getenv("PIPER_VOICE", ""),
-        "/usr/share/piper-voices",
-        "/opt/piper/voices",
-        os.path.expanduser("~/.local/share/piper-voices"),
-        "piper_voices",
-    ]
-    for entry in search:
-        if not entry:
-            continue
-        if entry.endswith(".onnx") and os.path.exists(entry):
-            _piper_voice = entry
-            return entry
-        if os.path.isdir(entry):
-            for root, _, files in os.walk(entry):
-                for f in files:
-                    if f.endswith(".onnx"):
-                        _piper_voice = os.path.join(root, f)
-                        return _piper_voice
-    _piper_voice = ""
-    return None
-
-
-def _generate_piper_decoy(output_path: str, text: str) -> bool:
-    """
-    Piper: coherent speech in a generic voice. Not the sender's voice, but a
-    listener hears real sentences rather than scrambled noise — which is the
-    whole point of a decoy.
-    """
-    if not shutil.which("piper"):
-        return False
-    voice = _find_piper_voice()
-    if not voice:
-        logger.warning("[voice_decoy] piper installed but no .onnx voice found")
-        return False
-    wav_path = output_path.replace(".m4a", ".wav")
-    try:
-        subprocess.run(
-            ["piper", "--model", voice, "--output_file", wav_path],
-            input=text.encode(), capture_output=True, timeout=60,
-        )
-        if not os.path.exists(wav_path):
-            return False
-        return _to_m4a(wav_path, output_path)
-    except Exception as e:
-        logger.error(f"[voice_decoy] piper synthesis failed: {e}")
-        return False
-
-
-def _generate_ffmpeg_decoy(source_path: str, output_path: str, rng: random.Random) -> bool:
-    """Fallback: slice + shuffle + pitch-shift segments of the source file."""
-    temp_prefix = f"temp_{uuid.uuid4().hex}"
-    segments = []
-    try:
-        duration = _probe_duration(source_path)
-        if not duration:
-            return False
-
-        num_segments = rng.randint(4, 6)
-        seg_duration = duration / num_segments
-
-        for i in range(num_segments):
-            seg_file = f"{temp_prefix}_seg_{i}.m4a"
-            start = i * seg_duration
-            tempo = rng.uniform(0.85, 1.25)
-            filter_chain = f"atempo={tempo}"
-            if rng.random() > 0.5:
-                filter_chain += ",asetrate=44100*1.2,atempo=0.83"
-
-            cmd = [
-                "ffmpeg", "-y", "-i", source_path,
-                "-ss", str(start), "-t", str(seg_duration),
-                "-filter:a", filter_chain,
-                "-vn", seg_file
-            ]
-            subprocess.run(cmd, capture_output=True)
-            if os.path.exists(seg_file):
-                segments.append(seg_file)
-
-        if not segments:
-            return False
-
-        rng.shuffle(segments)
-
-        concat_list = f"{temp_prefix}_list.txt"
-        with open(concat_list, "w") as f:
-            for s in segments:
-                f.write(f"file '{os.path.abspath(s)}'\n")
-
-        cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_list, "-c", "copy", output_path
-        ]
-        subprocess.run(cmd, capture_output=True)
-
-        for s in segments:
-            os.remove(s)
-        os.remove(concat_list)
-
-        return os.path.exists(output_path)
-
-    except Exception as e:
-        logger.error(f"[voice_decoy] ffmpeg fallback failed: {e}")
-        for i in range(10):
-            p = f"{temp_prefix}_seg_{i}.m4a"
-            if os.path.exists(p):
-                os.remove(p)
-        concat = f"{temp_prefix}_list.txt"
-        if os.path.exists(concat):
-            os.remove(concat)
-        return False
+        with tempfile.TemporaryDirectory(prefix="dilarion_voice_") as temp_dir:
+            reference_wav = os.path.join(temp_dir, "reference.wav")
+            generated_wav = os.path.join(temp_dir, "generated.wav")
+            if not normalize_voice_sample(source_path, reference_wav):
+                return False
+            try:
+                tts.tts_to_file(
+                    text=text, speaker_wav=reference_wav, language="en",
+                    file_path=generated_wav,
+                )
+                if not os.path.exists(generated_wav):
+                    return False
+                return _to_m4a(generated_wav, output_path)
+            except Exception as e:
+                logger.error("[voice_decoy] XTTS synthesis failed: %s", e)
+                return False
 
 
 def generate_voice_decoy(
@@ -262,8 +163,8 @@ def generate_voice_decoy(
     Generate a decoy voice note.
 
     `seed` (pass the media_id) makes the result reproducible: the same note must
-    always decoy to the same words. `target_duration` matches the original's
-    length; when omitted it is probed from `source_path`.
+    always decoy to the same words. When `target_duration` is omitted, the
+    enrollment sample length is used as an approximation.
 
     Returns True if `output_path` now holds playable audio.
     """
@@ -276,16 +177,7 @@ def generate_voice_decoy(
         target_duration = _probe_duration(source_path)
     text = " ".join(_pick_phrases(rng, target_duration))
 
-    # Tier 1: cloned voice, real sentences.
-    if _generate_tts_decoy(source_path, output_path, text):
-        logger.info("[voice_decoy] AI-cloned decoy generated")
-        return True
-
-    # Tier 2: generic voice, real sentences.
-    if _generate_piper_decoy(output_path, text):
-        logger.info("[voice_decoy] piper decoy generated")
-        return True
-
-    # Tier 3: sender's voice, no meaning.
-    logger.info("[voice_decoy] Using ffmpeg scramble fallback")
-    return _generate_ffmpeg_decoy(source_path, output_path, rng)
+    generated = _generate_tts_decoy(source_path, output_path, text)
+    if not generated and os.path.exists(output_path):
+        os.remove(output_path)
+    return generated

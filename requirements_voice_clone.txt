@@ -1,0 +1,3 @@
+# Install separately from the base backend requirements on the server.
+# The maintained Coqui package exposes `from TTS.api import TTS`.
+coqui-tts[cpu,codec]==0.27.5
