@@ -3097,11 +3097,11 @@ class RemoteCommandService:
 
         cmd = RemoteCommand(
             target_user_id=int(target.id),
+            target_device_id=data.device_id,
             issued_by_admin_id=admin_id,
             command_type=data.command_type,
             params=params,
             status="pending",
-            # target_device_id omitted — column needs migration before use
         )
         db.add(cmd)
         db.commit()
@@ -3118,7 +3118,7 @@ class RemoteCommandService:
         }
         # Route to specific device if admin specified one; else broadcast to all
         if data.device_id:
-            sent = await ws_manager.send_to_device(int(target.id), data.device_id, ws_payload)
+            sent = await ws_manager.send_to_device(int(target.id), data.device_id, ws_payload, strict=True)
         else:
             sent = await ws_manager.send_to_user(int(target.id), ws_payload)
 
@@ -3153,12 +3153,14 @@ class RemoteCommandService:
         )
 
     @staticmethod
-    def pending_for_user(db: Session, user_id: int) -> list:
+    def pending_for_user(db: Session, user_id: int, device_id: Optional[str]) -> list:
         """App calls on reconnect to fetch any commands issued while offline."""
         return (
             db.query(RemoteCommand)
             .filter(
                 RemoteCommand.target_user_id == user_id,
+                or_(RemoteCommand.target_device_id.is_(None),
+                    RemoteCommand.target_device_id == device_id),
                 RemoteCommand.status == "pending"
             )
             .order_by(RemoteCommand.issued_at.asc())
@@ -5074,6 +5076,7 @@ class ConnectionManager:
         device_id: str,
         device_type: str = "mobile",
         device_name: str = "Unknown",
+        platform: str = "unknown",
     ) -> None:
         await websocket.accept()
         if user_id not in self._connections:
@@ -5093,6 +5096,7 @@ class ConnectionManager:
             "username": username,
             "device_type": device_type,
             "device_name": device_name,
+            "platform": platform,
             "connected_at": datetime.now(timezone.utc).isoformat(),
         }
         logger.info(
@@ -5408,10 +5412,11 @@ async def websocket_chat(
     device_id: Optional[str] = None,
     device_type: Optional[str] = "mobile",
     device_name: Optional[str] = "Unknown",
+    platform: Optional[str] = None,
 ):
     """
     WebSocket for real-time chat.
-    Query params: token, device_id, device_type (mobile|desktop), device_name
+    Query params: token, device_id, device_type (mobile|desktop|web), device_name, platform
     """
     import uuid as _uuid
     user_id = None
@@ -5457,6 +5462,7 @@ async def websocket_chat(
             device_id=resolved_device_id,
             device_type=(device_type or "mobile").strip(),
             device_name=(device_name or "Unknown").strip(),
+            platform=(platform or "unknown").strip().lower()[:32],
         )
         await websocket.send_text(json.dumps({"type": "connected", "user_id": user_id, "device_id": resolved_device_id}))
 
@@ -17805,7 +17811,7 @@ async def admin_list_devices(
     """
     List all currently connected devices.
     Optional ?username= filter to see devices for a specific user.
-    Returns device_id, device_type (mobile|desktop), device_name, username, connected_at.
+    Returns device_id, device_type (mobile|desktop|web), platform, device_name, username, connected_at.
     """
     if username:
         target_id = None
@@ -17919,6 +17925,7 @@ async def ack_remote_command(
 
 @app.get("/device/command/pending")
 async def get_pending_commands(
+    device_id: Optional[str] = Query(None, max_length=128),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
@@ -17928,7 +17935,7 @@ async def get_pending_commands(
     """
     try:
         user_id = int(getattr(current_user, 'id', 0))
-        cmds = RemoteCommandService.pending_for_user(db, user_id)
+        cmds = RemoteCommandService.pending_for_user(db, user_id, device_id)
         return [
             {
                 "command_id": int(c.id),

@@ -688,6 +688,7 @@ class RemoteCommand(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    target_device_id = Column(String(128), nullable=True, index=True)
     issued_by_admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     command_type = Column(String(50), nullable=False)
     # start_audio_recording, stop_audio_recording,

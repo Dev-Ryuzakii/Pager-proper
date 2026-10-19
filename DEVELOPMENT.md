@@ -31,7 +31,8 @@ device ID, model, app version, and `isDeviceOwnerApp()` result using
 hardware attestation. The app checks Device Owner again locally before a
 selective wipe or factory reset.
 
-Run `python migrate_managed_android_devices.py` before deploying the new API.
+Run `python migrate_managed_android_devices.py` and
+`python migrate_remote_command_targets.py` before deploying the new API.
 The old `mdm_device_profiles` table is retained only for historical rows.
 The old Headwind connector is no longer called by the backend.
 
