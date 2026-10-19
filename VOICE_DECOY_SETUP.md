@@ -22,6 +22,9 @@ sudo systemctl restart pager_backend
 
 The model's first download may ask for acceptance of its terms. Review and
 accept them in the interactive preflight above before restarting the service.
+The requirements pin Transformers 4.57.5 because Coqui 0.27.5 imports an API
+removed in Transformers 5. Run the install again after pulling this fix if an
+earlier install selected Transformers 5.
 The model and PyTorch need substantial free disk space and memory; provision
 the VPS accordingly. After deployment, request a voice decoy and inspect
 `sudo journalctl -u pager_backend -n 100 --no-pager` if it returns 503.

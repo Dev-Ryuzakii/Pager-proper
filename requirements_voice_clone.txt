@@ -1,3 +1,5 @@
 # Install separately from the base backend requirements on the server.
 # The maintained Coqui package exposes `from TTS.api import TTS`.
 coqui-tts[cpu,codec]==0.27.5
+# Coqui imports isin_mps_friendly, which transformers 5 removed.
+transformers==4.57.5
