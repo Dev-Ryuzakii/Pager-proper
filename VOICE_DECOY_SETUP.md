@@ -25,6 +25,9 @@ accept them in the interactive preflight above before restarting the service.
 The requirements pin Transformers 4.57.5 because Coqui 0.27.5 imports an API
 removed in Transformers 5. Run the install again after pulling this fix if an
 earlier install selected Transformers 5.
+They also restore the AnyIO and h11 versions required by this backend's
+existing FastAPI and httpcore packages. Check `python -m pip check` after the
+install before restarting the service.
 The model and PyTorch need substantial free disk space and memory; provision
 the VPS accordingly. After deployment, request a voice decoy and inspect
 `sudo journalctl -u pager_backend -n 100 --no-pager` if it returns 503.

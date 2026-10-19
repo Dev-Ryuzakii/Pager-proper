@@ -3,3 +3,6 @@
 coqui-tts[cpu,codec]==0.27.5
 # Coqui imports isin_mps_friendly, which transformers 5 removed.
 transformers==4.57.5
+# Keep the existing FastAPI 0.104 / httpcore 0.16 environment compatible.
+anyio==3.7.1
+h11==0.14.0
