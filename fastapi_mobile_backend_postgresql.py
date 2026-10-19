@@ -30,7 +30,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, File, Form, UploadFile, Response, Request, WebSocket, WebSocketDisconnect, Body, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 import uvicorn
 from sqlalchemy.orm import Session
@@ -917,11 +917,16 @@ class OnboardingProfile(BaseModel):
     camera_attestation: bool = Field(..., description="Client attests that image came directly from the camera")
 
 class UserLogin(UserAuth):
+    # Android 2.0.2 was minified without Gson keep rules. Its release APK sends
+    # these unannotated fields as a/b/e. Accept them until users can update to
+    # a release that preserves the API model field names.
+    username: str = Field(..., min_length=3, max_length=50, validation_alias=AliasChoices("username", "a"))
+    token: str = Field(..., validation_alias=AliasChoices("token", "b"))
     # Device identity — lets the server keep one signed-in device per
     # platform and tell the account owner exactly who tried to sign in.
     device_id: Optional[str] = Field(None, max_length=128, description="Stable per-install id")
     device_name: Optional[str] = Field(None, max_length=120)
-    platform: Optional[str] = Field(None, max_length=20, description="android | ios | desktop | web")
+    platform: Optional[str] = Field(None, max_length=20, description="android | ios | desktop | web", validation_alias=AliasChoices("platform", "e"))
     location: Optional[str] = Field(None, max_length=200, description="Optional client-reported location, e.g. 'Lagos, Nigeria'")
 
 # 90 days — longest group disappearing-message timer a client can pick.
