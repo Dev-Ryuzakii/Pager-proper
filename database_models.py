@@ -503,7 +503,7 @@ class Media(Base):
         return f"<Media(media_id='{self.media_id}', filename='{self.filename}', type='{self.media_type}')>"
 
 class MDMDeviceProfile(Base):
-    """MDM Profile linking a User to their Headwind MDM Device"""
+    """Legacy Headwind profile retained for existing database rows."""
     __tablename__ = "mdm_device_profiles"
     
     id = Column(Integer, primary_key=True, index=True)
@@ -528,6 +528,21 @@ class MDMDeviceProfile(Base):
     
     def __repr__(self):
         return f"<MDMDeviceProfile(user_id={self.user_id}, hw_id='{self.headwind_device_id}', status='{self.enrollment_status}')>"
+
+
+class ManagedAndroidDevice(Base):
+    """Dilarion app's reported management state for one Android installation."""
+    __tablename__ = "managed_android_devices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(String(128), unique=True, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    device_name = Column(String(120), nullable=True)
+    is_device_owner = Column(Boolean, nullable=False, default=False)
+    android_sdk = Column(Integer, nullable=True)
+    app_version = Column(String(40), nullable=True)
+    registered_at = Column(DateTime, default=func.now(), nullable=False)
+    last_seen_at = Column(DateTime, default=func.now(), nullable=False)
 
 class LinkedDevice(Base):
     """A device linked to a user account, each with its own E2E identity key.

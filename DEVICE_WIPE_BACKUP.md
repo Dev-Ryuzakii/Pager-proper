@@ -48,7 +48,6 @@ call and cannot attest completion from inside that process. A factory reset
 likewise records `executing` before calling `wipeDevice` or `wipeData` and
 requires re-enrollment or another external check to confirm completion.
 
-The separate Headwind connector remains available for enrollment, but its
-factory-reset endpoint is not used in this backup-first flow. Its existing
-command URL must be checked against the specific Headwind edition and server
-version before treating it as a working wipe mechanism.
+Dilarion is the Android Device Owner for selective and factory wipes. It must
+be provisioned as such during setup; see [DEVELOPMENT.md](DEVELOPMENT.md).
+The backend does not call Headwind for enrollment or wipe.

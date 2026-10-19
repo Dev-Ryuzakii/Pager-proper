@@ -67,7 +67,7 @@ if os.path.exists('.env'):
 # Import required modules
 from database_config import get_database_session, db_config
 from database_models import ServiceEvent, UptimeTarget, BlockedApp, PolicyViolationScreenshot
-from database_models import User, Organization, OrganizationAccessRequest, OrgAnnouncement, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, GoogleCalendarEventLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, TaskMemberReportRevision, ChatSettings, HiddenMessage
+from database_models import User, Organization, OrganizationAccessRequest, OrgAnnouncement, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, ManagedAndroidDevice, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, GoogleCalendarEventLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, TaskMemberReportRevision, ChatSettings, HiddenMessage
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
 from voice_scrambler import generate_voice_decoy
@@ -3394,6 +3394,7 @@ class DeviceWipeService:
         target_packages: Optional[list],
         trigger_source: str,
         requested_by_user_id: int,
+        requested_device_id: Optional[str] = None,
     ) -> DeviceWipeCommand:
         """SOS and geofence-exit both land here instead of wiping directly — no
         backup request or device wipe until an authorized approver acts on it.
@@ -3404,6 +3405,7 @@ class DeviceWipeService:
             db, target_user_id, reason, wipe_mode, target_packages, batch_id=None,
             trigger_source=trigger_source, requested_by_user_id=requested_by_user_id,
             issued_by_admin_id=None, status="awaiting_approval",
+            requested_device_id=requested_device_id,
         )
 
     @staticmethod
@@ -19428,63 +19430,63 @@ if __name__ == "__main__":
     )
 
 # ==========================================
-# MDM (Mobile Device Management) INTEGRATION
+# Dilarion-managed Android devices
 # ==========================================
 
-import httpx
-
-MDM_MICROSERVICE_URL = os.getenv("MDM_MICROSERVICE_URL", "http://localhost:8001")
-
-class MDMEnrollRequest(BaseModel):
-    headwind_device_id: str
-    imei: Optional[str] = None
+class ManagedDeviceRegistration(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=128)
+    device_name: Optional[str] = Field(None, max_length=120)
+    is_device_owner: bool
+    android_sdk: Optional[int] = None
+    app_version: Optional[str] = Field(None, max_length=40)
 
 class MDMWipeRequest(BaseModel):
     user_id: Optional[int] = None
+    device_id: str = Field(..., min_length=1, max_length=128)
     reason: str = "Security Trigger"
 
-@app.post("/api/v1/mdm/enroll")
-async def mdm_enroll(
-    request: MDMEnrollRequest,
+@app.post("/api/v1/mdm/devices")
+async def register_managed_android_device(
+    request: ManagedDeviceRegistration,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
-    """Enroll the current user device into the MDM system"""
-    # Check if profile already exists
-    profile = db.query(MDMDeviceProfile).filter(MDMDeviceProfile.user_id == current_user.id).first()
-    
-    if profile:
-        profile.headwind_device_id = request.headwind_device_id
-        profile.imei = request.imei
-        profile.enrollment_status = "enrolled"
-    else:
-        profile = MDMDeviceProfile(
-            user_id=current_user.id,
-            headwind_device_id=request.headwind_device_id,
-            imei=request.imei,
-            enrollment_status="enrolled"
-        )
-        db.add(profile)
-    
-    # Confirm upstream enrollment before recording this profile as enrolled.
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{MDM_MICROSERVICE_URL}/mdm/enroll",
-                json={"device_id": request.headwind_device_id, "imei": request.imei, "user_id": current_user.id},
-                headers={"X-MDM-Connector-Token": os.getenv("MDM_CONNECTOR_TOKEN", "")},
-                timeout=5.0
-            )
-            resp.raise_for_status()
-            upstream = resp.json()
-            if upstream.get("status") != "enrolled":
-                raise ValueError("Connector did not confirm enrollment")
-            db.commit()
-            return {"status": "enrolled", "microservice_response": upstream}
-    except Exception as e:
-        db.rollback()
-        logger.error(f"MDM enrollment failed: {e}")
-        raise HTTPException(status_code=502, detail="MDM enrollment was not confirmed")
+    """Record Android's locally reported Device Owner state for this login."""
+    device = db.query(ManagedAndroidDevice).filter(
+        ManagedAndroidDevice.device_id == request.device_id).first()
+    if device and device.user_id != current_user.id:
+        raise HTTPException(status_code=409, detail="Device is registered to another user")
+    if device is None:
+        device = ManagedAndroidDevice(device_id=request.device_id, user_id=current_user.id)
+        db.add(device)
+    device.device_name = request.device_name
+    device.is_device_owner = request.is_device_owner
+    device.android_sdk = request.android_sdk
+    device.app_version = request.app_version
+    device.last_seen_at = datetime.utcnow()
+    db.commit()
+    return {"device_id": request.device_id,
+            "management_status": "device_owner_reported" if request.is_device_owner else "app_only"}
+
+@app.get("/admin/mdm/devices")
+async def list_managed_android_devices(
+    username: Optional[str] = None,
+    admin_user: User = Depends(get_admin_only),
+    db: Session = Depends(get_database_session),
+):
+    query = db.query(ManagedAndroidDevice)
+    if username:
+        target = db.query(User).filter(User.username == username).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+        query = query.filter(ManagedAndroidDevice.user_id == target.id)
+    devices = query.order_by(
+        ManagedAndroidDevice.last_seen_at.desc()).limit(500).all()
+    return [{"device_id": d.device_id, "user_id": d.user_id,
+             "device_name": d.device_name, "is_device_owner_reported": d.is_device_owner,
+             "android_sdk": d.android_sdk, "app_version": d.app_version,
+             "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None}
+            for d in devices]
 
 @app.post("/api/v1/mdm/wipe")
 async def mdm_wipe(
@@ -19499,17 +19501,21 @@ async def mdm_wipe(
     if target_user_id != current_user.id and not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Not authorized to wipe this device")
         
-    profile = db.query(MDMDeviceProfile).filter(MDMDeviceProfile.user_id == target_user_id).first()
-    if not profile or not profile.headwind_device_id:
-        raise HTTPException(status_code=404, detail="MDM profile not found for user")
+    device = db.query(ManagedAndroidDevice).filter(
+        ManagedAndroidDevice.user_id == target_user_id,
+        ManagedAndroidDevice.device_id == request.device_id,
+        ManagedAndroidDevice.is_device_owner == True,
+    ).first()
+    if not device:
+        raise HTTPException(status_code=409, detail="Device has not reported Device Owner status")
     if current_user.is_admin:
         cmd = await DeviceWipeService._issue_wipe_for_user(
             db, int(current_user.id), int(target_user_id), request.reason,
-            wipe_mode="factory_reset",
+            wipe_mode="factory_reset", requested_device_id=request.device_id,
         )
     else:
         cmd = DeviceWipeService.request_approval(
             db, int(target_user_id), request.reason, "factory_reset", None,
-            "sos", int(current_user.id),
+            "sos", int(current_user.id), requested_device_id=request.device_id,
         )
     return {"status": cmd.status, "wipe_id": int(cmd.id)}
