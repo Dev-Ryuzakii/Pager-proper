@@ -1,5 +1,5 @@
 """
-Voice decoy generator using XTTS-v2.
+Voice decoy generator using Chatterbox Nano.
 
 The enrollment recording is only a speaker reference. Never return or remix
 its audio as a decoy; if synthesis is unavailable, report failure.
@@ -21,7 +21,7 @@ import threading
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
-VOICE_DECOY_GENERATOR_VERSION = "xtts-v2-voice-v2"
+VOICE_DECOY_GENERATOR_VERSION = "chatterbox-nano-voice-v1"
 
 # Pool of generic security-context phrases.
 # Each decoy picks one at random — caller hears a convincingly voiced fake message.
@@ -46,9 +46,6 @@ _DECOY_PHRASES = [
 # Roughly how long one phrase takes to speak, for filling a target duration.
 _SECONDS_PER_PHRASE = 3.5
 
-# Lazy-loaded TTS engine; the first call may download the model.
-_tts_engine: Optional[object] = None
-_tts_available = True  # set False on first import failure
 _tts_lock = threading.Lock()
 
 
@@ -83,29 +80,15 @@ def _pick_phrases(rng: random.Random, target_duration: Optional[float]) -> List[
     return pool[:count]
 
 
-def _get_tts():
-    global _tts_engine, _tts_available
-    if not _tts_available:
-        return None
-    if _tts_engine is not None:
-        return _tts_engine
-    try:
-        from TTS.api import TTS  # type: ignore
-        # XTTS-v2 is multilingual and clones voice from a single sample
-        _tts_engine = TTS("tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=False).to("cpu")
-        logger.info("[voice_decoy] XTTS-v2 model loaded")
-        return _tts_engine
-    except Exception as e:
-        logger.error("[voice_decoy] XTTS-v2 unavailable: %s", e)
-        _tts_available = False
-        return None
-
-
 def normalize_voice_sample(source_path: str, wav_path: str) -> bool:
-    """Decode Android AAC or desktop WebM into a mono WAV XTTS can read."""
+    """Decode Android AAC or desktop WebM into a mono WAV for cloning."""
     try:
+        # Nano requires a reference longer than five seconds. Repeating a
+        # short enrollment clip keeps previously enrolled users functional.
+        duration = _probe_duration(source_path)
+        input_args = ["-stream_loop", "-1"] if duration and duration < 6 else []
         result = subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", source_path, "-vn", "-t", "30",
+            ["ffmpeg", "-y", "-v", "error", *input_args, "-i", source_path, "-vn", "-t", "30" if not input_args else "6",
              "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", wav_path],
             capture_output=True, timeout=45,
         )
@@ -129,27 +112,33 @@ def _to_m4a(wav_path: str, output_path: str) -> bool:
         return False
 
 
+def _run_voice_worker(command: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(command, capture_output=True, timeout=600)
+
+
 def _generate_tts_decoy(source_path: str, output_path: str, text: str) -> bool:
-    """XTTS-v2: synthesise the fake phrases in the sender's cloned voice."""
+    """Generate new speech in an isolated Chatterbox Python environment."""
     with _tts_lock:
-        tts = _get_tts()
-        if tts is None:
-            return False
         with tempfile.TemporaryDirectory(prefix="dilarion_voice_") as temp_dir:
             reference_wav = os.path.join(temp_dir, "reference.wav")
             generated_wav = os.path.join(temp_dir, "generated.wav")
             if not normalize_voice_sample(source_path, reference_wav):
                 return False
             try:
-                tts.tts_to_file(
-                    text=text, speaker_wav=reference_wav, language="en",
-                    file_path=generated_wav,
+                voice_python = os.environ.get(
+                    "VOICE_CLONE_PYTHON",
+                    os.path.join(os.path.dirname(__file__), "voice_venv", "bin", "python"),
                 )
-                if not os.path.exists(generated_wav):
+                worker = os.path.join(os.path.dirname(__file__), "voice_decoy_worker.py")
+                result = _run_voice_worker([voice_python, worker, reference_wav, generated_wav, text])
+                if result.returncode != 0:
+                    logger.error("[voice_decoy] Chatterbox worker failed: %s", result.stderr.decode(errors="replace")[-2000:])
+                    return False
+                if not os.path.exists(generated_wav) or os.path.getsize(generated_wav) <= 1024:
                     return False
                 return _to_m4a(generated_wav, output_path)
-            except Exception as e:
-                logger.error("[voice_decoy] XTTS synthesis failed: %s", e)
+            except (OSError, subprocess.SubprocessError) as e:
+                logger.error("[voice_decoy] Chatterbox synthesis failed: %s", e)
                 return False
 
 

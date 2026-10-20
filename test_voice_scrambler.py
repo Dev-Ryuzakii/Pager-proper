@@ -13,20 +13,22 @@ from unittest.mock import patch
 import voice_scrambler
 
 
-class FakeTts:
-    def tts_to_file(self, *, text, speaker_wav, language, file_path):
-        assert text and language == "en"
-        with wave.open(speaker_wav, "rb") as reference:
-            assert reference.getnchannels() == 1
-            assert reference.getframerate() == 24000
-        with wave.open(file_path, "wb") as output:
-            output.setnchannels(1)
-            output.setsampwidth(2)
-            output.setframerate(24000)
-            output.writeframes(b"".join(
-                struct.pack("<h", int(8000 * math.sin(2 * math.pi * 880 * i / 24000)))
-                for i in range(24000)
-            ))
+def fake_voice_worker(command, **kwargs):
+    _, _, speaker_wav, file_path, text = command
+    assert text
+    with wave.open(speaker_wav, "rb") as reference:
+        assert reference.getnchannels() == 1
+        assert reference.getframerate() == 24000
+        assert reference.getnframes() / reference.getframerate() > 5
+    with wave.open(file_path, "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(24000)
+        output.writeframes(b"".join(
+            struct.pack("<h", int(8000 * math.sin(2 * math.pi * 880 * i / 24000)))
+            for i in range(24000)
+        ))
+    return subprocess.CompletedProcess(command, 0, b"", b"")
 
 
 class VoiceScramblerTests(unittest.TestCase):
@@ -51,7 +53,7 @@ class VoiceScramblerTests(unittest.TestCase):
 
     def test_missing_clone_engine_never_replays_enrollment_audio(self):
         output = str(Path(self.temp.name) / "decoy.m4a")
-        with patch.object(voice_scrambler, "_get_tts", return_value=None):
+        with patch.object(voice_scrambler, "_run_voice_worker", side_effect=FileNotFoundError("worker missing")):
             self.assertFalse(voice_scrambler.generate_voice_decoy(
                 self.source, output, seed="voice-1", target_duration=8,
             ))
@@ -59,7 +61,7 @@ class VoiceScramblerTests(unittest.TestCase):
 
     def test_synthesized_speech_is_encoded_as_new_audio(self):
         output = str(Path(self.temp.name) / "decoy.m4a")
-        with patch.object(voice_scrambler, "_get_tts", return_value=FakeTts()):
+        with patch.object(voice_scrambler, "_run_voice_worker", side_effect=fake_voice_worker):
             self.assertTrue(voice_scrambler.generate_voice_decoy(
                 self.source, output, seed="voice-2", target_duration=8,
             ))

@@ -1,37 +1,48 @@
 # Voice decoy cloning on the backend
 
-The voice decoy endpoint uses XTTS-v2 to speak new text in the sender's
-enrolled voice. The enrollment recording is only a speaker reference. A
-missing or failing model now returns HTTP 503 instead of replaying pieces of
-the recording. Android AAC and desktop WebM samples are normalized to WAV.
+Voice decoys use [Chatterbox Nano](https://huggingface.co/ResembleAI/chatterbox-nano)
+to synthesize new English speech from the sender's enrolled voice. The model
+is MIT licensed. The enrollment recording is used only as a speaker reference.
+If synthesis fails, the endpoint returns HTTP 503. Existing scrambled decoys
+are bypassed by the updated cache key.
 
-On the VPS, from `~/Pager-proper`:
+The voice model requires dependencies that conflict with the backend's pinned
+FastAPI dependencies. Install it in its own virtual environment. On the VPS:
 
 ```bash
+cd ~/Pager-proper
+git pull --ff-only origin main
 sudo apt-get update
 sudo apt-get install -y ffmpeg
-source venv/bin/activate
-python -m pip install -r requirements_voice_clone.txt
-python - <<'PY'
-from TTS.api import TTS
-TTS("tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=False).to("cpu")
-print("XTTS-v2 model ready")
-PY
+python3 -m venv voice_venv
+voice_venv/bin/python -m pip install --upgrade pip
+voice_venv/bin/python -m pip install -r requirements_voice_clone.txt
+voice_venv/bin/python -m pip check
+```
+
+The first generation downloads the model. Test it before restarting the
+backend; use a real enrolled sample as the reference, substituting its path:
+
+```bash
+voice_venv/bin/python voice_decoy_worker.py /path/to/enrolled-sample.wav /tmp/voice-decoy-test.wav 'This is a voice cloning test.'
+ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 /tmp/voice-decoy-test.wav
 sudo systemctl restart pager_backend
 ```
 
-The model's first download may ask for acceptance of its terms. Review and
-accept them in the interactive preflight above before restarting the service.
-The requirements pin Transformers 4.57.5 because Coqui 0.27.5 imports an API
-removed in Transformers 5. Run the install again after pulling this fix if an
-earlier install selected Transformers 5.
-They also restore the AnyIO and h11 versions required by this backend's
-existing FastAPI and httpcore packages. Check `python -m pip check` after the
-install before restarting the service.
-The model and PyTorch need substantial free disk space and memory; provision
-the VPS accordingly. After deployment, request a voice decoy and inspect
-`sudo journalctl -u pager_backend -n 100 --no-pager` if it returns 503.
+The worker expects a WAV sample. If the enrolled sample is AAC or WebM,
+convert it first with `ffmpeg -i SAMPLE -ac 1 -ar 24000 /tmp/reference.wav`.
+The backend performs this conversion automatically for normal requests.
 
-Previously cached scrambled decoys are bypassed automatically by the new
-versioned cache key. Existing enrolled samples can be decoded on demand, so
-users do not need to record again unless the original upload was corrupt.
+If the earlier Coqui installation changed the backend virtual environment,
+remove its packages and restore the backend dependencies independently:
+
+```bash
+venv/bin/python -m pip uninstall -y coqui-tts httpx2 httpcore2
+venv/bin/python -m pip check
+```
+
+The first request may be slow because the CPU model loads for each generated
+decoy. Subsequent requests for the same voice note use the cached audio. If
+generation returns 503, inspect `sudo journalctl -u pager_backend -n 100
+--no-pager` for the worker error. Ensure the service user can read `voice_venv`
+and write the decoy cache.

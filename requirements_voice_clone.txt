@@ -1,8 +1,3 @@
-# Install separately from the base backend requirements on the server.
-# The maintained Coqui package exposes `from TTS.api import TTS`.
-coqui-tts[cpu,codec]==0.27.5
-# Coqui imports isin_mps_friendly, which transformers 5 removed.
-transformers==4.57.5
-# Keep the existing FastAPI 0.104 / httpcore 0.16 environment compatible.
-anyio==3.7.1
-h11==0.14.0
+# Install only inside voice_venv, not the backend venv. The released 0.1.7
+# wheel lacks Nano support; this upstream commit includes nano=True.
+chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git@5de7a54aa4e5e2baadb0182dde554908b48b85c2
