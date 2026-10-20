@@ -67,7 +67,7 @@ if os.path.exists('.env'):
 
 # Import required modules
 from database_config import get_database_session, db_config
-from database_models import ServiceEvent, UptimeTarget, BlockedApp, PolicyViolationScreenshot
+from database_models import ServiceEvent, UptimeTarget, BlockedApp, PolicyViolationScreenshot, EmailDeliveryLog
 from database_models import User, Organization, OrganizationAccessRequest, OrgAnnouncement, Message, UserKey, UserSession, AuditLog, MasterToken as DBMasterToken, Media, Call, Group, GroupMember, GroupMessageRead, EmergencyAlert, MonitoringConsent, MonitoringSession, AudioRecording, VideoRecording, LocationTrack, DeviceWipeCommand, GeofenceZone, GeofenceEvent, DeadMansSwitch, RemoteCommand, ConferenceSession, ConferenceParticipant, CommandAuditLog, MDMDeviceProfile, ManagedAndroidDevice, LinkedDevice, DeviceLinkRequest, Meeting, MeetingParticipant, MeetingRecording, MessageReaction, StarredMessage, RetentionPolicy, Webhook, AccountDeletionRequest, PasswordResetRequest, PersonalPlan, GoogleCalendarLink, GoogleCalendarEventLink, Task, TaskAssignee, TaskGroup, TaskGroupMember, TaskMemberReportRevision, ChatSettings, HiddenMessage
 from fake_text_generator import FakeTextGenerator
 from watermark_media import apply_watermark
@@ -473,13 +473,48 @@ def _build_email(to_email: str, subject: str, text_body: str, html_body: Optiona
     return msg
 
 
+def _email_log_status(log_id: int, status: str, failure_reason: Optional[str] = None) -> None:
+    session = db_config.get_session()
+    if session is None:
+        raise RuntimeError("Email log database unavailable")
+    try:
+        entry = session.get(EmailDeliveryLog, log_id)
+        if entry is None:
+            raise RuntimeError("Email log record missing")
+        entry.status = status
+        entry.failure_reason = failure_reason
+        entry.updated_at = datetime.now(timezone.utc)
+        session.commit()
+    finally:
+        session.close()
+
+
 def _send_email_message(to_email: str, subject: str, text_body: str, html_body: Optional[str] = None) -> bool:
-    """Send via the configured providers in order (cPanel SMTP first, Resend
-    fallback). Returns True as soon as one succeeds; only logs a failure once
-    every provider has been tried."""
+    """Send via configured SMTP, recording whether a server accepted the mail.
+
+    One log entry represents one requested email, even if the configured
+    fallback provider is tried after the primary provider fails.
+    """
+    session = db_config.get_session()
+    if session is None:
+        logger.error("Email not sent: email log database unavailable")
+        return False
+    try:
+        entry = EmailDeliveryLog(recipient=to_email[:255], subject=subject[:500], status="pending")
+        session.add(entry)
+        session.commit()
+        log_id = entry.id
+    except Exception:
+        session.rollback()
+        logger.exception("Email not sent: could not create delivery log")
+        return False
+    finally:
+        session.close()
+
     providers = _email_providers()
     if not providers:
         logger.warning("Email not sent to %s: no SMTP/Resend provider configured", to_email)
+        _email_log_status(log_id, "failed", "No email provider configured")
         return False
 
     last_error = None
@@ -496,6 +531,12 @@ def _send_email_message(to_email: str, subject: str, text_body: str, html_body: 
                     server.starttls(context=ssl_context)
                 server.login(user, password)
                 server.send_message(msg)
+            try:
+                _email_log_status(log_id, "sent")
+            except Exception:
+                # SMTP has already accepted the message. Never retry it just
+                # because the audit update failed; that would duplicate mail.
+                logger.exception("Email accepted but delivery log update failed (id=%s)", log_id)
             logger.info("Transactional email sent via %s (%s) to %s: %s", name, host, to_email, subject)
             return True
         except Exception as exc:  # noqa: BLE001
@@ -503,6 +544,9 @@ def _send_email_message(to_email: str, subject: str, text_body: str, html_body: 
             logger.warning("Email provider %s (%s) failed for %s: %s — trying next", name, host, to_email, exc)
             continue
     logger.error("Email not sent to %s: all providers failed (last: %s)", to_email, last_error)
+    smtp_code = getattr(last_error, "smtp_code", None)
+    reason = f"{type(last_error).__name__}" + (f" (SMTP {smtp_code})" if smtp_code else "")
+    _email_log_status(log_id, "failed", reason[:500])
     return False
 
 
@@ -14302,6 +14346,54 @@ async def admin_test_delivery(
     return {"config": config, "email": email_result, "sms": sms_result}
 
 
+@app.get("/admin/email-logs")
+async def admin_email_logs(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    search: str = Query("", max_length=100),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_admin: User = Depends(get_admin_or_operator),
+    db: Session = Depends(get_database_session),
+):
+    """Outbound mail history for admins and operators; provider details stay private."""
+    if status_filter and status_filter not in {"pending", "sent", "failed"}:
+        raise HTTPException(status_code=400, detail="Invalid email status")
+    query = db.query(EmailDeliveryLog)
+    if status_filter:
+        query = query.filter(EmailDeliveryLog.status == status_filter)
+    if search.strip():
+        escaped_search = search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped_search}%"
+        query = query.filter(or_(
+            EmailDeliveryLog.recipient.ilike(pattern, escape="\\"),
+            EmailDeliveryLog.subject.ilike(pattern, escape="\\"),
+        ))
+    total = query.count()
+    rows = query.order_by(EmailDeliveryLog.created_at.desc(), EmailDeliveryLog.id.desc()).offset(offset).limit(limit).all()
+    today = datetime.now(timezone.utc).date()
+    day_start = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+    tomorrow = day_start + timedelta(days=1)
+    today_counts = dict(
+        db.query(EmailDeliveryLog.status, func.count(EmailDeliveryLog.id))
+        .filter(EmailDeliveryLog.created_at >= day_start, EmailDeliveryLog.created_at < tomorrow)
+        .group_by(EmailDeliveryLog.status)
+        .all()
+    )
+    return {
+        "items": [{
+            "id": row.id,
+            "recipient": row.recipient,
+            "subject": row.subject,
+            "status": row.status,
+            "failure_reason": row.failure_reason,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        } for row in rows],
+        "total": total,
+        "today": {key: int(today_counts.get(key, 0)) for key in ("sent", "failed", "pending")},
+    }
+
+
 # ── Admin master decryption key ─────────────────────────────────────────────
 # Every client also wraps each message's AES key for this key's public half
 # (served at GET /encryption/admin-public-key, fetched the same way a device's
@@ -14670,7 +14762,7 @@ ADMIN_PAGE_KEYS = [
     # picker lists every page here, and an unknown key is rejected outright.
     "organizations", "users", "groups", "emergency", "field-ops",
     "wipe-approvals", "account-deletions", "password-resets", "recordings",
-    "service-health", "uptime", "device-policy", "operators", "audit",
+    "service-health", "email-logs", "uptime", "device-policy", "operators", "audit",
     "kill-switch", "data-purge", "settings",
 ]
 

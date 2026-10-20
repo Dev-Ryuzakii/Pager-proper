@@ -6,7 +6,7 @@ Using SQLAlchemy ORM for data modeling and relationships
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, DateTime, Boolean, LargeBinary, ForeignKey, Float, JSON, UniqueConstraint, Index
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, relationship
 from sqlalchemy.sql import func
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 from dotenv import load_dotenv
 
@@ -15,6 +15,19 @@ load_dotenv()
 
 class Base(DeclarativeBase):
     pass
+
+
+class EmailDeliveryLog(Base):
+    """One record per outbound email; sent means accepted by SMTP, not inbox delivery."""
+    __tablename__ = "email_delivery_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    recipient = Column(String(255), nullable=False, index=True)
+    subject = Column(String(500), nullable=False)
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    failure_reason = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 class User(Base):
     """User account table with authentication and profile data"""
