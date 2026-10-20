@@ -50,8 +50,8 @@ def show_env():
     print("ENVIRONMENT (values masked)")
     print("=" * 64)
     names = [
-        "RESEND_API_KEY", "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME",
-        "SMTP_PASSWORD", "SMTP_FROM", "RESEND_FROM_EMAIL", "SMTP_FROM_NAME",
+        "RESEND_API_KEY", "RESEND_API_KEY_2", "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME",
+        "SMTP_PASSWORD", "SMTP_FROM", "RESEND_FROM_EMAIL", "RESEND_FROM_EMAIL_2", "SMTP_FROM_NAME",
         "SMTP_SSL", "SMTP_STARTTLS", "SMTP_REPLY_TO", "SUPPORT_EMAIL",
         "SENDCHAMP_API_KEY", "SENDCHAMP_BASE_URL", "SENDCHAMP_SENDER_NAME",
         "SENDCHAMP_ROUTE", "SENDCHAMP_DEFAULT_COUNTRY_CODE",
@@ -63,7 +63,7 @@ def show_env():
 
 
 def _email_providers():
-    """Same order the server uses: configured SMTP first, Resend fallback."""
+    """Same configured providers as the server; send test tries each in order."""
     providers = []
     smtp_host = os.getenv("SMTP_HOST")
     smtp_from = os.getenv("SMTP_FROM") or os.getenv("SMTP_FROM_ADDRESS") or os.getenv("SMTP_USERNAME")
@@ -71,13 +71,16 @@ def _email_providers():
         port = int(os.getenv("SMTP_PORT", "465" if smtp_host == "smtp.resend.com" else "587"))
         use_ssl = os.getenv("SMTP_SSL", "1" if port in (465, 2465) else "0") == "1"
         use_starttls = (os.getenv("SMTP_STARTTLS", "0" if use_ssl else "1") == "1") and not use_ssl
-        providers.append(("smtp", smtp_host, port, os.getenv("SMTP_USERNAME"),
+        providers.append(("resend_smtp" if smtp_host == "smtp.resend.com" else "smtp", smtp_host, port, os.getenv("SMTP_USERNAME"),
                           os.getenv("SMTP_PASSWORD"), use_ssl, use_starttls, smtp_from))
-    resend_key = os.getenv("RESEND_API_KEY")
-    resend_from = os.getenv("RESEND_FROM_EMAIL") or smtp_from
-    if resend_key and resend_from and smtp_host != "smtp.resend.com":
-        providers.append(("resend", "smtp.resend.com", 465, "resend",
-                          resend_key, True, False, resend_from))
+    existing_resend_keys = {p[4] for p in providers if p[0].startswith("resend")}
+    for suffix in ("", "_2"):
+        key = os.getenv(f"RESEND_API_KEY{suffix}")
+        from_email = os.getenv(f"RESEND_FROM_EMAIL{suffix}") or (smtp_from if not suffix else None)
+        if key and from_email and key not in existing_resend_keys:
+            providers.append((f"resend{suffix or '_1'}", "smtp.resend.com", 465,
+                              "resend", key, True, False, from_email))
+            existing_resend_keys.add(key)
     return providers
 
 

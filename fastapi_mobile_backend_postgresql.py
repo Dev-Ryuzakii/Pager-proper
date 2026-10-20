@@ -419,10 +419,11 @@ def _email_template(
 
 
 def _email_providers() -> list:
-    """Ordered list of email providers to try. The configured SMTP (e.g. your
-    cPanel mail) is tried first; Resend is the automatic fallback when its API
-    key is set. Each entry: (name, host, port, user, password, use_ssl,
-    use_starttls, from_email)."""
+    """Configured SMTP first, then each distinct Resend account.
+
+    Each entry: (name, host, port, user, password, use_ssl,
+    use_starttls, from_email). Names and credentials stay server-side.
+    """
     providers = []
     smtp_host = os.getenv("SMTP_HOST")
     # Accept SMTP_FROM or the cPanel-style SMTP_FROM_ADDRESS; fall back to the
@@ -433,15 +434,17 @@ def _email_providers() -> list:
         port = int(os.getenv("SMTP_PORT", "465" if smtp_host == "smtp.resend.com" else "587"))
         use_ssl = os.getenv("SMTP_SSL", "1" if port in (465, 2465) else "0") == "1"
         use_starttls = (os.getenv("SMTP_STARTTLS", "0" if use_ssl else "1") == "1") and not use_ssl
-        providers.append(("smtp", smtp_host, port, os.getenv("SMTP_USERNAME"),
+        providers.append(("resend_smtp" if smtp_host == "smtp.resend.com" else "smtp", smtp_host, port, os.getenv("SMTP_USERNAME"),
                           os.getenv("SMTP_PASSWORD"), use_ssl, use_starttls, smtp_from))
 
-    resend_key = os.getenv("RESEND_API_KEY")
-    resend_from = os.getenv("RESEND_FROM_EMAIL") or smtp_from
-    # Add Resend as a fallback unless the primary SMTP already IS Resend.
-    if resend_key and resend_from and smtp_host != "smtp.resend.com":
-        providers.append(("resend", "smtp.resend.com", 465, "resend",
-                          resend_key, True, False, resend_from))
+    existing_resend_keys = {p[4] for p in providers if p[0].startswith("resend")}
+    for suffix in ("", "_2"):
+        key = os.getenv(f"RESEND_API_KEY{suffix}")
+        from_email = os.getenv(f"RESEND_FROM_EMAIL{suffix}") or (smtp_from if not suffix else None)
+        if key and from_email and key not in existing_resend_keys:
+            providers.append((f"resend{suffix or '_1'}", "smtp.resend.com", 465,
+                              "resend", key, True, False, from_email))
+            existing_resend_keys.add(key)
     return providers
 
 
@@ -516,6 +519,14 @@ def _send_email_message(to_email: str, subject: str, text_body: str, html_body: 
         logger.warning("Email not sent to %s: no SMTP/Resend provider configured", to_email)
         _email_log_status(log_id, "failed", "No email provider configured")
         return False
+
+    # Spread traffic across configured Resend accounts. Keep non-Resend SMTP
+    # first if configured; on a failed send, try the remaining accounts.
+    resend_providers = [p for p in providers if p[0].startswith("resend")]
+    if len(resend_providers) > 1:
+        start = (log_id - 1) % len(resend_providers)
+        providers = ([p for p in providers if not p[0].startswith("resend")]
+                     + resend_providers[start:] + resend_providers[:start])
 
     last_error = None
     for name, host, port, user, password, use_ssl, use_starttls, from_email in providers:
@@ -14310,10 +14321,10 @@ async def admin_test_delivery(
 
     config = {
         "email": {
-            "smtp_host": present("SMTP_HOST", "RESEND_API_KEY"),
-            "smtp_user": present("SMTP_USERNAME", "RESEND_API_KEY"),
-            "smtp_password": present("SMTP_PASSWORD", "RESEND_API_KEY"),
-            "from_email": present("SMTP_FROM", "RESEND_FROM_EMAIL"),
+            "smtp_host": present("SMTP_HOST", "RESEND_API_KEY", "RESEND_API_KEY_2"),
+            "smtp_user": present("SMTP_USERNAME", "RESEND_API_KEY", "RESEND_API_KEY_2"),
+            "smtp_password": present("SMTP_PASSWORD", "RESEND_API_KEY", "RESEND_API_KEY_2"),
+            "from_email": present("SMTP_FROM", "RESEND_FROM_EMAIL", "RESEND_FROM_EMAIL_2"),
         },
         "sms": {
             "sendchamp_api_key": present("SENDCHAMP_API_KEY"),

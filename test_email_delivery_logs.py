@@ -85,3 +85,35 @@ def test_fallback_attempt_is_one_email_log(monkeypatch):
         rows = db.query(EmailDeliveryLog).all()
         assert len(rows) == 1
         assert rows[0].status == "sent"
+
+
+def test_two_resend_accounts_rotate_and_keep_one_log_per_email(monkeypatch):
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine)
+    monkeypatch.setattr(api.db_config, "get_session", sessions)
+    for name in ("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RESEND_API_KEY", "first-key")
+    monkeypatch.setenv("RESEND_FROM_EMAIL", "first@one.example")
+    monkeypatch.setenv("RESEND_API_KEY_2", "second-key")
+    monkeypatch.setenv("RESEND_FROM_EMAIL_2", "second@two.example")
+
+    used_keys = []
+
+    class RecordingSmtp(FakeSmtp):
+        def login(self, user, password):
+            used_keys.append(password)
+
+    monkeypatch.setattr(api.smtplib, "SMTP_SSL", RecordingSmtp)
+    assert api._send_email_message("one@example.test", "First", "Body") is True
+    assert api._send_email_message("two@example.test", "Second", "Body") is True
+    assert used_keys == ["first-key", "second-key"]
+    with sessions() as db:
+        rows = db.query(EmailDeliveryLog).all()
+        assert len(rows) == 2
+        assert all(row.status == "sent" for row in rows)
+
+    # A second key from the same account must never be counted as another pool.
+    monkeypatch.setenv("RESEND_API_KEY_2", "first-key")
+    assert len(api._email_providers()) == 1
