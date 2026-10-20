@@ -20,8 +20,14 @@ voice_venv/bin/python -m pip install -r requirements_voice_clone.txt
 voice_venv/bin/python -m pip check
 ```
 
-The first generation downloads the model. Test it before restarting the
-backend; use a real enrolled sample as the reference, substituting its path:
+Preload the model once to download it and verify imports:
+
+```bash
+voice_venv/bin/python -c 'from chatterbox.tts_turbo import ChatterboxTurboTTS; ChatterboxTurboTTS.from_pretrained(device="cpu", nano=True); print("Nano model ready")'
+```
+
+Then test actual cloning before restarting the backend. Use a real enrolled
+sample as the reference, substituting its path:
 
 ```bash
 voice_venv/bin/python voice_decoy_worker.py /path/to/enrolled-sample.wav /tmp/voice-decoy-test.wav 'This is a voice cloning test.'
