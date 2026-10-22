@@ -2550,7 +2550,7 @@ class MediaService:
     
     @staticmethod
     def delete_media_file_from_disk(file_path: str) -> bool:
-        """Delete media file from disk after viewing (one-time view, user cannot go back)."""
+        """Remove a media file from disk after an explicit delete operation."""
         try:
             if file_path and os.path.exists(file_path):
                 os.remove(file_path)
@@ -14206,7 +14206,7 @@ async def get_media_file(
         if not os.path.exists(media.encrypted_file_path):
             # File was deleted after viewing (one-time view)
             if getattr(media, 'downloaded_at', None):
-                raise HTTPException(status_code=410, detail="Media was deleted after viewing. Cannot access again.")
+                raise HTTPException(status_code=410, detail="Media is no longer available on the server")
             raise HTTPException(status_code=404, detail="Media file not found on server")
         
         try:
@@ -16691,7 +16691,7 @@ async def download_raw_media(
                 raise HTTPException(status_code=404, detail="Voice note file not found")
             # Non-voice: File was deleted after viewing (one-time view)
             if media.downloaded_at:
-                raise HTTPException(status_code=410, detail="Media was deleted after viewing. Cannot access again.")
+                raise HTTPException(status_code=410, detail="Media is no longer available on the server")
             raise HTTPException(status_code=404, detail="File not found")
         
         # Read the file content
@@ -16699,7 +16699,7 @@ async def download_raw_media(
             content = file.read()
 
         # Dynamic leak-trace watermark: stamped with whoever is ACTUALLY
-        # downloading this real one-time copy right now, not whoever it was
+        # downloading this real copy right now, not whoever it was
         # originally addressed to at upload — the two differ for group media
         # and forwards, which is exactly the case this needs to cover.
         download_time = datetime.now(timezone.utc)
