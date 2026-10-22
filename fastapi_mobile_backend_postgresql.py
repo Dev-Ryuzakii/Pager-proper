@@ -14220,9 +14220,9 @@ async def get_media_file(
             # Mark as downloaded
             MediaService.mark_media_downloaded(db, media.id)
             
-            # Auto-delete from server after viewing (one-time view, user cannot go back)
-            MediaService.delete_media_file_from_disk(media.encrypted_file_path)
-            await _burn_one_time_media(db, media, user_id)
+            # Revealing/decrypting an attachment must not consume it. Keep the
+            # encrypted source available to both sender and recipient; normal
+            # expiry cleanup still applies when auto_delete is configured.
             
             return {
                 "media_id": media.media_id,
@@ -16641,43 +16641,6 @@ async def upload_raw_group_media(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
 
-async def _burn_one_time_media(db: Session, media: Media, reader_id: int) -> None:
-    """
-    Retire a one-time media message once its recipient has read it.
-
-    Deleting the encrypted file already made the media unreadable, but the
-    message row stayed behind, so a document kept sitting in the thread after
-    the recipient opened it — it never disappeared, it just stopped working.
-    Only the recipient's read burns it: the sender re-reading their own
-    attachment is not what "read by the recipient" means.
-    """
-    if int(getattr(media, 'sender_id', 0)) == int(reader_id):
-        return
-    if str(getattr(media, 'media_type', '')).lower() == 'voice':
-        return  # voice notes stay replayable — the file is kept on disk too
-
-    message_id = getattr(media, 'message_id', None)
-    if not message_id:
-        return
-    msg = db.query(Message).filter(Message.id == message_id).first()
-    if not msg or bool(getattr(msg, 'is_deleted', False)):
-        return
-
-    setattr(msg, 'is_deleted', True)
-    setattr(msg, 'deleted_at', datetime.now(timezone.utc))
-    db.commit()
-
-    notification = {
-        "type": "message_deleted",
-        "data": {"message_id": int(message_id), "group_id": msg.group_id},
-    }
-    for uid in _message_targets(db, msg):
-        try:
-            await ws_manager.send_to_user(uid, notification)
-        except Exception as e:
-            logger.warning(f"One-time media burn notify failed for user {uid}: {e}")
-
-
 @app.get("/media/download/{media_id}")
 async def download_raw_media(
     media_id: str, 
@@ -16755,12 +16718,9 @@ async def download_raw_media(
         media.downloaded_at = download_time
         db.commit()
         
-        # Voice notes: keep file on disk for replay. Only delete regular media (one-time view).
-        if not is_voice:
-            MediaService.delete_media_file_from_disk(file_path)
-            # …and retire the message itself, so the attachment disappears from
-            # the thread instead of lingering as a bubble that only 410s.
-            await _burn_one_time_media(db, media, user_id)
+        # Keep the encrypted source and message after download so the sender
+        # and recipient can reopen the attachment on their other devices.
+        # Configured expiration remains enforced by the normal cleanup job.
         
         content_len = len(content) if hasattr(content, "__len__") else 0
         monitor_record_event("media", "download", user_id=user_id)
