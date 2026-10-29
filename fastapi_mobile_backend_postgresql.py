@@ -12083,25 +12083,32 @@ async def toggle_message_reaction(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
 ):
-    """Toggles a reaction — add it if the user hasn't reacted with this emoji
-    yet, remove it if they have. A user can stack several different emoji on
-    the same message, matching Slack/Teams."""
+    """Sets this user's reaction on a message — WhatsApp-style, one reaction per
+    person. Reacting with the same emoji again removes it; reacting with a
+    different emoji replaces the previous one (so a user never stacks several
+    reactions on the same message)."""
     user_id = int(getattr(current_user, 'id', 0))
     msg = db.query(Message).filter(Message.id == message_id).first()
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
     _assert_can_access_message(db, msg, user_id)
 
-    existing = db.query(MessageReaction).filter(
+    # All of this user's reactions on this message (there should be at most one,
+    # but clean up any legacy stacked rows while we're here).
+    mine = db.query(MessageReaction).filter(
         MessageReaction.message_id == message_id,
         MessageReaction.user_id == user_id,
-        MessageReaction.emoji == payload.emoji,
-    ).first()
-    if existing:
-        db.delete(existing)
+    ).all()
+    same = next((r for r in mine if r.emoji == payload.emoji), None)
+    if same and len(mine) == 1:
+        # Tapping the same single reaction again clears it.
+        db.delete(same)
         db.commit()
         action = "removed"
     else:
+        # Replace whatever they had (including legacy multiples) with this one.
+        for r in mine:
+            db.delete(r)
         db.add(MessageReaction(message_id=message_id, user_id=user_id, emoji=payload.emoji))
         db.commit()
         action = "added"
