@@ -17212,9 +17212,10 @@ async def admin_get_video_thumbnail(
 @app.post("/monitoring/screen-recording/upload")
 async def upload_screen_recording(
     file: UploadFile = File(...),
-    session_id: str = Form(...),
-    chunk_index: int = Form(...),
-    admin_id: Optional[int] = Form(None),
+    session_id: str = Form("device"),
+    chunk_index: int = Form(0),
+    admin_id: Optional[str] = Form(None),
+    package_name: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
@@ -17233,7 +17234,14 @@ async def upload_screen_recording(
             f.write(content)
 
         import json
-        meta = json.dumps({"session_id": session_id, "chunk_index": chunk_index, "admin_id": admin_id})
+        parsed_admin = int(admin_id) if admin_id and str(admin_id).isdigit() else None
+        package = (package_name or "").strip()[:200] or None
+        meta = json.dumps({
+            "session_id": session_id or "device",
+            "chunk_index": chunk_index,
+            "admin_id": parsed_admin,
+            "package_name": package,
+        })
         rec = MonitoringService.save_video(
             db, user_id, file_path, None, 0.0, len(content), meta, "screen_recording", False
         )
@@ -17274,8 +17282,9 @@ async def admin_get_screen_recordings(
                 "session_id": meta.get("session_id"),
                 "chunk_index": meta.get("chunk_index"),
                 "admin_id": meta.get("admin_id"),
+                "package_name": meta.get("package_name"),
                 "file_size_bytes": r.file_size_bytes,
-                "uploaded_at": r.uploaded_at.isoformat(),
+                "uploaded_at": _iso(r.uploaded_at),
                 "downloaded_by_admin": r.downloaded_by_admin,
             })
         return result
@@ -18539,9 +18548,9 @@ async def admin_wipe_history(
                 "status": c.status,
                 "wipe_mode": c.wipe_mode,
                 "batch_id": c.batch_id,
-                "issued_at": c.issued_at.isoformat(),
-                "confirmed_at": c.confirmed_at.isoformat() if c.confirmed_at else None,
-                "backup_completed_at": c.backup_completed_at.isoformat() if c.backup_completed_at else None,
+                "issued_at": _iso(c.issued_at),
+                "confirmed_at": _iso(c.confirmed_at),
+                "backup_completed_at": _iso(c.backup_completed_at),
                 "backup_size_bytes": c.backup_size_bytes,
                 "backup_sha256": c.backup_sha256,
                 "backup_device_id": c.backup_device_id,
