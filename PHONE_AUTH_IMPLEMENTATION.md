@@ -230,7 +230,7 @@ Form data: phone_number=+1234567890, file=<binary>
 ### Test Admin Account
 Default admin credentials:
 - Username: `admin`
-- Password: `adminuser@123`
+- Password: `<set-a-strong-password-at-creation>`
 - Must change password on first login
 
 ### Test User Creation
@@ -238,7 +238,7 @@ Default admin credentials:
 # Login as admin
 curl -X POST http://localhost:8001/admin/login \
   -H "Content-Type: application/json" \
-  -d '{"username": "admin", "password": "adminuser@123"}'
+  -d '{"username": "admin", "password": "<set-a-strong-password-at-creation>"}'
 
 # Create user
 curl -X POST http://localhost:8001/admin/users \

@@ -35,8 +35,17 @@ def hash_password(password: str) -> str:
     hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
     return hashed.decode('utf-8')
 
-def create_admin_user(username: str = "admin", password: str = "adminuser@123"):
-    """Create an admin user account with default credentials"""
+def create_admin_user(username: str = "admin", password: str = None):
+    """Create an admin user account.
+
+    SECURITY: never ship a hardcoded default password. When no password is
+    given a strong random one is generated and printed once, so a fresh admin
+    account can't be logged into with a known default credential.
+    """
+    if not password:
+        import secrets
+        password = secrets.token_urlsafe(18)
+        print(f"🔑 Generated admin password (shown once, store it now): {password}")
     print(f"🔧 Creating admin user: {username}")
     print("=" * 50)
     
@@ -304,9 +313,9 @@ if __name__ == "__main__":
         print("  python create_admin_user.py list")
         print("  python create_admin_user.py reset-password <username> [--no-force-change]")
         print("  python create_admin_user.py remove <username>")
-        print("\nNote: Run 'init' first if tables don't exist. If no username/password for create, defaults:")
-        print("  Username: admin")
-        print("  Password: adminuser@123")
+        print("\nNote: Run 'init' first if tables don't exist. If no password is given for create,")
+        print("  a strong random password is generated and printed once.")
+        print("  Username defaults to: admin")
         sys.exit(1)
     
     command = sys.argv[1]
@@ -317,8 +326,8 @@ if __name__ == "__main__":
     
     if command == "create":
         username = "admin"
-        password = "adminuser@123"
-        
+        password = None  # None -> create_admin_user generates a strong random one
+
         if len(sys.argv) >= 3:
             username = sys.argv[2]
         if len(sys.argv) >= 4:

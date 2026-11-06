@@ -593,6 +593,6 @@ All admin endpoints (except login) require authentication with a valid admin acc
 
 ### First-Time Admin Login
 
-1. Admin logs in with default credentials (username: `admin`, password: `adminuser@123`)
+1. Admin logs in with default credentials (username: `admin`, password: `<set-a-strong-password-at-creation>`)
 2. If `must_change_password` is true in the response, admin must change password immediately
 3. After password change, admin can access all user management features

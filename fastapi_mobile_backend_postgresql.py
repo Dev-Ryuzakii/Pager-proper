@@ -4877,11 +4877,18 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("📴 Shutting down FastAPI Mobile Backend")
 
+# Interactive API docs (/docs, /redoc) and the OpenAPI schema expose the full
+# endpoint surface. Keep them OFF in production; opt in per-environment with
+# EXPOSE_API_DOCS=1 (e.g. local/staging) only.
+_expose_docs = os.getenv("EXPOSE_API_DOCS", "").strip().lower() in ("1", "true", "yes", "on")
 app = FastAPI(
     title="Secure Messaging API",
     description="Mobile backend for secure messaging system with PostgreSQL",
     version="2.1-PostgreSQL",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url="/docs" if _expose_docs else None,
+    redoc_url="/redoc" if _expose_docs else None,
+    openapi_url="/openapi.json" if _expose_docs else None,
 )
 
 # Log the exact field(s) behind every 422 so client "Login failed (422)" style
@@ -4922,8 +4929,11 @@ _cors_origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    # Any subdomain (one or more labels) of dilarion.xyz or eibstratoc.com.
-    allow_origin_regex=r"https://([a-z0-9-]+\.)*(dilarion\.xyz|eibstratoc\.com)",
+    # NOTE: no broad subdomain regex. A wildcard-subdomain regex combined with
+    # allow_credentials=True means any *.eibstratoc.com / *.dilarion.xyz origin
+    # (including a taken-over or dangling subdomain) gets credentialed CORS
+    # access. Add new real web origins to _cors_origins / CORS_ALLOW_ORIGINS
+    # explicitly instead. Native apps (desktop/iOS/Android) are not CORS-bound.
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -5843,19 +5853,17 @@ async def health_check():
 
 @app.get("/status")
 async def get_status(db: Session = Depends(get_database_session)):
-    """Get system status"""
+    """Get system status (public liveness only).
+
+    Deliberately does NOT expose user/message/session counts: those are
+    business-intelligence leaks for an unauthenticated endpoint. The DB
+    session dependency is kept so this still reflects DB reachability.
+    """
     try:
-        users_count = db.query(User).filter(User.is_active == True).count()
-        messages_count = db.query(Message).count()
-        sessions_count = db.query(UserSession).filter(UserSession.is_active == True).count()
-        
         return {
             "status": "running",
             "version": "2.1-PostgreSQL",
             "database": "PostgreSQL",
-            "users_count": users_count,
-            "messages_count": messages_count,
-            "active_sessions": sessions_count,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
     except Exception as e:
