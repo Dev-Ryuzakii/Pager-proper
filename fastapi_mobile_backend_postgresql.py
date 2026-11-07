@@ -7884,6 +7884,10 @@ async def create_conference(
                 "conference_id": int(conf.id),
                 "call_id": int(call_id) if call_id else None,
                 "upgraded_by": str(getattr(current_user, 'username', '')),
+                # So the receiving side can carry the right camera state into
+                # the conference instead of guessing/defaulting it — a video
+                # call silently turning into audio-only was exactly this gap.
+                "call_type": str(call.call_type) if call else None,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         })
