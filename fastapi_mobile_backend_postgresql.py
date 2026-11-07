@@ -16418,6 +16418,7 @@ async def upload_raw_media(
     content_type: Optional[str] = Form(None),
     encryption_metadata: Optional[str] = Form(None),
     decoy_kind: Optional[str] = Form(None),
+    forwarded_from_message_id: Optional[int] = Form(None),
     current_user: User = Depends(get_current_user),
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_database_session)
@@ -16487,13 +16488,14 @@ async def upload_raw_media(
             read=False,
             is_offline=False,
             expires_at=expires_at,
-            auto_delete=auto_delete
+            auto_delete=auto_delete,
+            forwarded_from_message_id=forwarded_from_message_id,
         )
-        
+
         db.add(message)
         db.commit()
         db.refresh(message)
-        
+
         # Create media record with specific media_type
         mediaListType = "voice" if is_voice else "raw"
         media = Media(
@@ -16547,6 +16549,7 @@ async def upload_raw_group_media(
     disappear_after_hours: Optional[int] = Form(None),
     content_type: Optional[str] = Form(None),
     decoy_kind: Optional[str] = Form(None),
+    forwarded_from_message_id: Optional[int] = Form(None),
     current_user: User = Depends(get_current_user),
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_database_session)
@@ -16598,7 +16601,8 @@ async def upload_raw_group_media(
             read=False,
             is_offline=False,
             expires_at=expires_at,
-            auto_delete=auto_delete
+            auto_delete=auto_delete,
+            forwarded_from_message_id=forwarded_from_message_id,
         )
         db.add(message)
         db.commit()
