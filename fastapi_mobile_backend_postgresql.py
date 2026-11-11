@@ -7907,6 +7907,13 @@ async def create_conference(
     )
     db.add(conf)
     db.flush()
+    # Close the 1:1 row so history can show the group call, but do not push
+    # "end"/"missed". That push is a hangup, and it was tearing the live call
+    # down on the other person's screen before they could follow into the room.
+    if call is not None and str(call.status) not in ("end", "ended", "missed", "declined", "decline", "upgraded"):
+        call.status = "upgraded"
+        if call.ended_at is None:
+            call.ended_at = datetime.now(timezone.utc)
     # Add creator as first participant
     db.add(ConferenceParticipant(conference_id=conf.id, user_id=caller_id))
     # Add the other party if call provided. The column is recipient_id — reading
@@ -8157,6 +8164,20 @@ async def conference_decline(
             "data": {"conference_id": conference_id, "username": username},
         })
 
+    # The last person waiting on an invite just said no, and nobody else is
+    # left to talk to. End it instead of leaving one person in an empty room.
+    if len(others) <= 1:
+        conf = db.query(ConferenceSession).filter(ConferenceSession.id == conference_id).first()
+        if conf and conf.is_active:
+            setattr(conf, 'is_active', False)
+            setattr(conf, 'ended_at', datetime.now(timezone.utc))
+            db.commit()
+            for p in others:
+                await ws_manager.send_to_user(p.user_id, {
+                    "type": "conference_ended",
+                    "data": {"conference_id": conference_id},
+                })
+
     return {"success": True}
 
 
@@ -8221,13 +8242,35 @@ async def conference_leave(
             "data": {"conference_id": conference_id, "username": username}
         })
 
-    # End conference if ≤1 participant left
-    if len(remaining) <= 1:
+    # One person left, and nobody is still deciding whether to join: the call
+    # is over. A pending invite keeps it open so the person being added can
+    # still pick up. Zero people left always ends it.
+    pending = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.is_active == False,
+        ConferenceParticipant.left_at.is_(None),
+    ).count()
+    if len(remaining) == 0 or (len(remaining) <= 1 and pending == 0):
         conf = db.query(ConferenceSession).filter(ConferenceSession.id == conference_id).first()
-        if conf:
+        if conf and conf.is_active:
             setattr(conf, 'is_active', False)
             setattr(conf, 'ended_at', datetime.now(timezone.utc))
             db.commit()
+            for p in remaining:
+                await ws_manager.send_to_user(p.user_id, {
+                    "type": "conference_ended",
+                    "data": {"conference_id": conference_id},
+                })
+            pending_rows = db.query(ConferenceParticipant).filter(
+                ConferenceParticipant.conference_id == conference_id,
+                ConferenceParticipant.is_active == False,
+                ConferenceParticipant.left_at.is_(None),
+            ).all()
+            for p in pending_rows:
+                await ws_manager.send_to_user(p.user_id, {
+                    "type": "conference_invite_cancelled",
+                    "data": {"conference_id": conference_id},
+                })
 
     return {"success": True}
 
@@ -12880,30 +12923,99 @@ async def admin_get_user_onboarding_profile(
         has_profile_picture=bool(picture_path) and os.path.exists(picture_path),
     )
 
+def _conference_joined_usernames(db: Session, conf: Optional[ConferenceSession]) -> List[str]:
+    """Usernames who actually joined. A pending invite (never accepted) is not included."""
+    if conf is None:
+        return []
+    names: List[str] = []
+    parts = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conf.id,
+    ).all()
+    for p in parts:
+        if not p.is_active and p.left_at is None:
+            continue
+        user = db.query(User).filter(User.id == p.user_id).first()
+        if user and user.username:
+            names.append(str(user.username))
+    return names
+
+
+def _conference_history_item(db: Session, conf: ConferenceSession, user_id: int, me: str) -> Optional[dict]:
+    names = _conference_joined_usernames(db, conf)
+    if me not in names or len(names) < 2:
+        return None
+    others = [n for n in names if n != me]
+    started = conf.created_at
+    ended = conf.ended_at
+    duration = 0
+    if started and ended:
+        s = started.replace(tzinfo=timezone.utc) if started.tzinfo is None else started
+        e = ended.replace(tzinfo=timezone.utc) if ended.tzinfo is None else ended
+        duration = max(0, int((e - s).total_seconds()))
+    return {
+        "id": -int(conf.id),
+        "other_party_username": ", ".join(others) if others else "Group call",
+        "participants": names,
+        "is_group": len(names) >= 3 or str(getattr(conf, "kind", "")) == "group_call",
+        "conference_id": int(conf.id),
+        "call_type": str(getattr(conf, "call_type", None) or "voice"),
+        "status": "accepted" if conf.is_active else "end",
+        "duration": duration,
+        "started_at": started.isoformat() if started else datetime.now(timezone.utc).isoformat(),
+        "answered_at": None,
+        "answered_device_name": None,
+        "answered_elsewhere": False,
+        "ended_at": ended.isoformat() if ended else None,
+        "is_caller": int(conf.created_by_user_id) == user_id,
+    }
+
+
 @app.get("/calls/history")
 async def get_call_history(
     device_id: Optional[str] = Query(None, max_length=128, description="The asking device, to flag calls answered on another one"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
-    """Retrieve call history for the current user"""
+    """Retrieve call history for the current user.
+
+    A 1:1 that picked up more people is returned as one group call, not as the
+    original pair. Calling that row back rings everyone who joined.
+    """
     try:
         user_id = int(getattr(current_user, 'id', 0))
+        me = str(getattr(current_user, 'username', ''))
         calls = db.query(Call).filter(
             or_(Call.caller_id == user_id, Call.recipient_id == user_id)
         ).order_by(Call.started_at.desc()).limit(50).all()
-        
+
+        merged_conf_ids = set()
         result = []
         for call in calls:
             other_party_id = call.recipient_id if call.caller_id == user_id else call.caller_id
             other_party = db.query(User).filter(User.id == other_party_id).first()
-            
+            conf = db.query(ConferenceSession).filter(
+                ConferenceSession.original_call_id == call.id,
+            ).order_by(ConferenceSession.id.desc()).first()
+            names = _conference_joined_usernames(db, conf) if conf else []
+            is_group = bool(conf) and len(names) >= 3
+            if conf and is_group:
+                merged_conf_ids.add(int(conf.id))
+            others = [n for n in names if n != me]
+            duration = int(call.duration or 0)
+            if is_group and conf is not None and conf.created_at and conf.ended_at:
+                s = conf.created_at.replace(tzinfo=timezone.utc) if conf.created_at.tzinfo is None else conf.created_at
+                e = conf.ended_at.replace(tzinfo=timezone.utc) if conf.ended_at.tzinfo is None else conf.ended_at
+                duration = max(duration, int((e - s).total_seconds()))
+            shown_status = "end" if str(call.status) == "upgraded" else str(call.status)
             result.append({
                 "id": int(call.id),
-                "other_party_username": str(other_party.username) if other_party else "unknown",
+                "other_party_username": (", ".join(others) if is_group and others else (str(other_party.username) if other_party else "unknown")),
+                "participants": names if is_group else [],
+                "is_group": is_group,
+                "conference_id": int(conf.id) if is_group and conf else None,
                 "call_type": str(call.call_type),
-                "status": str(call.status),
-                "duration": int(call.duration or 0),
+                "status": shown_status,
+                "duration": duration,
                 "started_at": call.started_at.isoformat(),
                 "answered_at": call.answered_at.isoformat() if getattr(call, "answered_at", None) else None,
                 # Only meaningful for incoming calls the user answered.
@@ -12916,11 +13028,79 @@ async def get_call_history(
                 "ended_at": call.ended_at.isoformat() if call.ended_at else None,
                 "is_caller": call.caller_id == user_id
             })
-            
-        return {"calls": result, "count": len(result)}
+
+        # Group calls that did not start as a 1:1 (started from a group chat).
+        memberships = db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.user_id == user_id,
+        ).all()
+        for membership in memberships:
+            if int(membership.conference_id) in merged_conf_ids:
+                continue
+            if not membership.is_active and membership.left_at is None:
+                continue
+            conf = db.query(ConferenceSession).filter(ConferenceSession.id == membership.conference_id).first()
+            if conf is None or str(getattr(conf, "kind", "")) not in ("call", "group_call"):
+                continue
+            if conf.original_call_id:
+                continue
+            item = _conference_history_item(db, conf, user_id, me)
+            if item and item["is_group"]:
+                merged_conf_ids.add(int(conf.id))
+                result.append(item)
+
+        result.sort(key=lambda row: row.get("started_at") or "", reverse=True)
+        return {"calls": result[:50], "count": min(len(result), 50)}
     except Exception as e:
         logger.error(f"Call history error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve call history")
+
+
+@app.post("/calls/group/redial")
+async def redial_group_call(
+    payload: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Call everyone who joined a previous group call. Each person gets Join / Ignore."""
+    conference_id = int(payload.get("conference_id") or 0)
+    conf = db.query(ConferenceSession).filter(ConferenceSession.id == conference_id).first()
+    if not conf:
+        raise HTTPException(status_code=404, detail="Call not found")
+    user_id = int(getattr(current_user, 'id', 0))
+    me = str(getattr(current_user, 'username', ''))
+    was_in = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conf.id,
+        ConferenceParticipant.user_id == user_id,
+    ).first()
+    if not was_in:
+        raise HTTPException(status_code=403, detail="You were not on that call")
+    names = _conference_joined_usernames(db, conf)
+    others = [n for n in names if n != me]
+    if not others:
+        raise HTTPException(status_code=400, detail="Nobody else from that call is available")
+
+    new = ConferenceSession(
+        created_by_user_id=user_id,
+        original_call_id=None,
+        is_active=True,
+        kind="call",
+        call_type=str(getattr(conf, "call_type", None) or "voice"),
+    )
+    db.add(new)
+    db.flush()
+    db.add(ConferenceParticipant(conference_id=new.id, user_id=user_id))
+    db.commit()
+    db.refresh(new)
+    for name in others:
+        try:
+            await conference_invite(int(new.id), {"username": name}, current_user, db)
+        except HTTPException:
+            continue
+    return {
+        "conference_id": int(new.id),
+        "call_type": str(new.call_type or "voice"),
+        "participants": names,
+    }
 
 class DisappearSettingsRequest(BaseModel):
     text_hours: Optional[int] = Field(None, description="Default disappear timer for plain text messages you send, in hours. Null/omitted = never.")
