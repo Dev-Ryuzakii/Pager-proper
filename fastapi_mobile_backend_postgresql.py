@@ -2653,8 +2653,24 @@ _PENDING_ICE_MAX = 300
 def _buffer_ice(recipient_id: int, notification: dict) -> None:
     q = _pending_ice.setdefault(recipient_id, [])
     q.append(notification)
+    dropped = 0
     if len(q) > _PENDING_ICE_MAX:
-        del q[: len(q) - _PENDING_ICE_MAX]  # keep the newest
+        dropped = len(q) - _PENDING_ICE_MAX
+        del q[:dropped]  # keep the newest
+    call_id = (notification.get("data") or {}).get("call_id")
+    if dropped:
+        # A real call trickles a few dozen candidates. Hitting the cap means an
+        # offline user has been accumulating them across calls, and the oldest
+        # — possibly from the live one — were discarded.
+        logger.warning(
+            f"ICE buffer for user {recipient_id} truncated: dropped {dropped} "
+            f"oldest (call_id={call_id}, kept={len(q)}, max={_PENDING_ICE_MAX})"
+        )
+    else:
+        logger.info(
+            f"ICE candidate buffered for user {recipient_id} "
+            f"call_id={call_id} (queued={len(q)})"
+        )
 
 
 async def flush_pending_ice(recipient_id: int) -> None:
@@ -2662,6 +2678,7 @@ async def flush_pending_ice(recipient_id: int) -> None:
     q = _pending_ice.pop(int(recipient_id), None)
     if not q:
         return
+    logger.info(f"Flushing {len(q)} buffered ICE candidate(s) to user {recipient_id}")
     for notification in q:
         await ws_manager.send_to_user(int(recipient_id), notification)
 
@@ -2888,6 +2905,9 @@ class CallService:
             # Recipient's WebSocket is momentarily down (it reconnects often).
             # Buffer the candidate and deliver on their next connect instead of
             # dropping it — a lost candidate leaves the call stuck "connecting".
+            # A callee who is connected but not yet in the call window is NOT
+            # this case: their socket is up, so the candidate is delivered and
+            # the desktop main window replays it when the call window opens.
             _buffer_ice(int(recipient.id), notification)
         # Always report success: the candidate is either delivered or queued.
         return True
@@ -7842,6 +7862,28 @@ async def send_ice_candidate(
         raise HTTPException(status_code=500, detail="Failed to forward ICE candidate")
 
 
+def _conference_public(db: Session, conf: Optional[ConferenceSession]) -> Dict[str, Any]:
+    """kind + call_type for every payload that puts someone into a room.
+
+    kind is the server's record of call vs meeting. Clients used to keep that
+    only in navigation state, so a late joiner, a second device, or the person
+    who was invited rendered a call as a Meeting. call_type is how a video
+    call stays video for the invitee. Rows from before the column existed are
+    derived the same way as the migration: original_call_id means it was a call.
+    """
+    if conf is None:
+        return {"kind": "meeting", "call_type": None}
+    kind = getattr(conf, "kind", None) or (
+        "call" if getattr(conf, "original_call_id", None) else "meeting"
+    )
+    call_type = getattr(conf, "call_type", None)
+    if not call_type and getattr(conf, "original_call_id", None):
+        call = db.query(Call).filter(Call.id == conf.original_call_id).first()
+        if call is not None and getattr(call, "call_type", None):
+            call_type = str(call.call_type)
+    return {"kind": str(kind), "call_type": call_type}
+
+
 @app.post("/calls/conference/create")
 async def create_conference(
     payload: dict,
@@ -7852,10 +7894,16 @@ async def create_conference(
     call_id = payload.get("call_id")
     caller_id = int(getattr(current_user, 'id', 0))
     call = db.query(Call).filter(Call.id == call_id).first() if call_id else None
+    # No call_id is an instant meeting started from the meetings UI. A call_id
+    # is a live 1:1 being upgraded — that stays a call, not a meeting.
+    kind = "call" if call_id else "meeting"
+    call_type = str(call.call_type) if call is not None and call.call_type else None
     conf = ConferenceSession(
         created_by_user_id=caller_id,
         original_call_id=call_id,
         is_active=True,
+        kind=kind,
+        call_type=call_type,
     )
     db.add(conf)
     db.flush()
@@ -7877,6 +7925,7 @@ async def create_conference(
     # as well, or they stay on a mesh leg nobody else is connected to — which is
     # what left an invited third participant audio-only with no way to turn video
     # on. Their client tears the 1:1 call down and joins conf-<id> on this.
+    meta = _conference_public(db, conf)
     if other_id is not None:
         await ws_manager.send_to_user(int(other_id), {
             "type": "conference_upgraded",
@@ -7887,13 +7936,14 @@ async def create_conference(
                 # So the receiving side can carry the right camera state into
                 # the conference instead of guessing/defaulting it — a video
                 # call silently turning into audio-only was exactly this gap.
-                "call_type": str(call.call_type) if call else None,
+                "call_type": meta["call_type"],
+                "kind": meta["kind"],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         })
 
     monitor_record_event("conference", "create", user_id=caller_id)
-    return {"conference_id": conf.id}
+    return {"conference_id": conf.id, **meta}
 
 
 @app.post("/calls/conference/{conference_id}/invite")
@@ -7955,32 +8005,43 @@ async def conference_invite(
     ]
 
     # Ring the invitee. Peer connections are set up in /accept, not here.
+    # kind and call_type travel with the ring: without them the invitee's
+    # client treated every conference as a Meeting and guessed the camera.
+    meta = _conference_public(db, conf)
     sent = await ws_manager.send_to_user(invitee_id, {
         "type": "conference_invite",
         "data": {
             "conference_id": conference_id,
             "invited_by": caller_username,
             "existing_participants": existing_usernames,
+            "kind": meta["kind"],
+            "call_type": meta["call_type"],
         }
     })
     if not sent:
         try:
+            if meta["kind"] == "meeting":
+                push_title, push_body = "Meeting", f"{caller_username} invited you to a meeting"
+            else:
+                label = "video" if meta["call_type"] == "video" else "voice" if meta["call_type"] == "voice" else "group"
+                push_title, push_body = f"{label.capitalize()} call", f"{caller_username} is adding you to a {label} call"
             await push_to_user(
-                db, invitee_id, "Group call",
-                "You're being added to a call", sound="ringingtone.caf",
+                db, invitee_id, push_title, push_body, sound="ringingtone.caf",
             )
         except Exception as e:
             logger.warning(f"Conference invite push failed: {e}")
 
-    # Persist a meeting card in the DM too, not just the ring — so it's still
-    # there to join from if the invite is missed while offline.
-    await _send_meeting_card(
-        db, caller_id, caller_username,
-        {"kind": "instant", "conference_id": conference_id, "title": None},
-        dm_usernames=[invitee_username],
-    )
+    # A meeting card belongs in the DM only for an actual meeting. Adding
+    # someone to a call used to post {"kind": "instant"} here, which is why
+    # a 1:1 that picked up a third person dropped a Meeting card in the chat.
+    if meta["kind"] == "meeting":
+        await _send_meeting_card(
+            db, caller_id, caller_username,
+            {"kind": "instant", "conference_id": conference_id, "title": None},
+            dm_usernames=[invitee_username],
+        )
 
-    return {"success": True, "conference_id": conference_id}
+    return {"success": True, "conference_id": conference_id, **meta}
 
 
 @app.post("/calls/conference/{conference_id}/accept")
@@ -8055,6 +8116,7 @@ async def conference_accept(
             }
         })
 
+    meta = _conference_public(db, conf)
     return {
         "success": True,
         "conference_id": conference_id,
@@ -8062,6 +8124,7 @@ async def conference_accept(
             str(getattr(db.query(User).filter(User.id == p.user_id).first(), 'username', ''))
             for p in existing
         ],
+        **meta,
     }
 
 
@@ -8241,7 +8304,15 @@ async def conference_livekit_token(
         .with_ttl(timedelta(hours=4))
         .to_jwt()
     )
-    return {"url": LIVEKIT_URL, "token": token, "room": room_name}
+    conf = db.query(ConferenceSession).filter(ConferenceSession.id == conference_id).first()
+    meta = _conference_public(db, conf)
+    return {
+        "url": LIVEKIT_URL,
+        "token": token,
+        "room": room_name,
+        "is_host": _conference_host_id(db, conference_id, conf) == user_id,
+        **meta,
+    }
 
 
 # ─── Meeting breakout rooms ──────────────────────────────────────────────────
@@ -8272,9 +8343,12 @@ async def _create_breakout_rooms(
         if not usernames:
             continue
 
+        parent = db.query(ConferenceSession).filter(ConferenceSession.id == conference_id).first()
+        parent_meta = _conference_public(db, parent)
         room = ConferenceSession(
             created_by_user_id=user_id, is_active=True,
             parent_conference_id=conference_id, breakout_name=name,
+            kind=parent_meta["kind"], call_type=parent_meta["call_type"],
         )
         db.add(room)
         db.commit()
@@ -10526,7 +10600,10 @@ async def join_meeting_by_code(
         # — no LiveKit room exists until someone with an admitted token actually
         # calls /livekit-token), same call_id-omitted path an instant meeting
         # uses. Guests can sit in the lobby before the host has even joined.
-        conf = ConferenceSession(created_by_user_id=meeting.creator_id, original_call_id=None, is_active=True)
+        conf = ConferenceSession(
+            created_by_user_id=meeting.creator_id, original_call_id=None, is_active=True,
+            kind="meeting",
+        )
         db.add(conf)
         db.flush()
         status = "admitted" if (is_host or not meeting.waiting_room_enabled) else "waiting"
@@ -10538,15 +10615,18 @@ async def join_meeting_by_code(
         meeting.status = "live"
         db.commit()
 
+        meta = _conference_public(db, conf)
         if status == "waiting":
             await ws_manager.send_to_user(meeting.creator_id, {
                 "type": "conference_join_request",
                 "data": {"conference_id": conf.id, "username": username, "user_id": user_id},
             })
-            return {"conference_id": conf.id, "status": "waiting", "participants": []}
-        return {"conference_id": conf.id, "status": "admitted", "participants": []}
+            return {"conference_id": conf.id, "status": "waiting", "participants": [], **meta}
+        return {"conference_id": conf.id, "status": "admitted", "participants": [], **meta}
 
     # Conference already exists.
+    live_conf = db.query(ConferenceSession).filter(ConferenceSession.id == meeting.conference_id).first()
+    meta = _conference_public(db, live_conf)
     existing_admitted = db.query(ConferenceParticipant).filter(
         ConferenceParticipant.conference_id == meeting.conference_id,
         ConferenceParticipant.is_active == True,
@@ -10573,9 +10653,9 @@ async def join_meeting_by_code(
                 "type": "conference_join_request",
                 "data": {"conference_id": meeting.conference_id, "username": username, "user_id": user_id},
             })
-            return {"conference_id": meeting.conference_id, "status": "waiting", "participants": []}
+            return {"conference_id": meeting.conference_id, "status": "waiting", "participants": [], **meta}
         elif my_row.status == "waiting":
-            return {"conference_id": meeting.conference_id, "status": "waiting", "participants": []}
+            return {"conference_id": meeting.conference_id, "status": "waiting", "participants": [], **meta}
         elif my_row.status == "denied":
             raise HTTPException(status_code=403, detail="The host denied your request to join")
 
@@ -10597,7 +10677,7 @@ async def join_meeting_by_code(
             }
         })
 
-    return {"conference_id": meeting.conference_id, "status": "admitted", "participants": other_usernames}
+    return {"conference_id": meeting.conference_id, "status": "admitted", "participants": other_usernames, **meta}
 
 
 def _conference_host_id(db: Session, conference_id: int, conf: Optional[ConferenceSession] = None) -> int:
@@ -10655,11 +10735,13 @@ async def admit_from_waiting_room(
     setattr(part, 'status', 'admitted')
     db.commit()
 
+    conf = db.query(ConferenceSession).filter(ConferenceSession.id == conference_id).first()
+    meta = _conference_public(db, conf)
     await ws_manager.send_to_user(target_user_id, {
         "type": "conference_admitted",
-        "data": {"conference_id": conference_id},
+        "data": {"conference_id": conference_id, **meta},
     })
-    return {"success": True}
+    return {"success": True, **meta}
 
 
 @app.post("/calls/conference/{conference_id}/waiting-room/{target_user_id}/deny")
@@ -11626,7 +11708,10 @@ async def start_group_call(
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
 
-    conf = ConferenceSession(created_by_user_id=caller_id, is_active=True)
+    conf = ConferenceSession(
+        created_by_user_id=caller_id, is_active=True,
+        kind="group_call", call_type=data.call_type,
+    )
     db.add(conf)
     db.flush()
     db.add(ConferenceParticipant(conference_id=conf.id, user_id=caller_id))
@@ -11650,6 +11735,7 @@ async def start_group_call(
             "group_id": int(group_id),
             "group_name": str(group.name),
             "call_type": data.call_type,
+            "kind": "group_call",
         },
     }
     label = "video" if data.call_type == "video" else "voice"
@@ -11674,6 +11760,7 @@ async def start_group_call(
     return {
         "conference_id": int(conf.id),
         "call_type": data.call_type,
+        "kind": "group_call",
         "rung": len(ring_ids),
         "not_rung": len(others) - len(ring_ids),
     }

@@ -957,6 +957,13 @@ class ConferenceSession(Base):
     id = Column(Integer, primary_key=True, index=True)
     created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     original_call_id = Column(Integer, ForeignKey("calls.id"), nullable=True)
+    # What this room is. Clients used to guess from a navigation flag, so a
+    # third person added to a 1:1 call landed in the Meeting UI. "call" is an
+    # upgraded 1:1 (or any ad-hoc call), "group_call" started from a group
+    # chat, "meeting" is a scheduled or instant meeting.
+    kind = Column(String(20), nullable=False, default="meeting")
+    # "voice" | "video" for calls. Null on meetings, where the lobby chooses.
+    call_type = Column(String(10), nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=func.now())
     ended_at = Column(DateTime, nullable=True)
