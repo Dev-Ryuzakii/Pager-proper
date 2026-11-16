@@ -199,8 +199,10 @@ def _user_in_org(db: Session, username: str, organization_id: int) -> User:
     return user
 
 
-def install_channel_routes(app: FastAPI, get_current_user, get_database_session, audit, notify):
-    """audit(db, user_id, event, description). notify is awaited with (user_ids, payload)."""
+def install_channel_routes(app: FastAPI, get_current_user, get_database_session, audit, notify, deliver):
+    """audit(db, user_id, event, description). notify is awaited with (user_ids, payload).
+    deliver(db, user, group_id, fields) is the group send path. Channels do not insert messages themselves.
+    """
 
     @app.post("/channels", status_code=201)
     async def create_channel(
@@ -472,54 +474,8 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
         current_user=Depends(get_current_user),
         db: Session = Depends(get_database_session),
     ):
-        channel = _channel(db, channel_id)
-        role = _require_reader(db, channel, current_user)
-        if role is None:
-            raise HTTPException(status_code=403, detail="You are not a member of this channel")
-        org_admin = is_org_channel_admin(current_user) and same_org(current_user, channel.organization_id)
-        block = posting_block(role, channel.posting_policy, bool(channel.is_archived), org_admin)
-        if block:
-            raise HTTPException(status_code=403, detail=block)
-        root = None
-        if body.thread_root_id is not None:
-            root = db.query(Message).filter(Message.id == body.thread_root_id, Message.group_id == channel_id).first()
-            if not root or root.thread_root_id is not None:
-                raise HTTPException(status_code=404, detail="Thread not found")
-        message = Message(
-            sender_id=int(current_user.id),
-            group_id=channel_id,
-            encrypted_content=body.message,
-            content_type=body.content_type or "encrypted",
-            decoy_content=body.decoy_content,
-            encrypted_key=body.encrypted_key,
-            iv=body.iv,
-            thread_root_id=root.id if root else None,
-            reply_to_message_id=body.reply_to_message_id,
-            mentions=body.mentions,
-            delivered=True,
-            read=False,
-        )
-        db.add(message)
-        if root:
-            apply_thread_reply(root)
-        db.commit()
-        db.refresh(message)
-        member_ids = [row.user_id for row in db.query(GroupMember.user_id).filter(GroupMember.group_id == channel_id).all()]
-        event = "thread_reply" if root else "channel_message"
-        await notify(member_ids, {
-            "type": event,
-            "data": {
-                "channel_id": channel_id,
-                "message_id": int(message.id),
-                "thread_root_id": int(root.id) if root else None,
-                "thread_reply_count": int(root.thread_reply_count) if root else 0,
-            },
-        })
-        return {
-            "message_id": int(message.id),
-            "thread_root_id": int(root.id) if root else None,
-            "thread_reply_count": int(root.thread_reply_count) if root else 0,
-        }
+        _channel(db, channel_id)
+        return await deliver(db, current_user, channel_id, body.model_dump())
 
     @app.get("/channels/{channel_id}/threads/{root_id}")
     async def list_thread(

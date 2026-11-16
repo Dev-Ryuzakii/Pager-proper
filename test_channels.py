@@ -107,10 +107,48 @@ class ChannelHttpTests(unittest.TestCase):
         async def notify(user_ids, payload):
             self.events.append((list(user_ids), payload))
 
+        async def deliver(db, user, group_id, fields):
+            channels.guard_channel_post(db, group_id, user)
+            root = None
+            if fields.get("thread_root_id"):
+                root = db.query(Message).filter(
+                    Message.id == fields["thread_root_id"], Message.group_id == group_id
+                ).first()
+                if not root or root.thread_root_id is not None:
+                    from fastapi import HTTPException
+                    raise HTTPException(status_code=404, detail="Thread not found")
+            message = Message(
+                sender_id=int(user.id), group_id=group_id,
+                encrypted_content=fields.get("message") or "",
+                thread_root_id=root.id if root else None,
+                reply_to_message_id=fields.get("reply_to_message_id"),
+                delivered=True, read=False,
+            )
+            db.add(message)
+            if root:
+                channels.apply_thread_reply(root)
+            db.commit()
+            db.refresh(message)
+            member_ids = [row.user_id for row in db.query(GroupMember.user_id).filter(GroupMember.group_id == group_id).all()]
+            await notify(member_ids, {
+                "type": "new_group_message",
+                "data": {
+                    "message_id": int(message.id),
+                    "thread_root_id": int(root.id) if root else None,
+                    "thread_reply_count": int(root.thread_reply_count) if root else 0,
+                },
+            })
+            return {
+                "status": "sent",
+                "message_id": int(message.id),
+                "thread_root_id": int(root.id) if root else None,
+                "thread_reply_count": int(root.thread_reply_count) if root else 0,
+            }
+
         channels.install_channel_routes(
             app, current_user, get_db,
             lambda db, uid, event, description: self.audit.append((event, description)),
-            notify,
+            notify, deliver,
         )
         self.client = TestClient(app)
 
@@ -166,7 +204,8 @@ class ChannelHttpTests(unittest.TestCase):
         self.assertEqual(thread.status_code, 200)
         self.assertEqual(thread.json()["thread_reply_count"], 1)
         self.assertEqual(len(thread.json()["replies"]), 1)
-        self.assertEqual(self.events[-1][1]["type"], "thread_reply")
+        self.assertEqual(self.events[-1][1]["type"], "new_group_message")
+        self.assertEqual(self.events[-1][1]["data"]["thread_root_id"], root_id)
 
         follow = self.client.post(f"/channels/{channel_id}/threads/{root_id}/follow")
         self.assertEqual(follow.status_code, 200)

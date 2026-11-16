@@ -12196,47 +12196,43 @@ async def mark_group_message_read(
         logger.error(f"Mark group message read error: {e}")
         raise HTTPException(status_code=500, detail="Failed to mark message as read")
 
-@app.post("/messages/group/send")
-async def send_group_message(
-    payload: GroupMessageSend,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_database_session)
-):
-    """Send a message to a group"""
+async def deliver_group_message(db: Session, current_user, group_id: int, fields: dict):
+    """One send path for groups and channels. fields match GroupMessageSend."""
     try:
         user_id = int(getattr(current_user, 'id', 0))
-        is_admin = bool(getattr(current_user, 'is_admin', False))
-        channels.guard_channel_post(db, payload.group_id, current_user)
+        channels.guard_channel_post(db, group_id, current_user)
         
         addressed_to_id = None
         is_announcement = False
 
-        if payload.addressed_to_username:
+        addressed = fields.get("addressed_to_username")
+        if addressed:
             # Find the user — verify they are a group member
-            target_user = db.query(User).filter(User.username == payload.addressed_to_username, User.is_active == True).first()
+            target_user = db.query(User).filter(User.username == addressed, User.is_active == True).first()
             if not target_user:
                 raise HTTPException(status_code=404, detail="Target user not found")
             target_member = db.query(GroupMember).filter(
-                GroupMember.group_id == payload.group_id,
+                GroupMember.group_id == group_id,
                 GroupMember.user_id == target_user.id
             ).first()
             if not target_member:
                 raise HTTPException(status_code=400, detail="Target user is not a member of this group")
             addressed_to_id = target_user.id
             is_announcement = bool(getattr(current_user, 'is_admin', False))
-            
+
         message = MessageService.send_message_to_group(
-            db, user_id, payload.group_id, payload.message,
-            _resolve_group_disappear_hours(db, current_user, payload.group_id, payload.disappear_after_hours, "text"), addressed_to_id, is_announcement,
-            payload.encrypted_key, payload.iv, payload.decoy_content,
-            content_type=_client_content_type(payload.content_type),
-            reply_to_message_id=payload.reply_to_message_id,
-            forwarded_from_message_id=payload.forwarded_from_message_id,
-            mentions=payload.mentions,
+            db, user_id, group_id, fields.get("message") or "",
+            _resolve_group_disappear_hours(db, current_user, group_id, fields.get("disappear_after_hours"), "text"), addressed_to_id, is_announcement,
+            fields.get("encrypted_key"), fields.get("iv"), fields.get("decoy_content"),
+            content_type=_client_content_type(fields.get("content_type")),
+            reply_to_message_id=fields.get("reply_to_message_id"),
+            forwarded_from_message_id=fields.get("forwarded_from_message_id"),
+            mentions=fields.get("mentions"),
         )
-        if payload.thread_root_id:
+        root = None
+        if fields.get("thread_root_id"):
             root = db.query(Message).filter(
-                Message.id == payload.thread_root_id, Message.group_id == payload.group_id
+                Message.id == fields["thread_root_id"], Message.group_id == group_id
             ).first()
             if not root or root.thread_root_id is not None:
                 raise HTTPException(status_code=404, detail="Thread not found")
@@ -12245,21 +12241,21 @@ async def send_group_message(
             db.commit()
 
         # Notify all group members via WebSocket
-        members = db.query(GroupMember).filter(GroupMember.group_id == payload.group_id).all()
+        members = db.query(GroupMember).filter(GroupMember.group_id == group_id).all()
         sender_username = str(getattr(current_user, 'username', ''))
-        mentioned_usernames = set(payload.mentions or [])
+        mentioned_usernames = set(fields.get("mentions") or [])
 
         notification = {
             "type": "new_group_message",
             "data": {
                 "message_id": int(message.id),
-                "group_id": int(payload.group_id),
+                "group_id": int(group_id),
                 "sender_username": sender_username,
-                "recipient_username": payload.addressed_to_username if payload.addressed_to_username else "group",
+                "recipient_username": addressed if addressed else "group",
                 "is_admin_announcement": is_announcement,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "decoy_content": getattr(message, 'decoy_content', ''),
-                "mentions": payload.mentions or [],
+                "mentions": fields.get("mentions") or [],
                 "thread_root_id": int(message.thread_root_id) if getattr(message, "thread_root_id", None) else None,
             }
         }
@@ -12274,9 +12270,16 @@ async def send_group_message(
                     await push_to_user(db, member.user_id, title, "You have a new message", sound="beep.caf")
                 
         monitor_record_event("messages", "send_group", user_id=user_id)
+        await _fire_webhooks(db, "message.sent", {
+            "message_id": int(message.id),
+            "group_id": int(group_id),
+            "sender_username": sender_username,
+        })
         return {
             "status": "sent",
-            "message_id": int(message.id)
+            "message_id": int(message.id),
+            "thread_root_id": int(message.thread_root_id) if getattr(message, "thread_root_id", None) else None,
+            "thread_reply_count": int(root.thread_reply_count) if root else 0,
         }
     except HTTPException as e:
         monitor_record_event("messages", "send_group", status="error", detail=str(e.detail), user_id=int(getattr(current_user, 'id', 0)))
@@ -12285,6 +12288,16 @@ async def send_group_message(
         logger.error(f"Send group message error: {e}")
         monitor_record_event("messages", "send_group", status="error", detail=f"{type(e).__name__}: {e}", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=500, detail="Failed to send group message")
+
+
+@app.post("/messages/group/send")
+async def send_group_message(
+    payload: GroupMessageSend,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session)
+):
+    """Send a message to a group. Channels use this same function."""
+    return await deliver_group_message(db, current_user, payload.group_id, payload.model_dump())
 
 
 # ─── Chat collaboration: reactions, edit, delete, pin, star ────────────────────
@@ -13313,7 +13326,7 @@ async def _notify_users(user_ids, payload):
             pass
 
 
-install_channel_routes(app, get_current_user, get_database_session, _audit, _notify_users)
+install_channel_routes(app, get_current_user, get_database_session, _audit, _notify_users, deliver_group_message)
 
 
 # ─── Profile picture ─────────────────────────────────────────────────────────
