@@ -142,6 +142,21 @@ def _generate_tts_decoy(source_path: str, output_path: str, text: str) -> bool:
                 return False
 
 
+def synthesize_cloned_speech(source_path: str, output_path: str, text: str) -> bool:
+    """Speak `text` with the enrolled voice. Never leave a partial file behind.
+
+    Voice decoys keep their own phrase list. This entry point is only for
+    words the account owner typed.
+    """
+    spoken = " ".join((text or "").split())
+    if not spoken:
+        return False
+    generated = _generate_tts_decoy(source_path, output_path, spoken)
+    if not generated and os.path.exists(output_path):
+        os.remove(output_path)
+    return generated
+
+
 def generate_voice_decoy(
     source_path: str,
     output_path: str,

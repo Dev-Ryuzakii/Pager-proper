@@ -76,6 +76,7 @@ from voice_scrambler import (
     generate_voice_decoy,
     normalize_voice_sample,
 )
+from voice_clone import enrollment_problem, install_voice_clone_routes
 from decoy_document import generate_decoy_document
 from decoy_image import generate_decoy_image, IMAGE_DECOY_KINDS
 from decoy_web_media import fetch_web_decoy_image
@@ -7915,7 +7916,9 @@ async def create_conference(
         if call.ended_at is None:
             call.ended_at = datetime.now(timezone.utc)
     # Add creator as first participant
-    db.add(ConferenceParticipant(conference_id=conf.id, user_id=caller_id))
+    db.add(ConferenceParticipant(
+        conference_id=conf.id, user_id=caller_id, is_active=True, status="admitted",
+    ))
     # Add the other party if call provided. The column is recipient_id — reading
     # callee_id raised AttributeError here, so creating a conference from a live
     # call always failed with a 500 and "add participant" never worked.
@@ -7923,7 +7926,9 @@ async def create_conference(
     if call:
         other_id = (int(call.caller_id) if int(call.recipient_id) == caller_id
                     else int(call.recipient_id))
-        db.add(ConferenceParticipant(conference_id=conf.id, user_id=other_id))
+        db.add(ConferenceParticipant(
+            conference_id=conf.id, user_id=other_id, is_active=True, status="admitted",
+        ))
     db.commit()
     db.refresh(conf)
 
@@ -8325,29 +8330,75 @@ async def conference_livekit_token(
     user_id = int(getattr(current_user, 'id', 0))
     username = str(getattr(current_user, 'username', ''))
 
+    conf = db.query(ConferenceSession).filter(ConferenceSession.id == conference_id).first()
+    if conf is None or not conf.is_active:
+        raise HTTPException(status_code=404, detail="Conference not found or ended")
+
+    # The two people already talking are moved into this room when someone is
+    # added. A screen disposing mid-switch was marking them left, and the next
+    # token request then 403'd. Clients show every 403 as "session expired"
+    # and hang the call up. Put those two back. An invitee who has not
+    # accepted is still refused.
+    original_ids = {int(getattr(conf, "created_by_user_id", 0) or 0)}
+    if getattr(conf, "original_call_id", None):
+        call = db.query(Call).filter(Call.id == conf.original_call_id).first()
+        if call is not None:
+            original_ids.add(int(getattr(call, "caller_id", 0) or 0))
+            original_ids.add(int(getattr(call, "recipient_id", 0) or 0))
+    original_ids.discard(0)
+
     part = db.query(ConferenceParticipant).filter(
         ConferenceParticipant.conference_id == conference_id,
         ConferenceParticipant.user_id == user_id,
-        ConferenceParticipant.is_active == True,
-    ).first()
-    if not part:
+    ).order_by(ConferenceParticipant.id.desc()).first()
+    if part is None and user_id in original_ids:
+        part = ConferenceParticipant(
+            conference_id=conference_id, user_id=user_id, is_active=True, status="admitted",
+        )
+        db.add(part)
+        db.commit()
+        db.refresh(part)
+    elif part is not None and user_id in original_ids and not part.is_active:
+        part.is_active = True
+        part.left_at = None
+        part.status = "admitted"
+        db.commit()
+    elif (
+        part is not None and part.is_active
+        and str(getattr(conf, "kind", "") or "") == "call"
+        and (not getattr(part, "status", None) or part.status == "waiting")
+    ):
+        # A call has no waiting room. A blank or "waiting" status here was
+        # refusing the LiveKit token for people already on the call.
+        part.status = "admitted"
+        db.commit()
+
+    if not part or not part.is_active:
         raise HTTPException(status_code=403, detail="Not an active participant in this conference")
-    if getattr(part, 'status', 'admitted') != 'admitted':
+    if (getattr(part, "status", None) or "admitted") != "admitted":
         raise HTTPException(status_code=403, detail="Waiting for the host to admit you")
 
     # identity is always the real authenticated username (can't be spoofed —
     # that's what every other endpoint keys admit/deny/invite off of); name is
     # a cosmetic label the lobby lets you edit before joining.
+    # Publish and subscribe are set explicitly. A video call with a third
+    # person is the first time these clients use the room, and a token that
+    # cannot subscribe shows everyone only their own camera.
     room_name = f"conf-{conference_id}"
     token = (
         lk_api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
         .with_identity(username)
         .with_name((display_name or "").strip() or username)
-        .with_grants(lk_api.VideoGrants(room_join=True, room=room_name))
+        .with_grants(lk_api.VideoGrants(
+            room_join=True,
+            room=room_name,
+            can_publish=True,
+            can_subscribe=True,
+            can_publish_data=True,
+        ))
         .with_ttl(timedelta(hours=4))
         .to_jwt()
     )
-    conf = db.query(ConferenceSession).filter(ConferenceSession.id == conference_id).first()
     meta = _conference_public(db, conf)
     return {
         "url": LIVEKIT_URL,
@@ -13153,6 +13204,9 @@ async def upload_voice_identity(
             raise HTTPException(status_code=400, detail="Voice sample must be between 1 byte and 10 MB")
         with open(source_path, "wb") as f:
             f.write(content)
+        problem = await run_in_threadpool(enrollment_problem, source_path)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
         if not await run_in_threadpool(normalize_voice_sample, source_path, converted_path):
             raise HTTPException(status_code=400, detail="Voice sample is not valid audio")
 
@@ -13171,23 +13225,18 @@ async def upload_voice_identity(
             if os.path.exists(path):
                 os.remove(path)
 
-@app.get("/users/{username}/voice-identity")
-async def get_user_voice_identity(
-    username: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_database_session)
-):
-    """Let a user check or play back only their own voice identity."""
-    if current_user.username != username:
-        raise HTTPException(status_code=403, detail="Voice identity belongs to another user")
-    user = db.query(User).filter(User.username == username).first()
-    if not user or not user.voice_identity_path:
-        raise HTTPException(status_code=404, detail="Voice identity not found")
-        
-    if not os.path.exists(user.voice_identity_path):
-        raise HTTPException(status_code=404, detail="Voice file missing")
-        
-    return FileResponse(user.voice_identity_path)
+def _voice_upload_dir() -> str:
+    return UPLOAD_DIR
+
+
+# Owner playback, deletion, and typed-speech generation. Decoy notes stay on
+# /media/decoy-voice and still use generate_voice_decoy.
+install_voice_clone_routes(
+    app,
+    get_current_user,
+    get_database_session,
+    _voice_upload_dir,
+)
 
 
 # ─── Profile picture ─────────────────────────────────────────────────────────
@@ -19541,6 +19590,84 @@ async def admin_list_recordings(
             "ended_at": r.ended_at.isoformat() if r.ended_at else None,
         })
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+async def _run_meeting_ai(recording_id: int):
+    """Background job: transcribe + summarise one recording, store on its row."""
+    import meeting_ai
+    from database_models import SessionLocal
+    db = SessionLocal()
+    try:
+        rec = db.query(MeetingRecording).filter(MeetingRecording.id == recording_id).first()
+        if not rec:
+            return
+        result = await meeting_ai.process_file(str(rec.file_path or ""))
+        rec.transcript = result.get("transcript")
+        rec.notes_json = json.dumps(result["notes"]) if result.get("notes") else None
+        rec.ai_status = result["status"]
+        rec.ai_error = result.get("error")
+        rec.ai_providers = f"{result['transcribe_provider']}+{result['summary_provider']}"
+        rec.ai_processed_at = datetime.now(timezone.utc)
+        db.commit()
+    except Exception as e:
+        logger.error(f"[meeting_ai] job for recording {recording_id} crashed: {type(e).__name__}: {e}")
+        db.rollback()
+        rec = db.query(MeetingRecording).filter(MeetingRecording.id == recording_id).first()
+        if rec:
+            rec.ai_status = "failed"
+            rec.ai_error = "Internal error"
+            db.commit()
+    finally:
+        db.close()
+
+
+@app.post("/admin/drive/recordings/{recording_id}/notes", status_code=202)
+async def admin_generate_recording_notes(
+    recording_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Admin only. Kicks off transcript + summary + action items. Poll the GET."""
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    rec = db.query(MeetingRecording).filter(MeetingRecording.id == recording_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    if rec.status != "completed":
+        raise HTTPException(status_code=409, detail="Recording is not finished yet")
+    if rec.ai_status == "processing":
+        raise HTTPException(status_code=409, detail="Already processing")
+    rec.ai_status = "processing"
+    rec.ai_error = None
+    db.commit()
+    background_tasks.add_task(_run_meeting_ai, recording_id)
+    return {"recording_id": recording_id, "ai_status": "processing"}
+
+
+@app.get("/admin/drive/recordings/{recording_id}/notes")
+async def admin_get_recording_notes(
+    recording_id: int,
+    include_transcript: bool = Query(False),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin only")
+    rec = db.query(MeetingRecording).filter(MeetingRecording.id == recording_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    out = {
+        "recording_id": rec.id,
+        "ai_status": rec.ai_status,
+        "ai_error": rec.ai_error,
+        "providers": rec.ai_providers,
+        "processed_at": rec.ai_processed_at.isoformat() if rec.ai_processed_at else None,
+        "notes": json.loads(rec.notes_json) if rec.notes_json else None,
+    }
+    if include_transcript:
+        out["transcript"] = rec.transcript
+    return out
 
 
 @app.get("/admin/drive/recordings/download/{recording_id}")

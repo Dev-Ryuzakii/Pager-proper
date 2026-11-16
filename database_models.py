@@ -1016,6 +1016,13 @@ class MeetingRecording(Base):
     file_size = Column(Integer, nullable=True)
     started_at = Column(DateTime, default=func.now())
     ended_at = Column(DateTime, nullable=True)
+    # AI notes (meeting_ai.py). ai_status: NULL (never run) / processing / done / failed.
+    ai_status = Column(String(20), nullable=True)
+    ai_error = Column(String(255), nullable=True)
+    transcript = Column(Text, nullable=True)
+    notes_json = Column(Text, nullable=True)  # {summary, key_points, decisions, action_items}
+    ai_providers = Column(String(64), nullable=True)  # e.g. "local+ollama" — which tier saw the data
+    ai_processed_at = Column(DateTime, nullable=True)
 
     conference = relationship("ConferenceSession", foreign_keys=[conference_id])
     started_by = relationship("User", foreign_keys=[started_by_user_id])

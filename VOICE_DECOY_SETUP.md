@@ -1,5 +1,9 @@
 # Voice decoy cloning on the backend
 
+Typed speech for the account owner is a separate API, documented in
+`VOICE_CLONE.md`. It uses this same worker. Decoy notes still choose their
+own phrases and do not speak text the user typed.
+
 Voice decoys use [Chatterbox Nano](https://huggingface.co/ResembleAI/chatterbox-nano)
 to synthesize new English speech from the sender's enrolled voice. The model
 is MIT licensed. The enrollment recording is used only as a speaker reference.

@@ -1,3 +1,5 @@
 # Install only inside voice_venv, not the backend venv. The released 0.1.7
 # wheel lacks Nano support; this upstream commit includes nano=True.
+# Weights come from ResembleAI/chatterbox-nano (Hugging Face license: mit).
+# Do not point the worker at OmniVoice or any other CC-BY-NC checkpoint.
 chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git@5de7a54aa4e5e2baadb0182dde554908b48b85c2
