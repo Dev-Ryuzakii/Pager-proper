@@ -135,6 +135,12 @@ def test_notes_access_rules_and_share_text():
     assert meeting_notes.participant_was_admitted("waiting", True, None) is False
     assert meeting_notes.participant_was_admitted("denied", False, None) is False
     assert meeting_notes.participant_was_admitted("admitted", False, None) is False
+    assert meeting_notes.can_assign_others(False, True, False, None) is True
+    assert meeting_notes.can_assign_others(False, True, False, 4) is False
+    assert meeting_notes.can_assign_others(False, False, True, 4) is True
+    assert meeting_notes.assignee_for_action(False, 9, 3) is None
+    assert meeting_notes.assignee_for_action(False, 3, 3) == 3
+    assert meeting_notes.assignee_for_action(True, 9, 3) == 9
 
 
 def test_paid_providers_refuse_without_keys():
@@ -215,6 +221,15 @@ def test_meeting_notes_endpoint_permissions():
     assert started == [rid]
     again = client.post(f"/meetings/recordings/{rid}/notes")
     assert again.status_code == 409
+    recording.notes_json = '{"action_items":[{"task":"Write the recap","owner":"host"}]}'
+    db.commit()
+    holder["user"] = people["guest"]
+    created = client.post(f"/meetings/recordings/{rid}/notes/action-items/0/task")
+    assert created.status_code == 201, created.text
+    assert created.json()["assignee_id"] is None
+    repeat = client.post(f"/meetings/recordings/{rid}/notes/action-items/0/task")
+    assert repeat.status_code == 200, repeat.text
+    assert repeat.json()["task_id"] == created.json()["task_id"]
     db.close()
 
 

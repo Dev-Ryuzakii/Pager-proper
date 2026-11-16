@@ -10,12 +10,14 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from org_privileges import has_org_privilege, is_org_account
 from database_models import (
     ConferenceParticipant,
+    GroupMember,
     Meeting,
     MeetingRecording,
     Organization,
@@ -56,6 +58,24 @@ def start_block(status: Optional[str], ai_status: Optional[str]) -> Optional[tup
         return 409, "Recording is not finished yet"
     if ai_status == "processing":
         return 409, "Already processing"
+    return None
+
+
+def can_assign_others(is_site_admin: bool, has_assign_tasks: bool, is_group_admin: bool, group_id) -> bool:
+    """Same split as POST /tasks: group admin inside a group, assign_tasks otherwise."""
+    if is_site_admin:
+        return True
+    if group_id:
+        return bool(is_group_admin)
+    return bool(has_assign_tasks)
+
+
+def assignee_for_action(can_assign: bool, matched_id: Optional[int], caller_id: int) -> Optional[int]:
+    """Without assign permission the task stays unassigned, unless it is the caller."""
+    if matched_id is None:
+        return None
+    if can_assign or int(matched_id) == int(caller_id):
+        return int(matched_id)
     return None
 
 
@@ -121,6 +141,11 @@ def recording_is_expired(ended_at: Optional[datetime], cutoff: datetime) -> bool
 
 class OrgNotesSetting(BaseModel):
     auto_meeting_notes: bool
+
+
+def _task_assignee_id(db: Session, task_id: int) -> Optional[int]:
+    row = db.query(TaskAssignee).filter(TaskAssignee.task_id == task_id).first()
+    return int(row.user_id) if row else None
 
 
 def _load(db: Session, recording_id: int) -> MeetingRecording:
@@ -214,10 +239,34 @@ def install_meeting_notes_routes(app: FastAPI, get_current_user, get_database_se
         title = str(item.get("task") or "").strip()
         if not title:
             raise HTTPException(status_code=404, detail="Action item not found")
+        if item.get("task_id"):
+            existing = db.query(Task).filter(Task.id == int(item["task_id"])).first()
+            if existing:
+                return JSONResponse(status_code=200, content={
+                    "task_id": int(existing.id),
+                    "title": existing.title,
+                    "assignee_id": _task_assignee_id(db, existing.id),
+                })
         meeting = db.query(Meeting).filter(Meeting.conference_id == recording.conference_id).first()
-        assignee = match_assignee(str(item.get("owner") or ""), _people(db, recording))
+        group_id = meeting.group_id if meeting else None
+        membership = None
+        if group_id:
+            membership = db.query(GroupMember).filter(
+                GroupMember.group_id == group_id, GroupMember.user_id == int(current_user.id)
+            ).first()
+        allowed = can_assign_others(
+            bool(getattr(current_user, "is_admin", False)),
+            has_org_privilege(current_user, "assign_tasks"),
+            bool(membership and membership.role in ("admin", "owner")),
+            group_id,
+        )
+        assignee = assignee_for_action(
+            allowed,
+            match_assignee(str(item.get("owner") or ""), _people(db, recording)),
+            int(current_user.id),
+        )
         task = Task(
-            group_id=meeting.group_id if meeting else None,
+            group_id=group_id,
             created_by_id=int(current_user.id),
             title=title[:255],
             description=str(item.get("due") or "").strip() or None,
@@ -226,6 +275,9 @@ def install_meeting_notes_routes(app: FastAPI, get_current_user, get_database_se
         db.flush()
         if assignee:
             db.add(TaskAssignee(task_id=task.id, user_id=assignee))
+        item["task_id"] = int(task.id)
+        notes["action_items"] = items
+        recording.notes_json = json.dumps(notes)
         db.commit()
         db.refresh(task)
         return {"task_id": int(task.id), "title": task.title, "assignee_id": assignee}
