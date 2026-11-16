@@ -11531,6 +11531,13 @@ def _group_dict(db: Session, g: Group, viewer_id: Optional[int] = None) -> Dict[
     }
 
 
+def _reject_channel_group_write(db: Session, group_id: int) -> None:
+    """Channels have their own routes. These group writes would skip them."""
+    group = db.query(Group).filter(Group.id == group_id).first()
+    if group and channels.group_write_uses_channel_api(getattr(group, "kind", None)):
+        raise HTTPException(status_code=409, detail="Use /channels endpoints")
+
+
 def _require_group_admin(db: Session, group_id: int, user_id: int) -> GroupMember:
     m = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user_id).first()
     if not m:
@@ -11634,6 +11641,7 @@ async def update_group_route(
     """Edit group name, description or disappearing-message timer (group admins)."""
     actor_id = int(getattr(current_user, 'id', 0))
     actor_name = str(getattr(current_user, 'username', ''))
+    _reject_channel_group_write(db, group_id)
     _require_group_admin(db, group_id, actor_id)
     g = db.query(Group).filter(Group.id == group_id).first()
     if not g:
@@ -11672,6 +11680,7 @@ async def delete_group_route(
 ):
     """Delete the group for everyone (group admins)."""
     actor_id = int(getattr(current_user, 'id', 0))
+    _reject_channel_group_write(db, group_id)
     _require_group_admin(db, group_id, actor_id)
     member_ids = [m.user_id for m in db.query(GroupMember).filter(GroupMember.group_id == group_id).all()]
     if not GroupService.delete_group(db, group_id, actor_id):
@@ -11694,6 +11703,7 @@ async def remove_group_member(
     """Remove a member from the group (group admins)."""
     actor_id = int(getattr(current_user, 'id', 0))
     actor_name = str(getattr(current_user, 'username', ''))
+    _reject_channel_group_write(db, group_id)
     _require_group_admin(db, group_id, actor_id)
     target = db.query(User).filter(User.username == username).first()
     if not target:
@@ -11723,6 +11733,7 @@ async def get_group_invite(
 ):
     """Current invite link for the group, creating one on first use (group admins)."""
     actor_id = int(getattr(current_user, 'id', 0))
+    _reject_channel_group_write(db, group_id)
     _require_group_admin(db, group_id, actor_id)
     g = db.query(Group).filter(Group.id == group_id).first()
     if not g:
@@ -11741,6 +11752,7 @@ async def reset_group_invite(
     db: Session = Depends(get_database_session)
 ):
     """Revoke the current invite link and issue a new one (group admins)."""
+    _reject_channel_group_write(db, group_id)
     actor_id = int(getattr(current_user, 'id', 0))
     _require_group_admin(db, group_id, actor_id)
     g = db.query(Group).filter(Group.id == group_id).first()
@@ -11800,6 +11812,8 @@ async def join_group_via_invite(
 ):
     """Join a group through its invite link / QR code."""
     g = _group_by_invite(db, code)
+    if channels.group_write_uses_channel_api(getattr(g, "kind", None)):
+        raise HTTPException(status_code=409, detail="Use /channels endpoints")
     _require_group_organization(db, g, current_user)
     user_id = int(getattr(current_user, 'id', 0))
     username = str(getattr(current_user, 'username', ''))
@@ -11959,6 +11973,7 @@ async def leave_group(
     """Leave a group"""
     try:
         user_id = int(getattr(current_user, 'id', 0))
+        _reject_channel_group_write(db, group_id)
         success = GroupService.leave_group(db, group_id, user_id)
         if success:
             return {"message": "Successfully left the group"}
@@ -11979,6 +11994,7 @@ async def add_group_member(
     """Add a user to a group"""
     try:
         actor_id = int(getattr(current_user, 'id', 0))
+        _reject_channel_group_write(db, group_id)
         success = GroupService.add_member(db, group_id, username, actor_id)
         if success:
             return {"message": f"User {username} added to group"}
@@ -12003,6 +12019,7 @@ async def promote_group_member(
     is_admin or the admin website."""
     try:
         actor_id = int(getattr(current_user, 'id', 0))
+        _reject_channel_group_write(db, group_id)
         actor_member = db.query(GroupMember).filter(
             GroupMember.group_id == group_id, GroupMember.user_id == actor_id
         ).first()
@@ -12040,6 +12057,7 @@ async def demote_group_member(
     """Revoke a group member's admin role — refuses to leave a group with zero admins."""
     try:
         actor_id = int(getattr(current_user, 'id', 0))
+        _reject_channel_group_write(db, group_id)
         actor_member = db.query(GroupMember).filter(
             GroupMember.group_id == group_id, GroupMember.user_id == actor_id
         ).first()

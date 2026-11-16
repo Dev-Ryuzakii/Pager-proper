@@ -54,6 +54,8 @@ def posting_cases():
     assert channels.in_channel_timeline("channel", None) is True
     assert channels.in_channel_timeline("channel", 4) is False
     assert channels.in_channel_timeline("group", 4) is True
+    assert channels.group_write_uses_channel_api("channel") is True
+    assert channels.group_write_uses_channel_api("group") is False
 
 
 class ChannelHttpTests(unittest.TestCase):

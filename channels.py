@@ -61,6 +61,11 @@ def can_manage(role: Optional[str], org_admin: bool) -> bool:
     return org_admin or role in ("owner", "admin")
 
 
+def group_write_uses_channel_api(kind: Optional[str]) -> bool:
+    """Old /groups writes must not change a channel."""
+    return kind == "channel"
+
+
 def in_channel_timeline(kind: Optional[str], thread_root_id) -> bool:
     """Thread replies stay in the thread panel. Groups have no threads."""
     return not (kind == "channel" and thread_root_id is not None)
