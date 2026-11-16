@@ -78,6 +78,7 @@ from voice_scrambler import (
 )
 from voice_clone import enrollment_problem, install_voice_clone_routes
 import channels
+from conference_access import can_revive_original_caller
 from org_privileges import (
     ORG_PRIVILEGES,
     has_org_privilege as _has_org_privilege,
@@ -8370,7 +8371,10 @@ async def conference_livekit_token(
         db.add(part)
         db.commit()
         db.refresh(part)
-    elif part is not None and user_id in original_ids and not part.is_active:
+    elif (
+        part is not None and user_id in original_ids and not part.is_active
+        and can_revive_original_caller(str(getattr(conf, "kind", "") or ""), getattr(part, "status", None))
+    ):
         part.is_active = True
         part.left_at = None
         part.status = "admitted"

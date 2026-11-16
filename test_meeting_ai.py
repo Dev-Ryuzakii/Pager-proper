@@ -108,6 +108,15 @@ def test_segments_group_speakers_and_local_tier_has_none():
     assert meeting_ai.segments_from_words(None) == []
 
 
+def test_denied_callers_are_not_revived():
+    from conference_access import can_revive_original_caller
+    assert can_revive_original_caller("call", "left") is True
+    assert can_revive_original_caller("call", None) is True
+    assert can_revive_original_caller("call", "denied") is False
+    assert can_revive_original_caller("call", "removed") is False
+    assert can_revive_original_caller("meeting", "left") is False
+
+
 def test_notes_access_rules_and_share_text():
     import meeting_notes
     assert meeting_notes.start_block("recording", None)[0] == 409
