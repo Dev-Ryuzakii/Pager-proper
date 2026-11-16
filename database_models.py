@@ -178,6 +178,8 @@ class Organization(Base):
     contact_phone = Column(String(20), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
+    # When a meeting recording finishes, queue transcript + notes without an admin click.
+    auto_meeting_notes = Column(Boolean, default=False, nullable=False)
 
     users = relationship("User", back_populates="organization", foreign_keys="User.organization_id")
 
@@ -270,6 +272,12 @@ class Message(Base):
     # the id) since all we ever need is "which message is this replying to,"
     # not a full parent object graph.
     reply_to_message_id = Column(Integer, ForeignKey("messages.id"), nullable=True)
+    # Channel threads. thread_root_id is the root message; only the root row
+    # carries the count so the channel list can show "N replies" without
+    # scanning the thread.
+    thread_root_id = Column(Integer, ForeignKey("messages.id"), nullable=True, index=True)
+    thread_reply_count = Column(Integer, default=0, nullable=False)
+    thread_last_reply_at = Column(DateTime, nullable=True)
 
     # Forwarding — client decrypts the original then re-sends as a normal new
     # message (content stays E2EE end to end), this column is purely a label
@@ -622,6 +630,15 @@ class Group(Base):
     # applies to every member's messages in this group (null = off).
     invite_code = Column(String(64), unique=True, nullable=True, index=True)
     disappear_after_hours = Column(Integer, nullable=True)
+    # Channels are groups. kind stays 'group' for existing chats so calls,
+    # encryption and read receipts keep using this table.
+    kind = Column(String(20), default="group", nullable=False, index=True)
+    visibility = Column(String(20), default="private", nullable=False)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
+    topic = Column(String(200), nullable=True)
+    is_archived = Column(Boolean, default=False, nullable=False)
+    posting_policy = Column(String(20), default="everyone", nullable=False)
+    slug = Column(String(80), nullable=True, index=True)
     
     # Relationships
     members = relationship("GroupMember", back_populates="group", cascade="all, delete-orphan")
@@ -637,7 +654,7 @@ class GroupMember(Base):
     id = Column(Integer, primary_key=True, index=True)
     group_id = Column(Integer, ForeignKey("groups.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    role = Column(String(20), default="member")  # admin, member
+    role = Column(String(20), default="member")  # owner, admin, member
     joined_at = Column(DateTime, default=func.now())
     
     # Relationships
@@ -646,6 +663,19 @@ class GroupMember(Base):
     
     def __repr__(self):
         return f"<GroupMember(group_id={self.group_id}, user_id={self.user_id}, role='{self.role}')>"
+
+
+class ThreadFollow(Base):
+    """A member asked to be notified about replies in one channel thread."""
+    __tablename__ = "thread_follows"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    root_message_id = Column(Integer, ForeignKey("messages.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=func.now())
+
+    __table_args__ = (UniqueConstraint("user_id", "root_message_id", name="uq_thread_follow"),)
+
 
 class GroupMessageRead(Base):
     """Table to track which members have read which group messages"""
@@ -1023,6 +1053,8 @@ class MeetingRecording(Base):
     notes_json = Column(Text, nullable=True)  # {summary, key_points, decisions, action_items}
     ai_providers = Column(String(64), nullable=True)  # e.g. "local+ollama" — which tier saw the data
     ai_processed_at = Column(DateTime, nullable=True)
+    # Timed speaker lines for seek. Null on the local tier (no diarization).
+    transcript_segments = Column(JSON, nullable=True)
 
     conference = relationship("ConferenceSession", foreign_keys=[conference_id])
     started_by = relationship("User", foreign_keys=[started_by_user_id])

@@ -77,6 +77,10 @@ from voice_scrambler import (
     normalize_voice_sample,
 )
 from voice_clone import enrollment_problem, install_voice_clone_routes
+import channels
+import meeting_notes
+from channels import install_channel_routes, search_channel_rows
+from meeting_notes import install_meeting_notes_routes
 from decoy_document import generate_decoy_document
 from decoy_image import generate_decoy_image, IMAGE_DECOY_KINDS
 from decoy_web_media import fetch_web_decoy_image
@@ -1002,6 +1006,7 @@ class GroupMessageSend(BaseModel):
     iv: Optional[str] = Field(None, description="Initialization Vector for AES")
     decoy_content: Optional[str] = Field(None, description="Client-generated decoy content")
     reply_to_message_id: Optional[int] = Field(None, description="Message this is a threaded reply to")
+    thread_root_id: Optional[int] = Field(None, description="Channel thread root. The reply is kept out of the channel timeline")
     forwarded_from_message_id: Optional[int] = Field(None, description="Original message this was forwarded from, for the UI label only")
     mentions: Optional[List[str]] = Field(None, description="Usernames @mentioned — cleartext, notification targeting only, never message content")
     content_type: Optional[str] = Field(None, description="Omit for normal text — 'gif' or 'sticker' still go through the same encryption/decoy pipeline, just render differently client-side")
@@ -1220,6 +1225,9 @@ class MessageResponse(BaseModel):
     group_id: Optional[int] = None
     reactions: Optional[List[Dict[str, Any]]] = []
     reply_to_message_id: Optional[int] = None
+    thread_root_id: Optional[int] = None
+    thread_reply_count: Optional[int] = 0
+    thread_last_reply_at: Optional[datetime] = None
     forwarded_from_message_id: Optional[int] = None
     is_edited: Optional[bool] = False
     is_deleted: Optional[bool] = False
@@ -4287,6 +4295,12 @@ class AdminService:
                         os.remove(fp)
                     except Exception as e:
                         logger.warning(f"Could not delete meeting recording {fp}: {e}")
+                # Transcript and notes are columns on this row. Clearing them
+                # here keeps the text out of the session if the delete is
+                # reordered later. Do not log the text.
+                rec.transcript = None
+                rec.notes_json = None
+                rec.transcript_segments = None
                 db.delete(rec)
 
             owned_meeting_ids = [
@@ -4860,9 +4874,23 @@ async def lifespan(app: FastAPI):
                                         pass
                                 db.delete(media)
                             db.delete(msg)
-                        if count > 0:
+                        old_recordings = db.query(MeetingRecording).filter(
+                            MeetingRecording.ended_at.isnot(None),
+                            MeetingRecording.ended_at <= cutoff,
+                        ).all()
+                        for rec in old_recordings:
+                            fp = getattr(rec, "file_path", None)
+                            if fp and os.path.exists(fp):
+                                try:
+                                    os.remove(fp)
+                                except OSError:
+                                    pass
+                            db.delete(rec)
+                        if count or old_recordings:
                             db.commit()
-                            logger.info(f"Retention policy: purged {count} message(s) older than {policy.auto_delete_days} days")
+                            logger.info(
+                                f"Retention policy: purged {count} message(s) and {len(old_recordings)} recording(s) older than {policy.auto_delete_days} days"
+                            )
                 finally:
                     db.close()
             except Exception as e:
@@ -8647,6 +8675,14 @@ async def start_conference_recording(
             "type": "conference_recording_started",
             "data": {"conference_id": conference_id},
         })
+        await ws_manager.send_to_user(m.user_id, {
+            "type": "meeting_transcription",
+            "data": {"conference_id": conference_id, "banner": "Recording and transcribing"},
+        })
+    AuditService.log_event(
+        db, user_id, "meeting_transcription_started",
+        meeting_notes.consent_audit_text(conference_id),
+    )
 
     return {"recording_id": rec.id, "status": "recording"}
 
@@ -8654,6 +8690,7 @@ async def start_conference_recording(
 @app.post("/calls/conference/{conference_id}/recording/stop")
 async def stop_conference_recording(
     conference_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
@@ -8698,6 +8735,10 @@ async def stop_conference_recording(
             "type": "conference_recording_stopped",
             "data": {"conference_id": conference_id},
         })
+
+    host = db.query(User).filter(User.id == rec.started_by_user_id).first()
+    if meeting_notes.queue_if_enabled(db, rec, getattr(host, "organization_id", None)):
+        background_tasks.add_task(_run_meeting_ai, int(rec.id))
 
     return {"recording_id": rec.id, "status": "completed"}
 
@@ -11494,6 +11535,11 @@ def _group_dict(db: Session, g: Group, viewer_id: Optional[int] = None) -> Dict[
         "member_count": len(g.members),
         "disappear_after_hours": getattr(g, "disappear_after_hours", None),
         "my_role": my_role,
+        "kind": getattr(g, "kind", "group") or "group",
+        "topic": getattr(g, "topic", None),
+        "visibility": getattr(g, "visibility", None),
+        "posting_policy": getattr(g, "posting_policy", None),
+        "is_archived": bool(getattr(g, "is_archived", False)),
     }
 
 
@@ -11563,6 +11609,7 @@ async def get_groups(
     try:
         user_id = int(getattr(current_user, 'id', 0))
         groups = GroupService.get_user_groups(db, user_id)
+        groups = [g for g in groups if (getattr(g, "kind", None) or "group") != "channel"]
         return [_group_dict(db, g, user_id) for g in groups]
     except Exception as e:
         logger.error(f"Get groups error: {e}")
@@ -12052,7 +12099,14 @@ async def get_group_messages(
         GroupMember.user_id == user_id
     ).first()
     if not membership:
-        raise HTTPException(status_code=403, detail="You are not a member of this group")
+        group = db.query(Group).filter(Group.id == group_id).first()
+        org_admin = bool(
+            group and getattr(group, "kind", None) == "channel"
+            and channels.is_org_channel_admin(current_user)
+            and channels.same_org(current_user, group.organization_id)
+        )
+        if not org_admin:
+            raise HTTPException(status_code=403, detail="You are not a member of this group")
         
     messages = _exclude_hidden(db, db.query(Message).filter(
         Message.group_id == group_id
@@ -12103,6 +12157,9 @@ async def get_group_messages(
             "group_id": int(group_id),
             "reactions": reactions_map.get(m.id, []),
             "reply_to_message_id": m.reply_to_message_id,
+            "thread_root_id": getattr(m, "thread_root_id", None),
+            "thread_reply_count": int(getattr(m, "thread_reply_count", 0) or 0),
+            "thread_last_reply_at": getattr(m, "thread_last_reply_at", None),
             "forwarded_from_message_id": m.forwarded_from_message_id,
             "is_edited": bool(getattr(m, 'is_edited', False)),
             "is_deleted": is_deleted,
@@ -12155,6 +12212,7 @@ async def send_group_message(
     try:
         user_id = int(getattr(current_user, 'id', 0))
         is_admin = bool(getattr(current_user, 'is_admin', False))
+        channels.guard_channel_post(db, payload.group_id, current_user)
         
         addressed_to_id = None
         is_announcement = False
@@ -12182,6 +12240,15 @@ async def send_group_message(
             forwarded_from_message_id=payload.forwarded_from_message_id,
             mentions=payload.mentions,
         )
+        if payload.thread_root_id:
+            root = db.query(Message).filter(
+                Message.id == payload.thread_root_id, Message.group_id == payload.group_id
+            ).first()
+            if not root or root.thread_root_id is not None:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            message.thread_root_id = root.id
+            channels.apply_thread_reply(root)
+            db.commit()
 
         # Notify all group members via WebSocket
         members = db.query(GroupMember).filter(GroupMember.group_id == payload.group_id).all()
@@ -13239,6 +13306,21 @@ install_voice_clone_routes(
 )
 
 
+def _audit(db, user_id, event, description):
+    AuditService.log_event(db, user_id, event, description)
+
+
+async def _notify_users(user_ids, payload):
+    for user_id in user_ids:
+        try:
+            await ws_manager.send_to_user(user_id, payload)
+        except Exception:
+            pass
+
+
+install_channel_routes(app, get_current_user, get_database_session, _audit, _notify_users)
+
+
 # ─── Profile picture ─────────────────────────────────────────────────────────
 
 _PROFILE_PICTURE_CONTENT_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
@@ -13424,6 +13506,8 @@ async def unified_search(
             or_(func.lower(Group.name).like(like), func.lower(func.coalesce(Group.description, "")).like(like)),
         ).limit(limit).all():
             member_count = db.query(GroupMember).filter(GroupMember.group_id == g.id).count()
+            if (getattr(g, "kind", None) or "group") == "channel":
+                continue
             groups.append({"id": int(g.id), "name": g.name, "description": g.description, "member_count": member_count})
 
     # Files the caller sent or received, matched by filename.
@@ -13441,7 +13525,13 @@ async def unified_search(
         func.lower(Media.filename).like(like),
     ).order_by(Media.created_at.desc()).limit(limit).all()]
 
-    return {"query": term, "people": people, "groups": groups, "files": files}
+    return {
+        "query": term,
+        "people": people,
+        "groups": groups,
+        "channels": search_channel_rows(db, current_user, term, limit),
+        "files": files,
+    }
 
 
 class UsernameUpdate(BaseModel):
@@ -19603,6 +19693,7 @@ async def _run_meeting_ai(recording_id: int):
             return
         result = await meeting_ai.process_file(str(rec.file_path or ""))
         rec.transcript = result.get("transcript")
+        rec.transcript_segments = result.get("segments")
         rec.notes_json = json.dumps(result["notes"]) if result.get("notes") else None
         rec.ai_status = result["status"]
         rec.ai_error = result.get("error")
@@ -19619,6 +19710,9 @@ async def _run_meeting_ai(recording_id: int):
             db.commit()
     finally:
         db.close()
+
+
+install_meeting_notes_routes(app, get_current_user, get_database_session, _run_meeting_ai, _audit)
 
 
 @app.post("/admin/drive/recordings/{recording_id}/notes", status_code=202)

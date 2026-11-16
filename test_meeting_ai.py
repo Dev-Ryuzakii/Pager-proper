@@ -94,11 +94,114 @@ def test_process_file_paths():
         meeting_ai._llm, meeting_ai.transcribe_file = orig_llm, orig_tr
 
 
+def test_segments_group_speakers_and_local_tier_has_none():
+    words = [
+        {"word": "Hello", "punctuated_word": "Hello", "speaker": 0, "start": 0.1, "end": 0.4},
+        {"word": "team", "punctuated_word": "team.", "speaker": 0, "start": 0.4, "end": 0.8},
+        {"word": "Agreed", "punctuated_word": "Agreed", "speaker": 1, "start": 1.0, "end": 1.4},
+    ]
+    segments = meeting_ai.segments_from_words(words)
+    assert segments[0]["speaker"] == "Speaker 1"
+    assert segments[0]["text"] == "Hello team."
+    assert segments[1]["speaker"] == "Speaker 2"
+    assert segments[1]["start"] == 1.0
+    assert meeting_ai.segments_from_words(None) == []
+
+
+def test_notes_access_rules_and_share_text():
+    import meeting_notes
+    assert meeting_notes.start_block("recording", None)[0] == 409
+    assert meeting_notes.start_block("completed", "processing")[0] == 409
+    assert meeting_notes.start_block("completed", None) is None
+    assert meeting_notes.start_block("completed", "done") is None
+    people = [
+        {"id": 1, "username": "sam", "full_name": "Sam Lee"},
+        {"id": 2, "username": "sam", "full_name": "Other"},
+    ]
+    assert meeting_notes.match_assignee("Sam Lee", people) == 1
+    assert meeting_notes.match_assignee("sam", people) is None
+    assert meeting_notes.match_assignee("", people) is None
+    text = meeting_notes.share_markdown({
+        "summary": "Shipped.",
+        "key_points": ["Friday"],
+        "decisions": [],
+        "action_items": [{"task": "Write tests", "owner": "Sam", "due": "Thu"}],
+    })
+    assert "Shipped." in text and "Write tests" in text and "Sam" in text
+    assert meeting_notes.share_markdown(None) == ""
+    assert "conference 9" in meeting_notes.consent_audit_text(9)
+
+
 def test_paid_providers_refuse_without_keys():
     meeting_ai.DEEPGRAM_API_KEY = ""
     assert meeting_ai._transcribe_deepgram("/x") is None
     meeting_ai.ANTHROPIC_API_KEY = ""
     assert asyncio.run(meeting_ai._llm("s", "u", "claude")) is None
+
+
+def test_meeting_notes_endpoint_permissions():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    import meeting_notes
+    from database_models import Base, ConferenceParticipant, ConferenceSession, MeetingRecording, Organization, User
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    org = Organization(name="Notes Org", slug="notes-org", contact_name="N", contact_email="n@notes.test")
+    db.add(org)
+    db.flush()
+    people = {}
+    for name, admin in (("host", False), ("guest", False), ("other", False), ("admin", True)):
+        user = User(
+            username=name, phone_number=f"+1666{len(people):04d}",
+            organization_id=org.id, is_admin=admin, is_active=True,
+        )
+        db.add(user)
+        db.flush()
+        people[name] = user
+    conference = ConferenceSession(created_by_user_id=people["host"].id, kind="meeting")
+    db.add(conference)
+    db.flush()
+    db.add(ConferenceParticipant(conference_id=conference.id, user_id=people["host"].id))
+    db.add(ConferenceParticipant(conference_id=conference.id, user_id=people["guest"].id))
+    recording = MeetingRecording(
+        conference_id=conference.id, started_by_user_id=people["host"].id,
+        egress_id="eg-1", status="completed", file_path="/tmp/none.mp4",
+    )
+    db.add(recording)
+    db.commit()
+    holder = {"user": people["guest"]}
+    started = []
+    app = FastAPI()
+
+    def current_user():
+        return holder["user"]
+
+    def get_db():
+        yield db
+
+    meeting_notes.install_meeting_notes_routes(
+        app, current_user, get_db, lambda recording_id: started.append(recording_id),
+        lambda *args: None,
+    )
+    client = TestClient(app)
+    rid = recording.id
+    assert client.get(f"/meetings/recordings/{rid}/notes").status_code == 200
+    holder["user"] = people["other"]
+    assert client.get(f"/meetings/recordings/{rid}/notes").status_code == 403
+    assert client.post(f"/meetings/recordings/{rid}/notes").status_code == 403
+    holder["user"] = people["admin"]
+    first = client.post(f"/meetings/recordings/{rid}/notes")
+    assert first.status_code == 202, first.text
+    assert started == [rid]
+    again = client.post(f"/meetings/recordings/{rid}/notes")
+    assert again.status_code == 409
+    db.close()
 
 
 if __name__ == "__main__":

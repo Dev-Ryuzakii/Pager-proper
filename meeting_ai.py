@@ -89,6 +89,63 @@ def _transcribe_deepgram(path: str) -> Optional[str]:
     return text.strip() or None
 
 
+def segments_from_words(words: Optional[List[dict]]) -> List[Dict[str, Any]]:
+    """Collapse Deepgram word timings into speaker turns. Local tier has none."""
+    segments: List[Dict[str, Any]] = []
+    for word in words or []:
+        if not isinstance(word, dict):
+            continue
+        text = str(word.get("punctuated_word") or word.get("word") or "").strip()
+        if not text:
+            continue
+        speaker = word.get("speaker")
+        label = None if speaker is None else f"Speaker {int(speaker) + 1}"
+        if segments and segments[-1]["speaker"] == label:
+            segments[-1]["text"] = f"{segments[-1]['text']} {text}"
+            segments[-1]["end"] = word.get("end")
+        else:
+            segments.append({
+                "speaker": label,
+                "start": word.get("start"),
+                "end": word.get("end"),
+                "text": text,
+            })
+    return segments
+
+
+def _transcribe_deepgram_diarized(path: str):
+    """Paid tier only. Returns (text, segments). Speakers stay unlabeled locally."""
+    if not DEEPGRAM_API_KEY:
+        logger.warning("[meeting_ai] TRANSCRIBE_PROVIDER=deepgram but DEEPGRAM_API_KEY is unset")
+        return None, None
+    with open(path, "rb") as f:
+        resp = httpx.post(
+            "https://api.deepgram.com/v1/listen",
+            params={"model": "nova-2", "smart_format": "true", "diarize": "true"},
+            headers={"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "video/mp4"},
+            content=f,
+            timeout=httpx.Timeout(600.0, connect=15.0),
+        )
+    if resp.status_code != 200:
+        logger.warning(f"[meeting_ai] Deepgram returned {resp.status_code}: {resp.text[:200]}")
+        return None, None
+    try:
+        alt = resp.json()["results"]["channels"][0]["alternatives"][0]
+        text = (alt.get("transcript") or "").strip()
+    except (KeyError, IndexError, ValueError):
+        return None, None
+    if not text:
+        return None, None
+    return text, segments_from_words(alt.get("words"))
+
+
+def transcribe_detailed(path: str):
+    """(transcript, segments). Segments are only filled for the paid diarized tier."""
+    if (TRANSCRIBE_PROVIDER or "").lower() == "deepgram":
+        return _transcribe_deepgram_diarized(path)
+    return transcribe_file(path), None
+
+
 def transcribe_file(path: str, provider: Optional[str] = None) -> Optional[str]:
     """Blocking (CPU / network heavy). Returns None on any failure."""
     provider = (provider or TRANSCRIBE_PROVIDER).lower()
@@ -225,10 +282,11 @@ async def process_file(path: str) -> Dict[str, Any]:
         return {**result, "status": "failed", "error": "Recording file not found"}
 
     loop = asyncio.get_running_loop()
-    transcript = await loop.run_in_executor(None, transcribe_file, path)
+    transcript, segments = await loop.run_in_executor(None, transcribe_detailed, path)
     if not transcript:
         return {**result, "status": "failed", "error": "Transcription failed or no speech detected"}
     result["transcript"] = transcript
+    result["segments"] = segments
 
     notes = await summarize_transcript(transcript)
     if notes is None:

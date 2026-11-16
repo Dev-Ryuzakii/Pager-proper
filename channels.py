@@ -1,0 +1,666 @@
+"""
+Topic channels. A channel is a Group (kind='channel') so messaging, encryption,
+calls and read receipts stay on the existing tables.
+
+Permission decisions are pure functions so tests do not need Postgres.
+"""
+
+import re
+from datetime import datetime
+from typing import Optional
+
+from fastapi import Depends, FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from database_models import Group, GroupMember, GroupMessageRead, Message, ThreadFollow, User
+
+_SLUG = re.compile(r"[^a-z0-9]+")
+
+
+def slugify(name: str) -> str:
+    slug = _SLUG.sub("-", (name or "").strip().lower()).strip("-")[:80]
+    return slug or "channel"
+
+
+def is_org_channel_admin(user) -> bool:
+    """Site admin, the organization account, or a member granted manage_groups."""
+    if getattr(user, "is_admin", False):
+        return True
+    if getattr(user, "user_type", None) == "organization" or getattr(user, "organization_role", None) == "viewer":
+        return True
+    privs = getattr(user, "org_privileges", None) or []
+    return "*" in privs or "manage_groups" in privs
+
+
+def same_org(user, organization_id) -> bool:
+    if getattr(user, "is_admin", False):
+        return True
+    return organization_id is not None and getattr(user, "organization_id", None) == organization_id
+
+
+def posting_block(role: Optional[str], posting_policy: str, archived: bool, org_admin: bool) -> Optional[str]:
+    """None when the caller may post. Archived wins over the admin exception."""
+    if archived:
+        return "This channel is archived"
+    if posting_policy == "admins" and role not in ("owner", "admin") and not org_admin:
+        return "Only channel admins can post here"
+    return None
+
+
+def can_manage(role: Optional[str], org_admin: bool) -> bool:
+    return org_admin or role in ("owner", "admin")
+
+
+def can_join(visibility: str, already_member: bool) -> Optional[str]:
+    if already_member:
+        return "Already a member"
+    if visibility != "public":
+        return "Private channels are invite-only"
+    return None
+
+
+def can_leave(role: Optional[str]) -> Optional[str]:
+    if role is None:
+        return "You are not a member of this channel"
+    if role == "owner":
+        return "Transfer ownership before leaving"
+    return None
+
+
+def apply_thread_reply(root: Message, when: Optional[datetime] = None) -> None:
+    root.thread_reply_count = int(root.thread_reply_count or 0) + 1
+    root.thread_last_reply_at = when or datetime.utcnow()
+
+
+class ChannelCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    topic: Optional[str] = Field(None, max_length=200)
+    description: Optional[str] = None
+    visibility: str = "private"
+    posting_policy: str = "everyone"
+    members: list[str] = []
+
+
+class ChannelPatch(BaseModel):
+    name: Optional[str] = Field(None, max_length=100)
+    topic: Optional[str] = Field(None, max_length=200)
+    description: Optional[str] = None
+    visibility: Optional[str] = None
+    posting_policy: Optional[str] = None
+
+
+class ChannelMessageIn(BaseModel):
+    message: str = Field(..., min_length=1)
+    encrypted_key: Optional[str] = None
+    iv: Optional[str] = None
+    decoy_content: Optional[str] = None
+    content_type: Optional[str] = None
+    thread_root_id: Optional[int] = None
+    reply_to_message_id: Optional[int] = None
+    mentions: Optional[list[str]] = None
+
+
+class MemberIn(BaseModel):
+    username: str
+
+
+class TransferIn(BaseModel):
+    username: str
+
+
+def _role(db: Session, channel_id: int, user_id: int) -> Optional[str]:
+    row = db.query(GroupMember).filter(
+        GroupMember.group_id == channel_id, GroupMember.user_id == user_id
+    ).first()
+    return row.role if row else None
+
+
+def _channel(db: Session, channel_id: int) -> Group:
+    row = db.query(Group).filter(Group.id == channel_id).first()
+    if not row or getattr(row, "kind", "group") != "channel":
+        raise HTTPException(status_code=404, detail="Channel not found")
+    return row
+
+
+def _require_reader(db: Session, channel: Group, user) -> Optional[str]:
+    role = _role(db, int(channel.id), int(user.id))
+    org_admin = is_org_channel_admin(user) and same_org(user, channel.organization_id)
+    if role is None and not org_admin:
+        raise HTTPException(status_code=403, detail="You are not a member of this channel")
+    return role
+
+
+def _require_manager(db: Session, channel: Group, user) -> str:
+    role = _require_reader(db, channel, user)
+    if not can_manage(role, is_org_channel_admin(user) and same_org(user, channel.organization_id)):
+        raise HTTPException(status_code=403, detail="Only channel owners and admins can do this")
+    return role or "admin"
+
+
+def channel_dict(db: Session, channel: Group, viewer_id: Optional[int]) -> dict:
+    role = _role(db, int(channel.id), int(viewer_id)) if viewer_id else None
+    unread = 0
+    if viewer_id:
+        read_ids = db.query(GroupMessageRead.message_id).filter(GroupMessageRead.user_id == viewer_id)
+        unread = db.query(Message).filter(
+            Message.group_id == channel.id,
+            Message.sender_id != viewer_id,
+            Message.thread_root_id.is_(None),
+            Message.is_deleted.is_(False),
+            ~Message.id.in_(read_ids),
+        ).count()
+    return {
+        "id": int(channel.id),
+        "name": channel.name,
+        "slug": channel.slug,
+        "topic": channel.topic,
+        "description": channel.description,
+        "visibility": channel.visibility,
+        "posting_policy": channel.posting_policy,
+        "is_archived": bool(channel.is_archived),
+        "organization_id": channel.organization_id,
+        "created_by": int(channel.created_by),
+        "member_count": db.query(GroupMember).filter(GroupMember.group_id == channel.id).count(),
+        "my_role": role,
+        "unread_count": unread,
+        "kind": "channel",
+    }
+
+
+def _unique_slug(db: Session, organization_id: int, name: str, ignore_id: Optional[int] = None) -> str:
+    base = slugify(name)
+    slug = base
+    n = 2
+    while True:
+        taken = db.query(Group).filter(
+            Group.organization_id == organization_id,
+            Group.kind == "channel",
+            Group.slug == slug,
+        ).first()
+        if not taken or (ignore_id is not None and int(taken.id) == int(ignore_id)):
+            return slug
+        slug = f"{base[:76]}-{n}"
+        n += 1
+
+
+def _user_in_org(db: Session, username: str, organization_id: int) -> User:
+    user = db.query(User).filter(User.username == username, User.is_active == True).first()
+    if not user or user.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+def install_channel_routes(app: FastAPI, get_current_user, get_database_session, audit, notify):
+    """audit(db, user_id, event, description). notify is awaited with (user_ids, payload)."""
+
+    @app.post("/channels", status_code=201)
+    async def create_channel(
+        body: ChannelCreate,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        org_id = getattr(current_user, "organization_id", None)
+        if not org_id:
+            raise HTTPException(status_code=403, detail="An organization membership is required")
+        if body.visibility not in ("public", "private"):
+            raise HTTPException(status_code=400, detail="visibility must be public or private")
+        if body.posting_policy not in ("everyone", "admins"):
+            raise HTTPException(status_code=400, detail="posting_policy must be everyone or admins")
+        slug = _unique_slug(db, org_id, body.name)
+        channel = Group(
+            name=body.name.strip(),
+            description=(body.description or "").strip() or None,
+            topic=(body.topic or "").strip() or None,
+            created_by=int(current_user.id),
+            kind="channel",
+            visibility=body.visibility,
+            organization_id=org_id,
+            posting_policy=body.posting_policy,
+            slug=slug,
+            is_archived=False,
+        )
+        db.add(channel)
+        db.flush()
+        db.add(GroupMember(group_id=channel.id, user_id=int(current_user.id), role="owner"))
+        for username in body.members:
+            member = _user_in_org(db, username, org_id)
+            if member.id == current_user.id:
+                continue
+            db.add(GroupMember(group_id=channel.id, user_id=member.id, role="member"))
+        db.commit()
+        db.refresh(channel)
+        audit(db, int(current_user.id), "channel_created", f"Channel {channel.id} created")
+        await notify([int(current_user.id)], {"type": "channel_updated", "data": {"channel_id": int(channel.id), "event": "created"}})
+        return channel_dict(db, channel, int(current_user.id))
+
+    @app.get("/channels/browse")
+    async def browse_channels(
+        q: str = Query("", max_length=100),
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        org_id = getattr(current_user, "organization_id", None)
+        if not org_id and not getattr(current_user, "is_admin", False):
+            return []
+        joined = {
+            row.group_id for row in db.query(GroupMember.group_id).filter(GroupMember.user_id == int(current_user.id)).all()
+        }
+        query = db.query(Group).filter(Group.kind == "channel", Group.visibility == "public", Group.is_archived.is_(False))
+        if org_id:
+            query = query.filter(Group.organization_id == org_id)
+        term = q.strip().lower()
+        rows = []
+        for channel in query.all():
+            if channel.id in joined:
+                continue
+            hay = " ".join(filter(None, [channel.name, channel.topic, channel.description])).lower()
+            if term and term not in hay:
+                continue
+            rows.append(channel_dict(db, channel, int(current_user.id)))
+        return rows
+
+    @app.get("/channels")
+    async def list_channels(
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        user_id = int(current_user.id)
+        joined_ids = {
+            row.group_id for row in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()
+        }
+        query = db.query(Group).filter(Group.kind == "channel", Group.id.in_(joined_ids or [-1]))
+        seen = {row.id for row in query.all()}
+        rows = list(query.all()) if joined_ids else []
+        if is_org_channel_admin(current_user):
+            extra = db.query(Group).filter(Group.kind == "channel")
+            org_id = getattr(current_user, "organization_id", None)
+            if org_id and not getattr(current_user, "is_admin", False):
+                extra = extra.filter(Group.organization_id == org_id)
+            for channel in extra.all():
+                if channel.id not in seen:
+                    rows.append(channel)
+        return [channel_dict(db, channel, user_id) for channel in rows]
+
+    @app.get("/channels/{channel_id}")
+    async def get_channel(
+        channel_id: int,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        channel = _channel(db, channel_id)
+        _require_reader(db, channel, current_user)
+        return channel_dict(db, channel, int(current_user.id))
+
+    @app.post("/channels/{channel_id}/join")
+    async def join_channel(
+        channel_id: int,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        channel = _channel(db, channel_id)
+        if not same_org(current_user, channel.organization_id):
+            raise HTTPException(status_code=404, detail="Channel not found")
+        role = _role(db, channel_id, int(current_user.id))
+        reason = can_join(channel.visibility, role is not None)
+        if reason:
+            raise HTTPException(status_code=403, detail=reason)
+        db.add(GroupMember(group_id=channel_id, user_id=int(current_user.id), role="member"))
+        db.commit()
+        return channel_dict(db, channel, int(current_user.id))
+
+    @app.post("/channels/{channel_id}/leave")
+    async def leave_channel(
+        channel_id: int,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        channel = _channel(db, channel_id)
+        role = _role(db, channel_id, int(current_user.id))
+        reason = can_leave(role)
+        if reason:
+            status = 409 if role == "owner" else 403
+            raise HTTPException(status_code=status, detail=reason)
+        db.query(GroupMember).filter(
+            GroupMember.group_id == channel_id, GroupMember.user_id == int(current_user.id)
+        ).delete()
+        db.commit()
+        return {"left": True, "channel_id": channel_id}
+
+    @app.patch("/channels/{channel_id}")
+    async def patch_channel(
+        channel_id: int,
+        body: ChannelPatch,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        channel = _channel(db, channel_id)
+        _require_manager(db, channel, current_user)
+        if body.name is not None and body.name.strip():
+            channel.name = body.name.strip()
+            channel.slug = _unique_slug(db, channel.organization_id, channel.name, ignore_id=int(channel.id))
+        if body.topic is not None:
+            channel.topic = body.topic.strip() or None
+        if body.description is not None:
+            channel.description = body.description.strip() or None
+        if body.visibility is not None:
+            if body.visibility not in ("public", "private"):
+                raise HTTPException(status_code=400, detail="visibility must be public or private")
+            channel.visibility = body.visibility
+        if body.posting_policy is not None:
+            if body.posting_policy not in ("everyone", "admins"):
+                raise HTTPException(status_code=400, detail="posting_policy must be everyone or admins")
+            channel.posting_policy = body.posting_policy
+        db.commit()
+        audit(db, int(current_user.id), "channel_updated", f"Channel {channel_id} updated")
+        return channel_dict(db, channel, int(current_user.id))
+
+    @app.post("/channels/{channel_id}/archive")
+    async def archive_channel(
+        channel_id: int,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        return await _set_archived(channel_id, True, current_user, db, audit)
+
+    @app.post("/channels/{channel_id}/unarchive")
+    async def unarchive_channel(
+        channel_id: int,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        return await _set_archived(channel_id, False, current_user, db, audit)
+
+    @app.post("/channels/{channel_id}/transfer-ownership")
+    async def transfer_ownership(
+        channel_id: int,
+        body: TransferIn,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        channel = _channel(db, channel_id)
+        role = _role(db, channel_id, int(current_user.id))
+        org_admin = is_org_channel_admin(current_user) and same_org(current_user, channel.organization_id)
+        if role != "owner" and not org_admin:
+            raise HTTPException(status_code=403, detail="Only the owner can transfer ownership")
+        target = _user_in_org(db, body.username, channel.organization_id)
+        membership = db.query(GroupMember).filter(
+            GroupMember.group_id == channel_id, GroupMember.user_id == target.id
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=404, detail="User is not a member of this channel")
+        current = db.query(GroupMember).filter(
+            GroupMember.group_id == channel_id, GroupMember.role == "owner"
+        ).first()
+        if current and current.user_id != target.id:
+            current.role = "admin"
+        membership.role = "owner"
+        db.commit()
+        audit(db, int(current_user.id), "channel_ownership_transferred", f"Channel {channel_id} owner is now {body.username}")
+        return channel_dict(db, channel, int(current_user.id))
+
+    @app.post("/channels/{channel_id}/members")
+    async def invite_member(
+        channel_id: int,
+        body: MemberIn,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        channel = _channel(db, channel_id)
+        _require_manager(db, channel, current_user)
+        if channel.visibility != "private" and not is_org_channel_admin(current_user):
+            # Public channels are joined by the member. Admins can still invite.
+            pass
+        target = _user_in_org(db, body.username, channel.organization_id)
+        existing = db.query(GroupMember).filter(
+            GroupMember.group_id == channel_id, GroupMember.user_id == target.id
+        ).first()
+        if not existing:
+            db.add(GroupMember(group_id=channel_id, user_id=target.id, role="member"))
+            db.commit()
+        return {"username": body.username, "role": "member"}
+
+    @app.delete("/channels/{channel_id}/members/{username}")
+    async def remove_member(
+        channel_id: int,
+        username: str,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        channel = _channel(db, channel_id)
+        _require_manager(db, channel, current_user)
+        target = _user_in_org(db, username, channel.organization_id)
+        membership = db.query(GroupMember).filter(
+            GroupMember.group_id == channel_id, GroupMember.user_id == target.id
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=404, detail="User is not a member of this channel")
+        if membership.role == "owner":
+            raise HTTPException(status_code=403, detail="Transfer ownership before removing the owner")
+        db.delete(membership)
+        db.commit()
+        return {"removed": username}
+
+    @app.post("/channels/{channel_id}/members/{username}/promote")
+    async def promote_member(
+        channel_id: int, username: str,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        return _set_role(db, channel_id, username, "admin", current_user)
+
+    @app.post("/channels/{channel_id}/members/{username}/demote")
+    async def demote_member(
+        channel_id: int, username: str,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        return _set_role(db, channel_id, username, "member", current_user)
+
+    @app.post("/channels/{channel_id}/messages", status_code=201)
+    async def post_channel_message(
+        channel_id: int,
+        body: ChannelMessageIn,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        channel = _channel(db, channel_id)
+        role = _require_reader(db, channel, current_user)
+        if role is None:
+            raise HTTPException(status_code=403, detail="You are not a member of this channel")
+        org_admin = is_org_channel_admin(current_user) and same_org(current_user, channel.organization_id)
+        block = posting_block(role, channel.posting_policy, bool(channel.is_archived), org_admin)
+        if block:
+            raise HTTPException(status_code=403, detail=block)
+        root = None
+        if body.thread_root_id is not None:
+            root = db.query(Message).filter(Message.id == body.thread_root_id, Message.group_id == channel_id).first()
+            if not root or root.thread_root_id is not None:
+                raise HTTPException(status_code=404, detail="Thread not found")
+        message = Message(
+            sender_id=int(current_user.id),
+            group_id=channel_id,
+            encrypted_content=body.message,
+            content_type=body.content_type or "encrypted",
+            decoy_content=body.decoy_content,
+            encrypted_key=body.encrypted_key,
+            iv=body.iv,
+            thread_root_id=root.id if root else None,
+            reply_to_message_id=body.reply_to_message_id,
+            mentions=body.mentions,
+            delivered=True,
+            read=False,
+        )
+        db.add(message)
+        if root:
+            apply_thread_reply(root)
+        db.commit()
+        db.refresh(message)
+        member_ids = [row.user_id for row in db.query(GroupMember.user_id).filter(GroupMember.group_id == channel_id).all()]
+        event = "thread_reply" if root else "channel_message"
+        await notify(member_ids, {
+            "type": event,
+            "data": {
+                "channel_id": channel_id,
+                "message_id": int(message.id),
+                "thread_root_id": int(root.id) if root else None,
+                "thread_reply_count": int(root.thread_reply_count) if root else 0,
+            },
+        })
+        return {
+            "message_id": int(message.id),
+            "thread_root_id": int(root.id) if root else None,
+            "thread_reply_count": int(root.thread_reply_count) if root else 0,
+        }
+
+    @app.get("/channels/{channel_id}/threads/{root_id}")
+    async def list_thread(
+        channel_id: int,
+        root_id: int,
+        limit: int = Query(50, ge=1, le=100),
+        before: Optional[int] = None,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        channel = _channel(db, channel_id)
+        _require_reader(db, channel, current_user)
+        root = db.query(Message).filter(Message.id == root_id, Message.group_id == channel_id, Message.thread_root_id.is_(None)).first()
+        if not root:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        query = db.query(Message).filter(Message.thread_root_id == root_id, Message.group_id == channel_id)
+        if before:
+            query = query.filter(Message.id < before)
+        replies = query.order_by(Message.id.desc()).limit(limit).all()
+        replies.reverse()
+        return {
+            "root_id": root_id,
+            "thread_reply_count": int(root.thread_reply_count or 0),
+            "thread_last_reply_at": root.thread_last_reply_at.isoformat() if root.thread_last_reply_at else None,
+            "following": db.query(ThreadFollow).filter(
+                ThreadFollow.user_id == int(current_user.id), ThreadFollow.root_message_id == root_id
+            ).first() is not None,
+            "replies": [_message_brief(db, row) for row in replies],
+        }
+
+    @app.post("/channels/{channel_id}/threads/{root_id}/follow")
+    async def follow_thread(
+        channel_id: int, root_id: int,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        channel = _channel(db, channel_id)
+        role = _require_reader(db, channel, current_user)
+        if role is None:
+            raise HTTPException(status_code=403, detail="You are not a member of this channel")
+        root = db.query(Message).filter(Message.id == root_id, Message.group_id == channel_id).first()
+        if not root:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        if not db.query(ThreadFollow).filter(ThreadFollow.user_id == int(current_user.id), ThreadFollow.root_message_id == root_id).first():
+            db.add(ThreadFollow(user_id=int(current_user.id), root_message_id=root_id))
+            db.commit()
+        return {"following": True, "root_id": root_id}
+
+    @app.delete("/channels/{channel_id}/threads/{root_id}/follow")
+    async def unfollow_thread(
+        channel_id: int, root_id: int,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_database_session),
+    ):
+        channel = _channel(db, channel_id)
+        _require_reader(db, channel, current_user)
+        db.query(ThreadFollow).filter(
+            ThreadFollow.user_id == int(current_user.id), ThreadFollow.root_message_id == root_id
+        ).delete()
+        db.commit()
+        return {"following": False, "root_id": root_id}
+
+
+async def _set_archived(channel_id, archived, current_user, db, audit):
+    channel = _channel(db, channel_id)
+    _require_manager(db, channel, current_user)
+    channel.is_archived = archived
+    db.commit()
+    audit(db, int(current_user.id), "channel_archived" if archived else "channel_unarchived", f"Channel {channel_id}")
+    return channel_dict(db, channel, int(current_user.id))
+
+
+def _set_role(db, channel_id, username, role, current_user):
+    channel = _channel(db, channel_id)
+    _require_manager(db, channel, current_user)
+    target = _user_in_org(db, username, channel.organization_id)
+    membership = db.query(GroupMember).filter(
+        GroupMember.group_id == channel_id, GroupMember.user_id == target.id
+    ).first()
+    if not membership:
+        raise HTTPException(status_code=404, detail="User is not a member of this channel")
+    if membership.role == "owner":
+        raise HTTPException(status_code=403, detail="Transfer ownership instead of changing the owner's role")
+    membership.role = role
+    db.commit()
+    return {"username": username, "role": role}
+
+
+def _message_brief(db: Session, row: Message) -> dict:
+    sender = db.query(User).filter(User.id == row.sender_id).first()
+    return {
+        "id": int(row.id),
+        "sender": getattr(sender, "username", ""),
+        "content": row.encrypted_content,
+        "encrypted_key": row.encrypted_key,
+        "iv": row.iv,
+        "decoy_content": row.decoy_content,
+        "content_type": row.content_type,
+        "timestamp": row.timestamp.isoformat() if row.timestamp else None,
+        "thread_root_id": row.thread_root_id,
+    }
+
+
+def search_channel_rows(db: Session, user, term: str, limit: int) -> list:
+    """Names, topics and descriptions only. Message bodies stay on the client."""
+    like = f"%{term.lower()}%"
+    from sqlalchemy import func, or_
+    query = db.query(Group).filter(
+        Group.kind == "channel",
+        or_(
+            func.lower(Group.name).like(like),
+            func.lower(func.coalesce(Group.topic, "")).like(like),
+            func.lower(func.coalesce(Group.description, "")).like(like),
+        ),
+    )
+    org_id = getattr(user, "organization_id", None)
+    if org_id and not getattr(user, "is_admin", False):
+        query = query.filter(Group.organization_id == org_id)
+    joined = {row.group_id for row in db.query(GroupMember.group_id).filter(GroupMember.user_id == int(user.id)).all()}
+    out = []
+    for channel in query.limit(limit * 3).all():
+        visible = channel.id in joined or (
+            channel.visibility == "public" and same_org(user, channel.organization_id)
+        ) or (is_org_channel_admin(user) and same_org(user, channel.organization_id))
+        if not visible:
+            continue
+        out.append({
+            "id": int(channel.id),
+            "name": channel.name,
+            "topic": channel.topic,
+            "description": channel.description,
+            "visibility": channel.visibility,
+            "member_count": db.query(GroupMember).filter(GroupMember.group_id == channel.id).count(),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def guard_channel_post(db: Session, group_id: int, user) -> Optional[Group]:
+    """Used by the existing group send path so a channel cannot bypass policy."""
+    group = db.query(Group).filter(Group.id == group_id).first()
+    if not group or getattr(group, "kind", "group") != "channel":
+        return None
+    role = _role(db, group_id, int(user.id))
+    if role is None:
+        raise HTTPException(status_code=403, detail="You are not a member of this channel")
+    org_admin = is_org_channel_admin(user) and same_org(user, group.organization_id)
+    block = posting_block(role, group.posting_policy or "everyone", bool(group.is_archived), org_admin)
+    if block:
+        raise HTTPException(status_code=403, detail=block)
+    return group
