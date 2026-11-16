@@ -47,6 +47,9 @@ def posting_cases():
     assert channels.can_leave("owner") == "Transfer ownership before leaving"
     assert channels.can_leave("member") is None
     assert channels.slugify("Launch Plans!") == "launch-plans"
+    assert channels.in_channel_timeline("channel", None) is True
+    assert channels.in_channel_timeline("channel", 4) is False
+    assert channels.in_channel_timeline("group", 4) is True
 
 
 class ChannelHttpTests(unittest.TestCase):

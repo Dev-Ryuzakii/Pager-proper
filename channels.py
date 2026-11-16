@@ -55,6 +55,11 @@ def can_manage(role: Optional[str], org_admin: bool) -> bool:
     return org_admin or role in ("owner", "admin")
 
 
+def in_channel_timeline(kind: Optional[str], thread_root_id) -> bool:
+    """Thread replies stay in the thread panel. Groups have no threads."""
+    return not (kind == "channel" and thread_root_id is not None)
+
+
 def can_join(visibility: str, already_member: bool) -> Optional[str]:
     if already_member:
         return "Already a member"

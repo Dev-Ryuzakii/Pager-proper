@@ -12081,13 +12081,13 @@ async def get_group_messages(
 ):
     """Get all messages for a specific group"""
     user_id = int(getattr(current_user, 'id', 0))
+    group = db.query(Group).filter(Group.id == group_id).first()
     # Check if user is a member
     membership = db.query(GroupMember).filter(
         GroupMember.group_id == group_id, 
         GroupMember.user_id == user_id
     ).first()
     if not membership:
-        group = db.query(Group).filter(Group.id == group_id).first()
         org_admin = bool(
             group and getattr(group, "kind", None) == "channel"
             and channels.is_org_channel_admin(current_user)
@@ -12101,9 +12101,10 @@ async def get_group_messages(
             f"Organization admin viewed channel {group_id} history",
         )
 
-    messages = _exclude_hidden(db, db.query(Message).filter(
-        Message.group_id == group_id
-    ), user_id).order_by(Message.timestamp.desc()).limit(limit).all()
+    history = db.query(Message).filter(Message.group_id == group_id)
+    if group and getattr(group, "kind", None) == "channel":
+        history = history.filter(Message.thread_root_id.is_(None))
+    messages = _exclude_hidden(db, history, user_id).order_by(Message.timestamp.desc()).limit(limit).all()
 
     reactions_map = _reactions_summary(db, [m.id for m in messages], user_id)
 
@@ -12259,6 +12260,7 @@ async def send_group_message(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "decoy_content": getattr(message, 'decoy_content', ''),
                 "mentions": payload.mentions or [],
+                "thread_root_id": int(message.thread_root_id) if getattr(message, "thread_root_id", None) else None,
             }
         }
 
