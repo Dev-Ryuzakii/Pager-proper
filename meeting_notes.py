@@ -13,6 +13,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from org_privileges import has_org_privilege, is_org_account
 from database_models import (
     ConferenceParticipant,
     Meeting,
@@ -270,12 +271,12 @@ def _org(db: Session, user) -> Organization:
 
 
 def _can_edit_org(user) -> bool:
-    if getattr(user, "is_admin", False):
-        return True
-    if getattr(user, "organization_role", None) in ("admin", "viewer") or getattr(user, "user_type", None) == "organization":
-        return True
-    privs = getattr(user, "org_privileges", None) or []
-    return "manage_groups" in privs or "*" in privs
+    """Who may toggle auto transcription. manage_groups is not enough."""
+    return bool(
+        getattr(user, "is_admin", False)
+        or is_org_account(user)
+        or has_org_privilege(user, "manage_staff")
+    )
 
 
 def consent_audit_text(conference_id: int) -> str:

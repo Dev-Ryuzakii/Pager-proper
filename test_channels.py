@@ -13,6 +13,28 @@ import channels
 from database_models import Base, Group, GroupMember, Message, Organization, User
 
 
+def org_admin_cases():
+    viewer = type("U", (), {"is_admin": False, "user_type": "mobile", "organization_role": "viewer", "org_privileges": None})()
+    org = type("U", (), {"is_admin": False, "user_type": "organization", "organization_role": "viewer", "org_privileges": None})()
+    groups = type("U", (), {"is_admin": False, "user_type": "mobile", "organization_role": "member", "org_privileges": ["manage_groups"]})()
+    staff = type("U", (), {"is_admin": False, "user_type": "mobile", "organization_role": "member", "org_privileges": ["manage_staff"]})()
+    star = type("U", (), {"is_admin": False, "user_type": "mobile", "organization_role": "member", "org_privileges": ["*"]})()
+    site = type("U", (), {"is_admin": True, "user_type": "mobile", "organization_role": "member", "org_privileges": None})()
+    member = type("U", (), {"is_admin": False, "user_type": "mobile", "organization_role": "member", "org_privileges": None})()
+    assert channels.is_org_channel_admin(viewer) is False
+    assert channels.is_org_channel_admin(org) is True
+    assert channels.is_org_channel_admin(groups) is True
+    assert channels.is_org_channel_admin(star) is True
+    assert channels.is_org_channel_admin(site) is True
+    assert channels.is_org_channel_admin(member) is False
+    import meeting_notes
+    assert meeting_notes._can_edit_org(viewer) is False
+    assert meeting_notes._can_edit_org(groups) is False
+    assert meeting_notes._can_edit_org(staff) is True
+    assert meeting_notes._can_edit_org(org) is True
+    assert meeting_notes._can_edit_org(site) is True
+
+
 def posting_cases():
     assert channels.posting_block("member", "everyone", False, False) is None
     assert channels.posting_block("member", "admins", False, False) == "Only channel admins can post here"
@@ -175,5 +197,6 @@ class ChannelHttpTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    org_admin_cases()
     posting_cases()
     unittest.main()

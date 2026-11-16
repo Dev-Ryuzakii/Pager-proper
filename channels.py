@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from database_models import Group, GroupMember, GroupMessageRead, Message, ThreadFollow, User
+from org_privileges import has_org_privilege, is_org_account
 
 _SLUG = re.compile(r"[^a-z0-9]+")
 
@@ -24,13 +25,15 @@ def slugify(name: str) -> str:
 
 
 def is_org_channel_admin(user) -> bool:
-    """Site admin, the organization account, or a member granted manage_groups."""
-    if getattr(user, "is_admin", False):
-        return True
-    if getattr(user, "user_type", None) == "organization" or getattr(user, "organization_role", None) == "viewer":
-        return True
-    privs = getattr(user, "org_privileges", None) or []
-    return "*" in privs or "manage_groups" in privs
+    """Site admin, the organization account, or a member granted manage_groups.
+
+    Portal viewers are read-only. They are not implicit admins.
+    """
+    return bool(
+        getattr(user, "is_admin", False)
+        or is_org_account(user)
+        or has_org_privilege(user, "manage_groups")
+    )
 
 
 def same_org(user, organization_id) -> bool:

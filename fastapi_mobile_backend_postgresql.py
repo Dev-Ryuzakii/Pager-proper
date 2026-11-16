@@ -78,6 +78,12 @@ from voice_scrambler import (
 )
 from voice_clone import enrollment_problem, install_voice_clone_routes
 import channels
+from org_privileges import (
+    ORG_PRIVILEGES,
+    has_org_privilege as _has_org_privilege,
+    is_org_account as _is_org_account,
+    org_privilege_set as _org_privilege_set,
+)
 import meeting_notes
 from channels import install_channel_routes, search_channel_rows
 from meeting_notes import install_meeting_notes_routes
@@ -5474,28 +5480,6 @@ async def get_organization_viewer(
 # Groups are self-run (GroupMember.role == "admin"). This is the separate,
 # organization-wide layer: the organization account delegates company-wide
 # powers to chosen staff. The organization account itself holds all of them.
-ORG_PRIVILEGES = {"broadcast", "assign_tasks", "call_control", "manage_staff", "manage_groups", "approve_deletions"}
-
-
-def _is_org_account(user) -> bool:
-    """True for the one delegated account that represents an organization."""
-    return (getattr(user, "user_type", None) == "organization"
-            or getattr(user, "organization_role", None) == "viewer")
-
-
-def _org_privilege_set(user) -> set:
-    """Effective org-wide privileges for a user. Site admins and the
-    organization account implicitly hold every privilege."""
-    if getattr(user, "is_admin", False) or _is_org_account(user):
-        return set(ORG_PRIVILEGES)
-    raw = getattr(user, "org_privileges", None) or []
-    if "*" in raw:
-        return set(ORG_PRIVILEGES)
-    return {p for p in raw if p in ORG_PRIVILEGES}
-
-
-def _has_org_privilege(user, name: str) -> bool:
-    return name in _org_privilege_set(user)
 
 
 # Add admin authentication dependency
