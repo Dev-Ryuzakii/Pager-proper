@@ -1936,7 +1936,7 @@ class GroupService:
         """Add a member to a group (must be an admin or the group creator)"""
         # Check permissions
         actor_member = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == actor_id).first()
-        if not actor_member or actor_member.role != "admin":
+        if not actor_member or not channels.is_group_admin_role(actor_member.role):
             raise HTTPException(status_code=403, detail="Only admins can add members")
             
         user = db.query(User).filter(User.username == username, User.is_active == True).first()
@@ -1989,7 +1989,7 @@ class GroupService:
         # Self-managed groups must never be left without an admin: hand the
         # role to the longest-standing remaining member.
         remaining = db.query(GroupMember).filter(GroupMember.group_id == group_id).order_by(GroupMember.joined_at.asc(), GroupMember.id.asc()).all()
-        if remaining and not any(m.role == "admin" for m in remaining):
+        if remaining and not any(channels.is_group_admin_role(m.role) for m in remaining):
             setattr(remaining[0], 'role', 'admin')
             db.commit()
         
@@ -9783,7 +9783,7 @@ async def _sync_task_to_google(task_id: int, cancelled: bool = False) -> None:
 
 def _is_group_admin(db: Session, group_id: int, user_id: int) -> bool:
     m = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user_id).first()
-    return bool(m and m.role == "admin")
+    return bool(m and channels.is_group_admin_role(m.role))
 
 
 def _task_dict(db: Session, task: Task) -> Dict[str, Any]:
@@ -11535,7 +11535,7 @@ def _require_group_admin(db: Session, group_id: int, user_id: int) -> GroupMembe
     m = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user_id).first()
     if not m:
         raise HTTPException(status_code=403, detail="You are not a member of this group")
-    if m.role != "admin":
+    if not channels.is_group_admin_role(m.role):
         raise HTTPException(status_code=403, detail="Only group admins can do this")
     return m
 
@@ -12006,7 +12006,7 @@ async def promote_group_member(
         actor_member = db.query(GroupMember).filter(
             GroupMember.group_id == group_id, GroupMember.user_id == actor_id
         ).first()
-        if not actor_member or actor_member.role != "admin":
+        if not actor_member or not channels.is_group_admin_role(actor_member.role):
             raise HTTPException(status_code=403, detail="Only group admins can promote members")
 
         target = db.query(User).filter(User.username == username, User.is_active == True).first()
@@ -12043,7 +12043,7 @@ async def demote_group_member(
         actor_member = db.query(GroupMember).filter(
             GroupMember.group_id == group_id, GroupMember.user_id == actor_id
         ).first()
-        if not actor_member or actor_member.role != "admin":
+        if not actor_member or not channels.is_group_admin_role(actor_member.role):
             raise HTTPException(status_code=403, detail="Only group admins can demote members")
 
         target = db.query(User).filter(User.username == username).first()
@@ -12057,7 +12057,7 @@ async def demote_group_member(
             raise HTTPException(status_code=400, detail=f"{username} is not a group admin")
 
         admin_count = db.query(GroupMember).filter(
-            GroupMember.group_id == group_id, GroupMember.role == "admin"
+            GroupMember.group_id == group_id, GroupMember.role.in_(("admin", "owner"))
         ).count()
         if admin_count <= 1:
             raise HTTPException(status_code=400, detail="Cannot demote the last admin of a group")

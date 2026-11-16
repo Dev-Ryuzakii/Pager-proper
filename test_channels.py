@@ -47,6 +47,10 @@ def posting_cases():
     assert channels.can_leave("owner") == "Transfer ownership before leaving"
     assert channels.can_leave("member") is None
     assert channels.slugify("Launch Plans!") == "launch-plans"
+    assert channels.is_group_admin_role("admin") is True
+    assert channels.is_group_admin_role("owner") is True
+    assert channels.is_group_admin_role("member") is False
+    assert channels.is_group_admin_role(None) is False
     assert channels.in_channel_timeline("channel", None) is True
     assert channels.in_channel_timeline("channel", 4) is False
     assert channels.in_channel_timeline("group", 4) is True

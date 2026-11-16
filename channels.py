@@ -25,6 +25,11 @@ def slugify(name: str) -> str:
     return slug or "channel"
 
 
+def is_group_admin_role(role) -> bool:
+    """Channel owners run the group the same way an admin does."""
+    return role in ("admin", "owner")
+
+
 def is_org_channel_admin(user) -> bool:
     """Site admin, the organization account, or a member granted manage_groups.
 

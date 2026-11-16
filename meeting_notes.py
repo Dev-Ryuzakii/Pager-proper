@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+import channels
 from org_privileges import has_org_privilege, is_org_account
 from database_models import (
     ConferenceParticipant,
@@ -257,7 +258,7 @@ def install_meeting_notes_routes(app: FastAPI, get_current_user, get_database_se
         allowed = can_assign_others(
             bool(getattr(current_user, "is_admin", False)),
             has_org_privilege(current_user, "assign_tasks"),
-            bool(membership and membership.role in ("admin", "owner")),
+            bool(membership and channels.is_group_admin_role(membership.role)),
             group_id,
         )
         assignee = assignee_for_action(
