@@ -1,7 +1,7 @@
 """Channel permissions, join rules, archive, and thread counts. SQLite, no Postgres."""
 
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -10,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import channels
-from database_models import Base, Group, GroupMember, Message, Organization, User
+from database_models import Base, Group, GroupMember, HiddenMessage, Message, Organization, User
 
 
 def org_admin_cases():
@@ -126,7 +126,7 @@ class ChannelHttpTests(unittest.TestCase):
             )
             db.add(message)
             if root:
-                channels.apply_thread_reply(root)
+                channels.apply_thread_reply(db, int(root.id))
             db.commit()
             db.refresh(message)
             member_ids = [row.user_id for row in db.query(GroupMember.user_id).filter(GroupMember.group_id == group_id).all()]
@@ -200,10 +200,15 @@ class ChannelHttpTests(unittest.TestCase):
         })
         self.assertEqual(reply.status_code, 201, reply.text)
         self.assertEqual(reply.json()["thread_reply_count"], 1)
+        second = self.client.post(f"/channels/{channel_id}/messages", json={
+            "message": "cipher-reply-2", "thread_root_id": root_id,
+        })
+        self.assertEqual(second.status_code, 201, second.text)
+        self.assertEqual(second.json()["thread_reply_count"], 2)
         thread = self.client.get(f"/channels/{channel_id}/threads/{root_id}")
         self.assertEqual(thread.status_code, 200)
-        self.assertEqual(thread.json()["thread_reply_count"], 1)
-        self.assertEqual(len(thread.json()["replies"]), 1)
+        self.assertEqual(thread.json()["thread_reply_count"], 2)
+        self.assertEqual(len(thread.json()["replies"]), 2)
         self.assertEqual(self.events[-1][1]["type"], "new_group_message")
         self.assertEqual(self.events[-1][1]["data"]["thread_root_id"], root_id)
 
@@ -232,10 +237,39 @@ class ChannelHttpTests(unittest.TestCase):
         self.assertEqual(self.client.post(f"/channels/{private['id']}/join").status_code, 403)
         self._as("owner")
         self.assertEqual(self.client.post(f"/channels/{created['id']}/leave").status_code, 409)
-
         root = self.db.query(Message).filter(Message.id == root_id).one()
-        self.assertEqual(root.thread_reply_count, 1)
+        self.assertEqual(root.thread_reply_count, 2)
         self.assertIsInstance(root.thread_last_reply_at, datetime)
+
+    def test_thread_filters_hidden_expired_and_scrubs_deleted(self):
+        created = self._create()
+        channel_id = created["id"]
+        self._as("member")
+        root = self.client.post(f"/channels/{channel_id}/messages", json={"message": "root"}).json()
+        reply = self.client.post(f"/channels/{channel_id}/messages", json={
+            "message": "gone", "thread_root_id": root["message_id"],
+        }).json()
+        row = self.db.query(Message).filter(Message.id == reply["message_id"]).one()
+        row.is_deleted = True
+        row.encrypted_content = "cipher-secret"
+        hidden = self.client.post(f"/channels/{channel_id}/messages", json={
+            "message": "hidden", "thread_root_id": root["message_id"],
+        }).json()
+        self.db.add(HiddenMessage(user_id=self.users["member"].id, message_id=hidden["message_id"]))
+        expired = self.client.post(f"/channels/{channel_id}/messages", json={
+            "message": "old", "thread_root_id": root["message_id"],
+        }).json()
+        old = self.db.query(Message).filter(Message.id == expired["message_id"]).one()
+        old.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        self.db.commit()
+        page = self.client.get(f"/channels/{channel_id}/threads/{root['message_id']}").json()
+        ids = [item["id"] for item in page["replies"]]
+        self.assertIn(reply["message_id"], ids)
+        self.assertNotIn(hidden["message_id"], ids)
+        self.assertNotIn(expired["message_id"], ids)
+        shown = next(item for item in page["replies"] if item["id"] == reply["message_id"])
+        self.assertEqual(shown["content"], "")
+        self.assertTrue(shown["is_deleted"])
 
 
 if __name__ == "__main__":

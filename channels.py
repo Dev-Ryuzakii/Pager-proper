@@ -6,14 +6,15 @@ Permission decisions are pure functions so tests do not need Postgres.
 """
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from database_models import Group, GroupMember, GroupMessageRead, Message, ThreadFollow, User
+from database_models import Group, GroupMember, GroupMessageRead, HiddenMessage, Message, ThreadFollow, User
 from org_privileges import has_org_privilege, is_org_account
 
 _SLUG = re.compile(r"[^a-z0-9]+")
@@ -76,9 +77,16 @@ def can_leave(role: Optional[str]) -> Optional[str]:
     return None
 
 
-def apply_thread_reply(root: Message, when: Optional[datetime] = None) -> None:
-    root.thread_reply_count = int(root.thread_reply_count or 0) + 1
-    root.thread_last_reply_at = when or datetime.utcnow()
+def apply_thread_reply(db: Session, root_id: int, when: Optional[datetime] = None) -> None:
+    """Atomic increment so two replies at once cannot lose a count."""
+    when = when or datetime.now(timezone.utc)
+    db.query(Message).filter(Message.id == root_id).update(
+        {
+            Message.thread_reply_count: func.coalesce(Message.thread_reply_count, 0) + 1,
+            Message.thread_last_reply_at: when,
+        },
+        synchronize_session="fetch",
+    )
 
 
 class ChannelCreate(BaseModel):
@@ -491,11 +499,16 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
         root = db.query(Message).filter(Message.id == root_id, Message.group_id == channel_id, Message.thread_root_id.is_(None)).first()
         if not root:
             raise HTTPException(status_code=404, detail="Thread not found")
+        now = datetime.now(timezone.utc)
         query = db.query(Message).filter(Message.thread_root_id == root_id, Message.group_id == channel_id)
+        query = query.filter(or_(Message.expires_at.is_(None), Message.expires_at > now))
+        hidden = db.query(HiddenMessage.message_id).filter(HiddenMessage.user_id == int(current_user.id))
+        query = query.filter(~Message.id.in_(hidden))
         if before:
             query = query.filter(Message.id < before)
         replies = query.order_by(Message.id.desc()).limit(limit).all()
         replies.reverse()
+        serialize = globals().get("serialize_message") or _message_brief
         return {
             "root_id": root_id,
             "thread_reply_count": int(root.thread_reply_count or 0),
@@ -503,7 +516,7 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
             "following": db.query(ThreadFollow).filter(
                 ThreadFollow.user_id == int(current_user.id), ThreadFollow.root_message_id == root_id
             ).first() is not None,
-            "replies": [_message_brief(db, row) for row in replies],
+            "replies": [serialize(db, row, int(current_user.id)) for row in replies],
         }
 
     @app.post("/channels/{channel_id}/threads/{root_id}/follow")
@@ -564,18 +577,22 @@ def _set_role(db, channel_id, username, role, current_user):
     return {"username": username, "role": role}
 
 
-def _message_brief(db: Session, row: Message) -> dict:
+def _message_brief(db: Session, row: Message, viewer_id: int = 0) -> dict:
+    """Fallback shape. The app replaces this with the group message serializer."""
     sender = db.query(User).filter(User.id == row.sender_id).first()
+    deleted = bool(getattr(row, "is_deleted", False))
     return {
         "id": int(row.id),
         "sender": getattr(sender, "username", ""),
-        "content": row.encrypted_content,
-        "encrypted_key": row.encrypted_key,
-        "iv": row.iv,
-        "decoy_content": row.decoy_content,
-        "content_type": row.content_type,
+        "content": "" if deleted else row.encrypted_content,
+        "encrypted_key": None if deleted else row.encrypted_key,
+        "iv": None if deleted else row.iv,
+        "decoy_content": "" if deleted else row.decoy_content,
+        "content_type": "deleted" if deleted else row.content_type,
         "timestamp": row.timestamp.isoformat() if row.timestamp else None,
         "thread_root_id": row.thread_root_id,
+        "is_deleted": deleted,
+        "is_edited": bool(getattr(row, "is_edited", False)),
     }
 
 

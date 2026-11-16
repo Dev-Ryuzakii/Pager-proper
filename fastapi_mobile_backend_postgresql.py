@@ -12072,6 +12072,54 @@ async def demote_group_member(
         logger.error(f"Demote group member error: {e}")
         raise HTTPException(status_code=500, detail="Failed to demote member")
 
+def _group_message_dict(db: Session, m: Message, user_id: int, reactions: list) -> dict:
+    """One shape for channel timelines and thread replies."""
+    sender_user = db.query(User).filter(User.id == m.sender_id).first()
+    read_by_rows = db.query(User.username, GroupMessageRead.user_id, GroupMessageRead.read_at).join(
+        GroupMessageRead, User.id == GroupMessageRead.user_id
+    ).filter(GroupMessageRead.message_id == m.id).all()
+    recipient_user = db.query(User).filter(User.id == m.recipient_id).first() if m.recipient_id else None
+    is_private_tagged = m.recipient_id is not None
+    can_read_content = not is_private_tagged or user_id == m.sender_id or user_id == m.recipient_id
+    is_deleted = bool(getattr(m, "is_deleted", False))
+    return {
+        "id": int(m.id),
+        "sender": str(getattr(sender_user, "username", "Unknown")),
+        "recipient": str(getattr(recipient_user, "username", "")) if recipient_user else "group",
+        "content": "" if is_deleted else (str(m.encrypted_content) if can_read_content else str(getattr(m, "decoy_content", "") or "[Private tagged message]")),
+        "content_type": "deleted" if is_deleted else (str(m.content_type) if can_read_content else "private_tagged"),
+        "encrypted_key": None if is_deleted else (getattr(m, "encrypted_key", None) if can_read_content else None),
+        "iv": None if is_deleted else (getattr(m, "iv", None) if can_read_content else None),
+        "timestamp": m.timestamp,
+        "delivered": bool(m.delivered),
+        "read": any(row.user_id == user_id for row in read_by_rows),
+        "read_by": [row.username for row in read_by_rows],
+        "read_receipts": [{"username": row.username, "read_at": row.read_at} for row in read_by_rows],
+        "is_admin_announcement": bool(getattr(m, "is_admin_announcement", False)),
+        "is_private_tagged": is_private_tagged,
+        "decoy_content": "" if is_deleted else str(getattr(m, "decoy_content", "")),
+        "group_id": int(m.group_id) if m.group_id else None,
+        "reactions": reactions,
+        "reply_to_message_id": m.reply_to_message_id,
+        "thread_root_id": getattr(m, "thread_root_id", None),
+        "thread_reply_count": int(getattr(m, "thread_reply_count", 0) or 0),
+        "thread_last_reply_at": getattr(m, "thread_last_reply_at", None),
+        "forwarded_from_message_id": m.forwarded_from_message_id,
+        "is_edited": bool(getattr(m, "is_edited", False)),
+        "is_deleted": is_deleted,
+        "is_pinned": bool(getattr(m, "is_pinned", False)),
+        "mentions": m.mentions or [],
+    }
+
+
+def serialize_channel_reply(db: Session, m: Message, user_id: int) -> dict:
+    reactions = _reactions_summary(db, [m.id], user_id).get(m.id, [])
+    return _group_message_dict(db, m, user_id, reactions)
+
+
+channels.serialize_message = serialize_channel_reply
+
+
 @app.get("/groups/{group_id}/messages", response_model=List[MessageResponse])
 async def get_group_messages(
     group_id: int,
@@ -12107,60 +12155,7 @@ async def get_group_messages(
     messages = _exclude_hidden(db, history, user_id).order_by(Message.timestamp.desc()).limit(limit).all()
 
     reactions_map = _reactions_summary(db, [m.id for m in messages], user_id)
-
-    # Map messages to response model
-    result = []
-    for m in messages:
-        sender_user = db.query(User).filter(User.id == m.sender_id).first()
-
-        # Get who read this message
-        read_by_rows = db.query(User.username, GroupMessageRead.user_id, GroupMessageRead.read_at).join(
-            GroupMessageRead, User.id == GroupMessageRead.user_id
-        ).filter(GroupMessageRead.message_id == m.id).all()
-
-        read_by_list = [row.username for row in read_by_rows]
-        read_receipts = [{"username": row.username, "read_at": row.read_at} for row in read_by_rows]
-        is_read_by_me = any(row.user_id == user_id for row in read_by_rows)
-
-        recipient_user = None
-        if m.recipient_id:
-            recipient_user = db.query(User).filter(User.id == m.recipient_id).first()
-        is_private_tagged = m.recipient_id is not None
-        can_read_content = (
-            not is_private_tagged or
-            user_id == m.sender_id or
-            user_id == m.recipient_id
-        )
-        is_deleted = bool(getattr(m, 'is_deleted', False))
-        result.append({
-            "id": int(m.id),
-            "sender": str(getattr(sender_user, 'username', 'Unknown')),
-            "recipient": str(getattr(recipient_user, 'username', '')) if recipient_user else "group",
-            "content": '' if is_deleted else (str(m.encrypted_content) if can_read_content else str(getattr(m, 'decoy_content', '') or '[Private tagged message]')),
-            "content_type": "deleted" if is_deleted else (str(m.content_type) if can_read_content else "private_tagged"),
-            "encrypted_key": None if is_deleted else (getattr(m, 'encrypted_key', None) if can_read_content else None),
-            "iv": None if is_deleted else (getattr(m, 'iv', None) if can_read_content else None),
-            "timestamp": m.timestamp,
-            "delivered": bool(m.delivered),
-            "read": is_read_by_me,
-            "read_by": read_by_list,
-            "read_receipts": read_receipts,
-            "is_admin_announcement": bool(getattr(m, 'is_admin_announcement', False)),
-            "is_private_tagged": is_private_tagged,
-            "decoy_content": '' if is_deleted else str(getattr(m, 'decoy_content', '')),
-            "group_id": int(group_id),
-            "reactions": reactions_map.get(m.id, []),
-            "reply_to_message_id": m.reply_to_message_id,
-            "thread_root_id": getattr(m, "thread_root_id", None),
-            "thread_reply_count": int(getattr(m, "thread_reply_count", 0) or 0),
-            "thread_last_reply_at": getattr(m, "thread_last_reply_at", None),
-            "forwarded_from_message_id": m.forwarded_from_message_id,
-            "is_edited": bool(getattr(m, 'is_edited', False)),
-            "is_deleted": is_deleted,
-            "is_pinned": bool(getattr(m, 'is_pinned', False)),
-            "mentions": m.mentions or [],
-        })
-    return result
+    return [_group_message_dict(db, m, user_id, reactions_map.get(m.id, [])) for m in messages]
 
 @app.post("/groups/{group_id}/messages/{message_id}/read")
 async def mark_group_message_read(
@@ -12237,8 +12232,9 @@ async def deliver_group_message(db: Session, current_user, group_id: int, fields
             if not root or root.thread_root_id is not None:
                 raise HTTPException(status_code=404, detail="Thread not found")
             message.thread_root_id = root.id
-            channels.apply_thread_reply(root)
+            channels.apply_thread_reply(db, int(root.id))
             db.commit()
+            db.refresh(root)
 
         # Notify all group members via WebSocket
         members = db.query(GroupMember).filter(GroupMember.group_id == group_id).all()
