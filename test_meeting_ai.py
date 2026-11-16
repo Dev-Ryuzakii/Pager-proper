@@ -130,6 +130,11 @@ def test_notes_access_rules_and_share_text():
     assert "Shipped." in text and "Write tests" in text and "Sam" in text
     assert meeting_notes.share_markdown(None) == ""
     assert "conference 9" in meeting_notes.consent_audit_text(9)
+    assert meeting_notes.participant_was_admitted("admitted", True, None) is True
+    assert meeting_notes.participant_was_admitted("admitted", False, "left") is True
+    assert meeting_notes.participant_was_admitted("waiting", True, None) is False
+    assert meeting_notes.participant_was_admitted("denied", False, None) is False
+    assert meeting_notes.participant_was_admitted("admitted", False, None) is False
 
 
 def test_paid_providers_refuse_without_keys():
@@ -156,7 +161,10 @@ def test_meeting_notes_endpoint_permissions():
     db.add(org)
     db.flush()
     people = {}
-    for name, admin in (("host", False), ("guest", False), ("other", False), ("admin", True)):
+    for name, admin in (
+        ("host", False), ("guest", False), ("other", False), ("admin", True),
+        ("waiting", False), ("denied", False), ("invited", False),
+    ):
         user = User(
             username=name, phone_number=f"+1666{len(people):04d}",
             organization_id=org.id, is_admin=admin, is_active=True,
@@ -167,8 +175,11 @@ def test_meeting_notes_endpoint_permissions():
     conference = ConferenceSession(created_by_user_id=people["host"].id, kind="meeting")
     db.add(conference)
     db.flush()
-    db.add(ConferenceParticipant(conference_id=conference.id, user_id=people["host"].id))
-    db.add(ConferenceParticipant(conference_id=conference.id, user_id=people["guest"].id))
+    db.add(ConferenceParticipant(conference_id=conference.id, user_id=people["host"].id, status="admitted", is_active=True))
+    db.add(ConferenceParticipant(conference_id=conference.id, user_id=people["guest"].id, status="admitted", is_active=True))
+    db.add(ConferenceParticipant(conference_id=conference.id, user_id=people["waiting"].id, status="waiting", is_active=True))
+    db.add(ConferenceParticipant(conference_id=conference.id, user_id=people["denied"].id, status="denied", is_active=False))
+    db.add(ConferenceParticipant(conference_id=conference.id, user_id=people["invited"].id, status="admitted", is_active=False, left_at=None))
     recording = MeetingRecording(
         conference_id=conference.id, started_by_user_id=people["host"].id,
         egress_id="eg-1", status="completed", file_path="/tmp/none.mp4",
@@ -194,6 +205,9 @@ def test_meeting_notes_endpoint_permissions():
     assert client.get(f"/meetings/recordings/{rid}/notes").status_code == 200
     holder["user"] = people["other"]
     assert client.get(f"/meetings/recordings/{rid}/notes").status_code == 403
+    for name in ("waiting", "denied", "invited"):
+        holder["user"] = people[name]
+        assert client.get(f"/meetings/recordings/{rid}/notes").status_code == 403, name
     assert client.post(f"/meetings/recordings/{rid}/notes").status_code == 403
     holder["user"] = people["admin"]
     first = client.post(f"/meetings/recordings/{rid}/notes")

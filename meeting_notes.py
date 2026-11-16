@@ -130,12 +130,21 @@ def _load(db: Session, recording_id: int) -> MeetingRecording:
     return row
 
 
+def participant_was_admitted(status, is_active, left_at) -> bool:
+    """Invitees, the waiting room, and denied people never saw the call."""
+    if status != "admitted":
+        return False
+    return bool(is_active) or left_at is not None
+
+
 def _participant_ids(db: Session, recording: MeetingRecording) -> set:
-    ids = {
-        row.user_id for row in db.query(ConferenceParticipant.user_id).filter(
-            ConferenceParticipant.conference_id == recording.conference_id
-        ).all()
-    }
+    ids = set()
+    rows = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == recording.conference_id
+    ).all()
+    for row in rows:
+        if participant_was_admitted(row.status, row.is_active, row.left_at):
+            ids.add(row.user_id)
     if recording.started_by_user_id:
         ids.add(recording.started_by_user_id)
     return ids
