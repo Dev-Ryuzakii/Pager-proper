@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import random
+import re
 import subprocess
 import tempfile
 import threading
@@ -56,6 +57,9 @@ def _rng(seed: Optional[str]) -> random.Random:
     return random.Random(int(hashlib.sha256(seed.encode()).hexdigest()[:16], 16))
 
 
+_DECODED_TIME = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
 def _probe_duration(path: str) -> Optional[float]:
     try:
         out = subprocess.check_output([
@@ -63,8 +67,30 @@ def _probe_duration(path: str) -> Optional[float]:
             "-of", "default=noprint_wrappers=1:nokey=1", path
         ], stderr=subprocess.DEVNULL, timeout=15)
         return float(out.decode().strip())
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except ValueError:
+        # Browser MediaRecorder WebM has no duration in its header, so
+        # ffprobe prints "N/A". Decode the stream to measure it instead.
+        return _decoded_duration(path)
+    except (OSError, subprocess.SubprocessError):
         return None
+
+
+def _decoded_duration(path: str) -> Optional[float]:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-nostdin", "-i", path, "-f", "null", "-"],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    matches = _DECODED_TIME.findall(result.stderr.decode(errors="replace"))
+    if not matches:
+        return None
+    hours, minutes, seconds = matches[-1]
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def _pick_phrases(rng: random.Random, target_duration: Optional[float]) -> List[str]:

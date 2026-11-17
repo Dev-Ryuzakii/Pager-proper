@@ -88,6 +88,19 @@ class VoiceCloneTests(unittest.TestCase):
         self.assertIn("not valid audio", voice_clone.enrollment_problem(junk))
         self.assertIsNone(voice_clone.enrollment_problem(self.sample))
 
+    def test_accepts_browser_webm_without_a_duration_header(self):
+        # MediaRecorder streams WebM, so the header never records a duration
+        # and ffprobe reports "N/A". Writing to a pipe reproduces that.
+        path = Path(self.upload) / "browser.webm"
+        recorded = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=300:duration=7",
+             "-c:a", "libopus", "-f", "webm", "-live", "1", "-"],
+            check=True, capture_output=True,
+        )
+        path.write_bytes(recorded.stdout)
+        self.assertAlmostEqual(voice_scrambler._probe_duration(str(path)), 7, delta=0.2)
+        self.assertIsNone(voice_clone.enrollment_problem(str(path)))
+
     def test_owner_can_preview_generated_speech_and_a_stranger_cannot(self):
         created = self.client.post("/users/me/voice-speech", json={"text": "Hello from the owner"})
         self.assertEqual(created.status_code, 200, created.text)
