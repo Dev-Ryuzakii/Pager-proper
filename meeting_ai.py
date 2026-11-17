@@ -275,6 +275,15 @@ async def summarize_transcript(transcript: str, provider: Optional[str] = None) 
 
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
+def resolve_recording_path(file_path: Optional[str], recordings_dir: str) -> str:
+    """Egress may store a relative name. The API looks beside RECORDINGS_DIR."""
+    if not file_path:
+        return ""
+    if os.path.isabs(file_path):
+        return file_path
+    return os.path.join(os.path.abspath(recordings_dir), file_path)
+
+
 def concurrency_limit(raw: Optional[str]) -> int:
     try:
         value = int(raw if raw is not None else "1")

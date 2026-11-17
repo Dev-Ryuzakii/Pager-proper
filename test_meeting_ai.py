@@ -139,6 +139,9 @@ def test_notes_access_rules_and_share_text():
     assert meeting_ai.concurrency_limit("1") == 1
     assert meeting_ai.concurrency_limit("0") == 1
     assert meeting_ai.concurrency_limit("nope") == 1
+    assert meeting_ai.resolve_recording_path("room.mp4", "/var/recordings") == "/var/recordings/room.mp4"
+    assert meeting_ai.resolve_recording_path("/tmp/room.mp4", "/var/recordings") == "/tmp/room.mp4"
+    assert meeting_ai.resolve_recording_path("", "/var/recordings") == ""
     assert meeting_notes.start_block("completed", "done") is None
     people = [
         {"id": 1, "username": "sam", "full_name": "Sam Lee"},

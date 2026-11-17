@@ -78,6 +78,7 @@ from voice_scrambler import (
 )
 from voice_clone import enrollment_problem, install_voice_clone_routes
 import channels
+import meeting_ai
 from conference_access import can_revive_original_caller
 from org_privileges import (
     ORG_PRIVILEGES,
@@ -8338,7 +8339,7 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
 # Room-composite recordings (Egress renders every published track into one
 # MP4) — superadmin-only, written here rather than media_uploads/ since
 # recordings aren't part of the encrypted chat/media model at all.
-RECORDINGS_DIR = "meeting_recordings"
+RECORDINGS_DIR = os.path.abspath(os.environ.get("RECORDINGS_DIR", "meeting_recordings"))
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
 
@@ -8723,8 +8724,9 @@ async def stop_conference_recording(
 
     setattr(rec, 'status', 'completed')
     setattr(rec, 'ended_at', datetime.now(timezone.utc))
-    if os.path.exists(rec.file_path):
-        setattr(rec, 'file_size', os.path.getsize(rec.file_path))
+    stored_recording = meeting_ai.resolve_recording_path(rec.file_path, RECORDINGS_DIR)
+    if stored_recording and os.path.exists(stored_recording):
+        setattr(rec, 'file_size', os.path.getsize(stored_recording))
     db.commit()
 
     members = db.query(ConferenceParticipant).filter(
@@ -19740,14 +19742,13 @@ async def admin_list_recordings(
 
 async def _run_meeting_ai(recording_id: int):
     """Background job: transcribe + summarise one recording, store on its row."""
-    import meeting_ai
     from database_models import SessionLocal
     db = SessionLocal()
     try:
         rec = db.query(MeetingRecording).filter(MeetingRecording.id == recording_id).first()
         if not rec:
             return
-        result = await meeting_ai.process_file(str(rec.file_path or ""))
+        result = await meeting_ai.process_file(meeting_ai.resolve_recording_path(rec.file_path, RECORDINGS_DIR))
         rec.transcript = result.get("transcript")
         rec.transcript_segments = result.get("segments")
         rec.notes_json = json.dumps(result["notes"]) if result.get("notes") else None
@@ -19838,9 +19839,10 @@ async def admin_download_drive_recording(
         raise HTTPException(status_code=403, detail="Admin only")
 
     r = db.query(MeetingRecording).filter(MeetingRecording.id == recording_id).first()
-    if not r or not r.file_path or not os.path.exists(r.file_path):
+    recording_path = meeting_ai.resolve_recording_path(r.file_path if r else None, RECORDINGS_DIR)
+    if not r or not recording_path or not os.path.exists(recording_path):
         raise HTTPException(status_code=404, detail="Recording not found")
-    return FileResponse(r.file_path, filename=os.path.basename(r.file_path), media_type="video/mp4")
+    return FileResponse(recording_path, filename=os.path.basename(recording_path), media_type="video/mp4")
 
 
 # ─── Snapshot endpoints (battery, network, device-info, clipboard, screenshot, photo) ───
