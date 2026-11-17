@@ -1041,9 +1041,8 @@ class MeetingRecording(Base):
     """
     A LiveKit room-composite (mux of every published track) recording of a
     conference, rendered server-side by LiveKit Egress and written to local
-    disk. Superadmin-only (Drive site) — never exposed to regular users, and
-    unrelated to the E2EE encrypted_content DMs/groups use: a recording
-    captures the call itself, not message contents.
+    disk. Participants download the file from their You chat. The MP4 is not
+    end-to-end encrypted: Egress writes it in the clear on the server.
     """
     __tablename__ = "meeting_recordings"
 

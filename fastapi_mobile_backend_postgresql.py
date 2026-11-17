@@ -87,6 +87,7 @@ from org_privileges import (
     org_privilege_set as _org_privilege_set,
 )
 import meeting_notes
+import self_dm
 from channels import install_channel_routes, search_channel_rows
 from meeting_notes import install_meeting_notes_routes
 from decoy_document import generate_decoy_document
@@ -1672,34 +1673,17 @@ class MessageService:
             decoy_content,
         )
 
-        expires_at = None
-        auto_delete = False
-        if disappear_after_hours is not None and disappear_after_hours > 0:
-            expires_at = datetime.now(timezone.utc) + timedelta(hours=disappear_after_hours)
-            auto_delete = True
-
-        message = Message(
-            sender_id=sender_id,
-            recipient_id=recipient.id,
-            encrypted_content=message_content,
-            content_type=content_type,
-            delivered=False,
-            read=False,
-            is_offline=True,
-            expires_at=expires_at,
-            auto_delete=auto_delete,
-            decoy_content=decoy_text,
+        return self_dm.create_direct_message(
+            db, sender_id, recipient.id, message_content,
+            disappear_after_hours=disappear_after_hours,
             encrypted_key=encrypted_key,
             iv=iv,
+            decoy_content=decoy_text,
+            content_type=content_type,
             reply_to_message_id=reply_to_message_id,
             forwarded_from_message_id=forwarded_from_message_id,
             mentions=mentions,
         )
-
-        db.add(message)
-        db.commit()
-        db.refresh(message)
-        return message
 
     @staticmethod
     def send_message_to_group(db: Session, sender_id: int, group_id: int, message_content: str,
@@ -5386,12 +5370,9 @@ ws_manager = ConnectionManager()
 
 
 # Authentication dependency
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
-                          db: Session = Depends(get_database_session)) -> User:
-    """Get current authenticated user"""
+async def _user_for_session_token(db: Session, token: str) -> User:
+    """Resolve a session token the same way Authorization: Bearer does."""
     try:
-        token = credentials.credentials
-
         # Validate session
         session = SessionService.validate_session(db, token)
         user_id = session.user_id if session else None
@@ -5452,6 +5433,12 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             detail="Authentication failed",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security),
+                          db: Session = Depends(get_database_session)) -> User:
+    """Get current authenticated user"""
+    return await _user_for_session_token(db, credentials.credentials)
 
 
 async def get_onboarding_user(
@@ -8172,6 +8159,7 @@ async def conference_accept(
 @app.post("/calls/conference/{conference_id}/decline")
 async def conference_decline(
     conference_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
@@ -8211,6 +8199,10 @@ async def conference_decline(
                     "type": "conference_ended",
                     "data": {"conference_id": conference_id},
                 })
+            try:
+                await _complete_live_recordings(db, conference_id, background_tasks)
+            except Exception as e:
+                logger.error("recording auto-stop failed for %s: %s", conference_id, type(e).__name__)
 
     return {"success": True}
 
@@ -8248,6 +8240,7 @@ async def conference_signal(
 @app.post("/calls/conference/{conference_id}/leave")
 async def conference_leave(
     conference_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
@@ -8305,6 +8298,10 @@ async def conference_leave(
                     "type": "conference_invite_cancelled",
                     "data": {"conference_id": conference_id},
                 })
+            try:
+                await _complete_live_recordings(db, conference_id, background_tasks)
+            except Exception as e:
+                logger.error("recording auto-stop failed for %s: %s", conference_id, type(e).__name__)
 
     return {"success": True}
 
@@ -8560,6 +8557,7 @@ async def auto_breakout_rooms(
 @app.post("/meetings/{conference_id}/breakout/end")
 async def end_breakout_rooms(
     conference_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
 ):
@@ -8590,6 +8588,12 @@ async def end_breakout_rooms(
             "type": "breakout_ended",
             "data": {"parent_conference_id": conference_id},
         })
+
+    for room in rooms:
+        try:
+            await _complete_live_recordings(db, int(room.id), background_tasks)
+        except Exception as e:
+            logger.error("recording auto-stop failed for %s: %s", room.id, type(e).__name__)
 
     AuditService.log_event(db, user_id, "breakout_ended", f"Breakout rooms ended for conference {conference_id}")
     return {"ended": len(rooms)}
@@ -8696,6 +8700,108 @@ async def start_conference_recording(
     return {"recording_id": rec.id, "status": "recording"}
 
 
+async def _stop_egress_quietly(egress_id: Optional[str]):
+    """Egress stop can 404 once the room is already empty. Local completion still proceeds."""
+    if not egress_id or not (lk_api and LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        return
+    api = lk_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        await api.egress.stop_egress(lk_api.StopEgressRequest(egress_id=egress_id))
+    except Exception as e:
+        logger.error(f"Egress stop error: {e}")
+    finally:
+        await api.aclose()
+
+
+async def _announce_self_card(db: Session, message: Message, content_type: str, push_title: Optional[str] = None, push_body: Optional[str] = None):
+    user = db.query(User).filter(User.id == message.recipient_id).first()
+    username = str(getattr(user, "username", "") or "")
+    sent = await ws_manager.send_to_user(int(message.recipient_id), {
+        "type": "new_message",
+        "data": {
+            "message_id": int(message.id),
+            "sender_username": username,
+            "recipient_username": username,
+            "content_type": content_type,
+            "is_self": True,
+            "timestamp": self_dm.iso_z(message.timestamp) or self_dm.iso_z(datetime.now(timezone.utc)),
+        },
+    })
+    if not sent and push_title:
+        await push_to_user(db, int(message.recipient_id), push_title, push_body or "", sound="beep.caf")
+
+
+async def _deliver_recording_cards(recording_id: int):
+    from database_models import SessionLocal
+    db = SessionLocal()
+    try:
+        messages = self_dm.deliver_recording_cards(db, recording_id, RECORDINGS_DIR)
+        for message in messages:
+            title = "Meeting"
+            try:
+                title = json.loads(message.encrypted_content).get("meeting_title") or title
+            except Exception:
+                pass
+            await _announce_self_card(
+                db, message, "meeting_recording",
+                "Meeting recording", f"Your recording of {title} is ready",
+            )
+        logger.info("recording cards delivered recording_id=%s count=%s", recording_id, len(messages))
+    except Exception as e:
+        logger.error("recording card delivery failed for %s: %s", recording_id, type(e).__name__)
+    finally:
+        db.close()
+
+
+async def _deliver_notes_cards(recording_id: int):
+    from database_models import SessionLocal
+    db = SessionLocal()
+    try:
+        messages = self_dm.deliver_notes_cards(db, recording_id)
+        for message in messages:
+            await _announce_self_card(db, message, "meeting_notes")
+        logger.info("notes cards delivered recording_id=%s count=%s", recording_id, len(messages))
+    except Exception as e:
+        logger.error("notes card delivery failed for %s: %s", recording_id, type(e).__name__)
+    finally:
+        db.close()
+
+
+async def _complete_live_recordings(db: Session, conference_id: int, background_tasks: BackgroundTasks) -> list:
+    """Stop any in-progress egress for this room and queue cards. Cards never fail the caller."""
+    rows = db.query(MeetingRecording).filter(
+        MeetingRecording.conference_id == conference_id,
+        MeetingRecording.status == "recording",
+    ).all()
+    done = []
+    for rec in rows:
+        await _stop_egress_quietly(rec.egress_id)
+        rec.status = "completed"
+        rec.ended_at = meeting_notes.naive_utc()
+        stored = meeting_ai.resolve_recording_path(rec.file_path, RECORDINGS_DIR)
+        if stored and os.path.exists(stored) and os.path.getsize(stored) > 0:
+            rec.file_size = os.path.getsize(stored)
+        db.commit()
+        members = db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.conference_id == conference_id,
+            ConferenceParticipant.is_active == True,
+        ).all()
+        for member in members:
+            await ws_manager.send_to_user(member.user_id, {
+                "type": "conference_recording_stopped",
+                "data": {"conference_id": conference_id},
+            })
+        host = db.query(User).filter(User.id == rec.started_by_user_id).first()
+        if meeting_notes.queue_if_enabled(db, rec, getattr(host, "organization_id", None)):
+            background_tasks.add_task(_run_meeting_ai, int(rec.id))
+        try:
+            background_tasks.add_task(_deliver_recording_cards, int(rec.id))
+        except Exception as e:
+            logger.error("recording card schedule failed for %s: %s", rec.id, type(e).__name__)
+        done.append(rec)
+    return done
+
+
 @app.post("/calls/conference/{conference_id}/recording/stop")
 async def stop_conference_recording(
     conference_id: int,
@@ -8718,39 +8824,9 @@ async def stop_conference_recording(
     if not rec:
         raise HTTPException(status_code=404, detail="No recording in progress")
 
-    api = lk_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-    try:
-        await api.egress.stop_egress(lk_api.StopEgressRequest(egress_id=rec.egress_id))
-    except Exception as e:
-        logger.error(f"Egress stop error: {e}")
-        # Fall through and mark it stopped locally anyway — Egress considers
-        # a room going empty an implicit stop too, so this call can 404/409
-        # legitimately if that already happened.
-    finally:
-        await api.aclose()
-
-    setattr(rec, 'status', 'completed')
-    setattr(rec, 'ended_at', datetime.now(timezone.utc))
-    stored_recording = meeting_ai.resolve_recording_path(rec.file_path, RECORDINGS_DIR)
-    if stored_recording and os.path.exists(stored_recording):
-        setattr(rec, 'file_size', os.path.getsize(stored_recording))
-    db.commit()
-
-    members = db.query(ConferenceParticipant).filter(
-        ConferenceParticipant.conference_id == conference_id,
-        ConferenceParticipant.is_active == True,
-    ).all()
-    for m in members:
-        await ws_manager.send_to_user(m.user_id, {
-            "type": "conference_recording_stopped",
-            "data": {"conference_id": conference_id},
-        })
-
-    host = db.query(User).filter(User.id == rec.started_by_user_id).first()
-    if meeting_notes.queue_if_enabled(db, rec, getattr(host, "organization_id", None)):
-        background_tasks.add_task(_run_meeting_ai, int(rec.id))
-
-    return {"recording_id": rec.id, "status": "completed"}
+    done = await _complete_live_recordings(db, conference_id, background_tasks)
+    finished = done[0] if done else rec
+    return {"recording_id": finished.id, "status": "completed"}
 
 
 # ─── Scheduled meetings ────────────────────────────────────────────────────────
@@ -11309,12 +11385,7 @@ async def get_conversation(
         _require_same_organization(current_user, partner)
         partner_id = int(getattr(partner, 'id', 0))
 
-        msg_query = db.query(Message).filter(
-            or_(
-                and_(Message.sender_id == user_id, Message.recipient_id == partner_id),
-                and_(Message.sender_id == partner_id, Message.recipient_id == user_id),
-            )
-        )
+        msg_query = db.query(Message).filter(self_dm.dm_clause(user_id, partner_id))
         chat_settings = db.query(ChatSettings).filter(
             ChatSettings.user_id == user_id, ChatSettings.peer_username == partner_username,
         ).first()
@@ -11472,34 +11543,9 @@ async def get_conversations(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session)
 ):
-    """Get list of users the current user has exchanged messages with"""
+    """Self chat first, then the people this user has exchanged messages with."""
     try:
-        user_id = int(getattr(current_user, 'id', 0))
-
-        msgs = db.query(Message).filter(
-            or_(
-                Message.sender_id == user_id,
-                Message.recipient_id == user_id
-            )
-        ).order_by(Message.timestamp.desc()).all()
-
-        seen: set = set()
-        partner_ids: list = []
-        for msg in msgs:
-            pid = msg.recipient_id if msg.sender_id == user_id else msg.sender_id
-            if pid not in seen:
-                seen.add(pid)
-                partner_ids.append(pid)
-
-        result = []
-        for pid in partner_ids:
-            partner = db.query(User).filter(User.id == pid, User.is_active == True).first()
-            if partner and _same_organization(current_user, partner):
-                result.append({
-                    "username": str(getattr(partner, 'username', '')),
-                    "is_active": bool(getattr(partner, 'is_active', False)),
-                })
-        return result
+        return self_dm.list_conversations(db, current_user)
     except Exception as e:
         logger.error(f"Conversations fetch error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch conversations")
@@ -19761,6 +19807,7 @@ async def _run_meeting_ai(recording_id: int):
     """Background job: transcribe + summarise one recording, store on its row."""
     from database_models import SessionLocal
     db = SessionLocal()
+    done = False
     try:
         rec = db.query(MeetingRecording).filter(MeetingRecording.id == recording_id).first()
         if not rec:
@@ -19773,6 +19820,7 @@ async def _run_meeting_ai(recording_id: int):
         rec.ai_error = result.get("error")
         rec.ai_providers = f"{result['transcribe_provider']}+{result['summary_provider']}"
         rec.ai_processed_at = datetime.now(timezone.utc)
+        done = rec.ai_status == "done"
         db.commit()
     except Exception as e:
         logger.error(f"[meeting_ai] job for recording {recording_id} crashed: {type(e).__name__}: {e}")
@@ -19784,9 +19832,14 @@ async def _run_meeting_ai(recording_id: int):
             db.commit()
     finally:
         db.close()
+    if done:
+        await _deliver_notes_cards(recording_id)
 
 
 install_meeting_notes_routes(app, get_current_user, get_database_session, _run_meeting_ai, _audit)
+self_dm.install_recording_library_routes(
+    app, get_current_user, _user_for_session_token, get_database_session, lambda: RECORDINGS_DIR,
+)
 
 
 @app.post("/admin/drive/recordings/{recording_id}/notes", status_code=202)
