@@ -8430,12 +8430,17 @@ async def conference_livekit_token(
         .to_jwt()
     )
     meta = _conference_public(db, conf)
+    recording = db.query(MeetingRecording).filter(
+        MeetingRecording.conference_id == conference_id,
+        MeetingRecording.status == "recording",
+    ).first() is not None
     return {
         "url": LIVEKIT_URL,
         "token": token,
         "room": room_name,
         "is_host": _conference_host_id(db, conference_id, conf) == user_id,
         **meta,
+        **meeting_notes.recording_banner(recording),
     }
 
 

@@ -366,6 +366,13 @@ def _can_edit_org(user) -> bool:
     )
 
 
+def recording_banner(is_recording: bool) -> dict:
+    """Late joiners did not see the websocket that went out when recording started."""
+    if not is_recording:
+        return {}
+    return {"recording": True, "banner": "Recording and transcribing"}
+
+
 def consent_audit_text(conference_id: int) -> str:
     return f"Recording and transcription started for conference {conference_id}"
 

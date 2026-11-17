@@ -159,6 +159,8 @@ def test_notes_access_rules_and_share_text():
     assert "Shipped." in text and "Write tests" in text and "Sam" in text
     assert meeting_notes.share_markdown(None) == ""
     assert "conference 9" in meeting_notes.consent_audit_text(9)
+    assert meeting_notes.recording_banner(False) == {}
+    assert meeting_notes.recording_banner(True)["banner"] == "Recording and transcribing"
     assert meeting_notes.participant_was_admitted("admitted", True, None) is True
     assert meeting_notes.participant_was_admitted("admitted", False, "left") is True
     assert meeting_notes.participant_was_admitted("waiting", True, None) is False
