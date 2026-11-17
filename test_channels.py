@@ -43,7 +43,9 @@ def posting_cases():
     assert channels.posting_block(None, "everyone", False, True) is None
     assert channels.posting_block("owner", "everyone", True, True) == "This channel is archived"
     assert channels.can_join("public", False) is None
+    assert channels.can_join("public", False, archived=True) == "This channel is archived"
     assert channels.can_join("private", False) == "Private channels are invite-only"
+    assert channels.thread_push_recipients([2, 3], 4, 3, [2]) == [4]
     assert channels.can_leave("owner") == "Transfer ownership before leaving"
     assert channels.can_leave("member") is None
     assert channels.member_change_block("admin", "member", False, "remove") is None
@@ -198,6 +200,14 @@ class ChannelHttpTests(unittest.TestCase):
         self.assertEqual(created["my_role"], "owner")
         self.assertEqual(created["slug"], "launch-plans")
         self.assertTrue(any(event == "channel_created" for event, _ in self.audit))
+        self.assertIn(self.users["member"].id, self.events[0][0])
+        self._as("owner")
+        archived_join = self.client.post(f"/channels/{channel_id}/archive")
+        self.assertEqual(archived_join.status_code, 200)
+        self._as("outsider")
+        self.assertEqual(self.client.post(f"/channels/{channel_id}/join").status_code, 403)
+        self._as("owner")
+        self.assertEqual(self.client.post(f"/channels/{channel_id}/unarchive").status_code, 200)
 
         self._as("stranger")
         self.assertEqual(self.client.get(f"/channels/{channel_id}").status_code, 403)

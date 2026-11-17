@@ -82,7 +82,9 @@ def in_channel_timeline(kind: Optional[str], thread_root_id) -> bool:
     return not (kind == "channel" and thread_root_id is not None)
 
 
-def can_join(visibility: str, already_member: bool) -> Optional[str]:
+def can_join(visibility: str, already_member: bool, archived: bool = False) -> Optional[str]:
+    if archived:
+        return "This channel is archived"
     if already_member:
         return "Already a member"
     if visibility != "public":
@@ -96,6 +98,16 @@ def can_leave(role: Optional[str]) -> Optional[str]:
     if role == "owner":
         return "Transfer ownership before leaving"
     return None
+
+
+def thread_push_recipients(follower_ids, author_id, sender_id, muted_ids) -> list:
+    """Followers and the root author, except the sender and muted chats."""
+    ids = set(follower_ids or [])
+    if author_id:
+        ids.add(int(author_id))
+    ids.discard(int(sender_id))
+    muted = set(muted_ids or [])
+    return sorted(uid for uid in ids if uid not in muted)
 
 
 def reply_target_block(target_group_id, group_id) -> Optional[str]:
@@ -268,15 +280,17 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
         db.add(channel)
         db.flush()
         db.add(GroupMember(group_id=channel.id, user_id=int(current_user.id), role="owner"))
+        notified = [int(current_user.id)]
         for username in body.members:
             member = _user_in_org(db, username, org_id)
             if member.id == current_user.id:
                 continue
             db.add(GroupMember(group_id=channel.id, user_id=member.id, role="member"))
+            notified.append(int(member.id))
         db.commit()
         db.refresh(channel)
         audit(db, int(current_user.id), "channel_created", f"Channel {channel.id} created")
-        await notify([int(current_user.id)], {"type": "channel_updated", "data": {"channel_id": int(channel.id), "event": "created"}})
+        await notify(notified, {"type": "channel_updated", "data": {"channel_id": int(channel.id), "event": "created"}})
         return channel_dict(db, channel, int(current_user.id))
 
     @app.get("/channels/browse")
@@ -347,7 +361,7 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
         if not same_org(current_user, channel.organization_id):
             raise HTTPException(status_code=404, detail="Channel not found")
         role = _role(db, channel_id, int(current_user.id))
-        reason = can_join(channel.visibility, role is not None)
+        reason = can_join(channel.visibility, role is not None, bool(channel.is_archived))
         if reason:
             raise HTTPException(status_code=403, detail=reason)
         db.add(GroupMember(group_id=channel_id, user_id=int(current_user.id), role="member"))
@@ -453,9 +467,8 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
     ):
         channel = _channel(db, channel_id)
         _require_manager(db, channel, current_user)
-        if channel.visibility != "private" and not is_org_channel_admin(current_user):
-            # Public channels are joined by the member. Admins can still invite.
-            pass
+        if channel.is_archived:
+            raise HTTPException(status_code=403, detail="This channel is archived")
         target = _user_in_org(db, body.username, channel.organization_id)
         existing = db.query(GroupMember).filter(
             GroupMember.group_id == channel_id, GroupMember.user_id == target.id
@@ -463,6 +476,8 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
         if not existing:
             db.add(GroupMember(group_id=channel_id, user_id=target.id, role="member"))
             db.commit()
+            audit(db, int(current_user.id), "channel_member_added", f"{body.username} added to channel {channel_id}")
+            await notify([int(target.id)], {"type": "channel_updated", "data": {"channel_id": channel_id, "event": "added"}})
         return {"username": body.username, "role": "member"}
 
     @app.delete("/channels/{channel_id}/members/{username}")
@@ -487,8 +502,13 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
         blocked = member_change_block(actor_role, membership.role, org_admin, "remove")
         if blocked:
             raise HTTPException(status_code=403, detail=blocked)
+        root_ids = db.query(Message.id).filter(Message.group_id == channel_id, Message.thread_root_id.is_(None))
+        db.query(ThreadFollow).filter(
+            ThreadFollow.user_id == target.id, ThreadFollow.root_message_id.in_(root_ids)
+        ).delete(synchronize_session=False)
         db.delete(membership)
         db.commit()
+        await notify([int(target.id)], {"type": "channel_updated", "data": {"channel_id": channel_id, "event": "removed"}})
         return {"removed": username}
 
     @app.post("/channels/{channel_id}/members/{username}/promote")

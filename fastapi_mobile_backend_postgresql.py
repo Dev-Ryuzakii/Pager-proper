@@ -12283,11 +12283,26 @@ async def deliver_group_message(db: Session, current_user, group_id: int, fields
         for member in members:
             if member.user_id != user_id:
                 ws_sent = await ws_manager.send_to_user(member.user_id, notification)
-                if not ws_sent:
+                if not ws_sent and not root:
                     member_user = db.query(User).filter(User.id == member.user_id).first()
                     was_mentioned = bool(member_user and member_user.username in mentioned_usernames)
                     title = "You were mentioned" if was_mentioned else "New message"
                     await push_to_user(db, member.user_id, title, "You have a new message", sound="beep.caf")
+        if root:
+            from database_models import ThreadFollow
+            followers = [
+                row.user_id for row in db.query(ThreadFollow.user_id).filter(ThreadFollow.root_message_id == root.id).all()
+            ]
+            now = datetime.now(timezone.utc)
+            muted = set()
+            for row in db.query(ChatSettings).filter(ChatSettings.group_id == group_id, ChatSettings.is_muted == True).all():
+                until = row.muted_until
+                if until is not None and getattr(until, "tzinfo", None) is None:
+                    until = until.replace(tzinfo=timezone.utc)
+                if until is None or until > now:
+                    muted.add(row.user_id)
+            for uid in channels.thread_push_recipients(followers, root.sender_id, user_id, muted):
+                await push_to_user(db, uid, "Thread reply", "New reply in a thread you follow", sound="beep.caf")
                 
         monitor_record_event("messages", "send_group", user_id=user_id)
         await _fire_webhooks(db, "message.sent", {
