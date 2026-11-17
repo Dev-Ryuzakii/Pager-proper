@@ -4619,6 +4619,19 @@ async def lifespan(app: FastAPI):
             logger.warning("⚠️  App will start but database functionality may be limited")
         else:
             logger.info("✅ PostgreSQL database connected successfully")
+            try:
+                from database_models import SessionLocal, MeetingRecording
+                import meeting_notes as _meeting_notes
+                _stale = SessionLocal()
+                try:
+                    stuck = _stale.query(MeetingRecording).filter(MeetingRecording.ai_status == "processing").all()
+                    if _meeting_notes.fail_stale_jobs(stuck):
+                        _stale.commit()
+                        logger.info("Marked stale meeting notes jobs as failed")
+                finally:
+                    _stale.close()
+            except Exception as e:
+                logger.warning(f"Could not recover stale meeting notes jobs: {type(e).__name__}")
             
             # Create tables if they don't exist
             if db_config.create_tables():
@@ -19773,10 +19786,11 @@ async def admin_generate_recording_notes(
         raise HTTPException(status_code=404, detail="Recording not found")
     if rec.status != "completed":
         raise HTTPException(status_code=409, detail="Recording is not finished yet")
-    if rec.ai_status == "processing":
+    if rec.ai_status == "processing" and not meeting_notes.processing_is_stale(rec.ai_status, getattr(rec, "ai_started_at", None), datetime.now(timezone.utc)):
         raise HTTPException(status_code=409, detail="Already processing")
     rec.ai_status = "processing"
     rec.ai_error = None
+    rec.ai_started_at = datetime.now(timezone.utc)
     db.commit()
     background_tasks.add_task(_run_meeting_ai, recording_id)
     return {"recording_id": recording_id, "ai_status": "processing"}

@@ -122,6 +122,14 @@ def test_notes_access_rules_and_share_text():
     assert meeting_notes.start_block("recording", None)[0] == 409
     assert meeting_notes.start_block("completed", "processing")[0] == 409
     assert meeting_notes.start_block("completed", None) is None
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    assert meeting_notes.processing_is_stale("processing", now - timedelta(hours=3), now) is True
+    assert meeting_notes.processing_is_stale("processing", now - timedelta(minutes=5), now) is False
+    assert meeting_notes.start_block("completed", "processing", now - timedelta(hours=3), now) is None
+    stuck = type("R", (), {"ai_status": "processing", "ai_started_at": None, "ai_error": None})()
+    assert meeting_notes.fail_stale_jobs([stuck], now) == 1
+    assert stuck.ai_status == "failed"
     assert meeting_notes.start_block("completed", "done") is None
     people = [
         {"id": 1, "username": "sam", "full_name": "Sam Lee"},

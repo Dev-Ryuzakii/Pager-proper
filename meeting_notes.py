@@ -6,7 +6,7 @@ the text this module formats.
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
@@ -53,13 +53,39 @@ def notes_view(recording, include_transcript: bool = False) -> dict:
     return out
 
 
-def start_block(status: Optional[str], ai_status: Optional[str]) -> Optional[tuple]:
+def processing_is_stale(ai_status: Optional[str], started_at: Optional[datetime], now: datetime) -> bool:
+    """A restart can leave a job processing. Two hours is long enough to have died."""
+    if ai_status != "processing" or started_at is None:
+        return False
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now - started_at >= timedelta(hours=2)
+
+
+def start_block(status: Optional[str], ai_status: Optional[str], started_at: Optional[datetime] = None, now: Optional[datetime] = None) -> Optional[tuple]:
     """(http_status, detail) when a notes job must not start."""
     if status != "completed":
         return 409, "Recording is not finished yet"
-    if ai_status == "processing":
+    now = now or datetime.now(timezone.utc)
+    if ai_status == "processing" and not processing_is_stale(ai_status, started_at, now):
         return 409, "Already processing"
     return None
+
+
+def fail_stale_jobs(rows, now: Optional[datetime] = None) -> int:
+    """Mark stuck processing rows failed. Returns how many changed. Does not log text."""
+    now = now or datetime.now(timezone.utc)
+    changed = 0
+    for row in rows:
+        started = getattr(row, "ai_started_at", None)
+        # A processing row with no start time did not survive a restart.
+        if getattr(row, "ai_status", None) == "processing" and (started is None or processing_is_stale("processing", started, now)):
+            row.ai_status = "failed"
+            row.ai_error = "Processing timed out"
+            changed += 1
+    return changed
 
 
 def can_assign_others(is_site_admin: bool, has_assign_tasks: bool, is_group_admin: bool, group_id) -> bool:
@@ -214,11 +240,12 @@ def install_meeting_notes_routes(app: FastAPI, get_current_user, get_database_se
     ):
         recording = _load(db, recording_id)
         _require_reader(db, recording, current_user)
-        block = start_block(recording.status, recording.ai_status)
+        block = start_block(recording.status, recording.ai_status, recording.ai_started_at)
         if block:
             raise HTTPException(status_code=block[0], detail=block[1])
         recording.ai_status = "processing"
         recording.ai_error = None
+        recording.ai_started_at = datetime.now(timezone.utc)
         db.commit()
         background_tasks.add_task(start_job, recording_id)
         return {"recording_id": recording_id, "ai_status": "processing"}
@@ -352,9 +379,10 @@ def queue_if_enabled(db: Session, recording: MeetingRecording, organization_id: 
     org = db.query(Organization).filter(Organization.id == organization_id).first()
     if not org or not org.auto_meeting_notes:
         return False
-    if start_block(recording.status, recording.ai_status):
+    if start_block(recording.status, recording.ai_status, getattr(recording, "ai_started_at", None)):
         return False
     recording.ai_status = "processing"
     recording.ai_error = None
+    recording.ai_started_at = datetime.now(timezone.utc)
     db.commit()
     return True

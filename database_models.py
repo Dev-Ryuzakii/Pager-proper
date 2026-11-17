@@ -1063,6 +1063,7 @@ class MeetingRecording(Base):
     notes_json = Column(Text, nullable=True)  # {summary, key_points, decisions, action_items}
     ai_providers = Column(String(64), nullable=True)  # e.g. "local+ollama" — which tier saw the data
     ai_processed_at = Column(DateTime, nullable=True)
+    ai_started_at = Column(DateTime, nullable=True)
     # Timed speaker lines for seek. Null on the local tier (no diarization).
     transcript_segments = Column(JSON, nullable=True)
 
