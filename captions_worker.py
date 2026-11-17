@@ -34,6 +34,25 @@ import numpy as np
 
 logger = logging.getLogger("captions_worker")
 
+
+def load_env_file(path: str = ".env") -> None:
+    """Fill os.environ from .env without overriding what the process already has."""
+    if not os.path.exists(path):
+        return
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.removeprefix("export ").strip()
+            os.environ.setdefault(key, value.strip().strip('"').strip("'"))
+
+
+# Settings below are read at import, so .env has to be loaded first.
+if __name__ == "__main__":
+    load_env_file()
+
 SAMPLE_RATE = 16000
 FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
@@ -410,12 +429,6 @@ async def _guarded(session_id: int, conference_id: int, transcriber: Transcriber
 
 
 if __name__ == "__main__":
-    if os.path.exists(".env"):
-        with open(".env") as fh:
-            for line in fh:
-                if "=" in line and not line.startswith("#"):
-                    k, v = line.strip().split("=", 1)
-                    os.environ.setdefault(k, v)
     asyncio.run(main())
 
 # Deploy notes
