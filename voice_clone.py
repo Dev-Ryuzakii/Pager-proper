@@ -5,6 +5,7 @@ copy VoiceStudio. It only validates recordings and text, keeps files inside the
 signed-in user's directory, and removes partial output when generation fails.
 """
 
+import asyncio
 import json
 import logging
 import operator
@@ -25,6 +26,32 @@ from starlette.concurrency import run_in_threadpool
 from voice_scrambler import _probe_duration, synthesize_cloned_speech
 
 logger = logging.getLogger(__name__)
+
+
+def voice_concurrency_limit(raw: Optional[str]) -> int:
+    try:
+        value = int(raw if raw is not None else "1")
+    except (TypeError, ValueError):
+        return 1
+    return value if value > 0 else 1
+
+
+_VOICE_SEM = None
+
+
+def voice_semaphore():
+    global _VOICE_SEM
+    if _VOICE_SEM is None:
+        _VOICE_SEM = asyncio.Semaphore(voice_concurrency_limit(os.environ.get("VOICE_CLONE_CONCURRENCY")))
+    return _VOICE_SEM
+
+
+async def acquire_voice(sem) -> bool:
+    """False when the cap is full. The caller releases the semaphore."""
+    if sem.locked():
+        return False
+    await sem.acquire()
+    return True
 
 MIN_ENROLLMENT_SECONDS = 5.0
 MAX_SPEECH_CHARS = 400
@@ -306,18 +333,23 @@ def install_voice_clone_routes(app: FastAPI, get_current_user, get_database_sess
         current_user=Depends(get_current_user),
     ):
         """Speak text in the signed-in user's enrolled voice."""
+        if not await acquire_voice(voice_semaphore()):
+            raise HTTPException(status_code=429, detail="Voice generation is busy")
         try:
-            clip = await run_in_threadpool(
-                generate_owned_speech,
-                upload_dir(),
-                int(current_user.id),
-                current_user.voice_identity_path,
-                body.text,
-                synthesize,
-            )
-        except VoiceCloneError as exc:
-            _http(exc)
-        return clip
+            try:
+                clip = await run_in_threadpool(
+                    generate_owned_speech,
+                    upload_dir(),
+                    int(current_user.id),
+                    current_user.voice_identity_path,
+                    body.text,
+                    synthesize,
+                )
+            except VoiceCloneError as exc:
+                _http(exc)
+            return clip
+        finally:
+            voice_semaphore().release()
 
     @app.get("/users/me/voice-speech/{clip_id}")
     async def get_voice_speech(clip_id: str, current_user=Depends(get_current_user)):

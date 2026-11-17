@@ -200,5 +200,22 @@ class VoiceCloneTests(unittest.TestCase):
         self.assertNotIn("Hello from the owner", seen["text"])
 
 
+class VoiceSlotTests(unittest.TestCase):
+    def test_second_generation_is_busy(self):
+        import asyncio
+        sem = asyncio.Semaphore(1)
+
+        async def check():
+            self.assertTrue(await voice_clone.acquire_voice(sem))
+            self.assertFalse(await voice_clone.acquire_voice(sem))
+            sem.release()
+            self.assertTrue(await voice_clone.acquire_voice(sem))
+            sem.release()
+
+        asyncio.run(check())
+        self.assertEqual(voice_clone.voice_concurrency_limit(None), 1)
+        self.assertEqual(voice_clone.voice_concurrency_limit("0"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
