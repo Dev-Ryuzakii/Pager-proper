@@ -12214,7 +12214,13 @@ async def deliver_group_message(db: Session, current_user, group_id: int, fields
     try:
         user_id = int(getattr(current_user, 'id', 0))
         channels.guard_channel_post(db, group_id, current_user)
-        
+        reply_to = fields.get("reply_to_message_id")
+        if reply_to:
+            target = db.query(Message).filter(Message.id == reply_to).first()
+            blocked = channels.reply_target_block(getattr(target, "group_id", None), group_id)
+            if blocked:
+                raise HTTPException(status_code=400, detail=blocked)
+
         addressed_to_id = None
         is_announcement = False
 

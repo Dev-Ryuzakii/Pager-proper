@@ -98,6 +98,12 @@ def can_leave(role: Optional[str]) -> Optional[str]:
     return None
 
 
+def reply_target_block(target_group_id, group_id) -> Optional[str]:
+    if target_group_id is None or int(target_group_id) != int(group_id):
+        return "Reply target is not in this conversation"
+    return None
+
+
 def apply_thread_reply(db: Session, root_id: int, when: Optional[datetime] = None) -> None:
     """Atomic increment so two replies at once cannot lose a count."""
     when = when or datetime.now(timezone.utc)

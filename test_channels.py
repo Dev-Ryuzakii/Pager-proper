@@ -51,6 +51,9 @@ def posting_cases():
     assert channels.member_change_block("admin", "member", False, "promote") == "Only the owner can promote a channel admin"
     assert channels.member_change_block("owner", "admin", False, "demote") is None
     assert channels.member_change_block("admin", "admin", True, "remove") is None
+    assert channels.reply_target_block(None, 1) == "Reply target is not in this conversation"
+    assert channels.reply_target_block(2, 1) == "Reply target is not in this conversation"
+    assert channels.reply_target_block(1, 1) is None
     assert channels.slugify("Launch Plans!") == "launch-plans"
     assert channels.is_group_admin_role("admin") is True
     assert channels.is_group_admin_role("owner") is True
@@ -120,6 +123,13 @@ class ChannelHttpTests(unittest.TestCase):
 
         async def deliver(db, user, group_id, fields):
             channels.guard_channel_post(db, group_id, user)
+            reply_to = fields.get("reply_to_message_id")
+            if reply_to:
+                target = db.query(Message).filter(Message.id == reply_to).first()
+                blocked = channels.reply_target_block(getattr(target, "group_id", None), group_id)
+                if blocked:
+                    from fastapi import HTTPException
+                    raise HTTPException(status_code=400, detail=blocked)
             root = None
             if fields.get("thread_root_id"):
                 root = db.query(Message).filter(
