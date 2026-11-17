@@ -301,6 +301,16 @@ class Message(Base):
     # mentioned explicitly; this carries no message content.
     mentions = Column(JSON, nullable=True)
 
+    __table_args__ = (
+        Index(
+            "uq_messages_card_hash",
+            "message_hash",
+            unique=True,
+            postgresql_where=text("message_hash LIKE 'rec:%' OR message_hash LIKE 'notes:%'"),
+            sqlite_where=text("message_hash LIKE 'rec:%' OR message_hash LIKE 'notes:%'"),
+        ),
+    )
+
     # Relationships
     sender = relationship("User", foreign_keys=[sender_id], back_populates="sent_messages")
     recipient = relationship("User", foreign_keys=[recipient_id], back_populates="received_messages")
@@ -1051,7 +1061,7 @@ class MeetingRecording(Base):
     started_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     egress_id = Column(String(64), nullable=False)
     file_path = Column(String(512), nullable=True)
-    status = Column(String(20), default="recording")  # recording/completed/failed
+    status = Column(String(20), default="recording")  # recording → processing → completed, or failed
     file_size = Column(Integer, nullable=True)
     started_at = Column(DateTime, default=func.now())
     ended_at = Column(DateTime, nullable=True)

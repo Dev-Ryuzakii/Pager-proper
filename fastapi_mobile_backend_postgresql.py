@@ -88,6 +88,7 @@ from org_privileges import (
 )
 import meeting_notes
 import self_dm
+import live_captions  # defines its tables on Base, so import before create_all
 from channels import install_channel_routes, search_channel_rows
 from meeting_notes import install_meeting_notes_routes
 from decoy_document import generate_decoy_document
@@ -4884,6 +4885,7 @@ async def lifespan(app: FastAPI):
                         old_recordings = db.query(MeetingRecording).filter(
                             MeetingRecording.ended_at.isnot(None),
                             MeetingRecording.ended_at <= cutoff,
+                            MeetingRecording.status.notin_(("recording", "processing")),
                         ).all()
                         for rec in old_recordings:
                             fp = meeting_ai.resolve_recording_path(getattr(rec, "file_path", None), RECORDINGS_DIR)
@@ -4908,7 +4910,48 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(periodic_message_cleanup())
     meeting_reminder_task = asyncio.create_task(periodic_meeting_reminders())
     task_reminder_task = asyncio.create_task(periodic_task_reminders())
+    async def periodic_recording_sweep():
+        """Lost webhooks. Every two minutes, finish recordings whose file has settled."""
+        while True:
+            try:
+                await asyncio.sleep(120)
+                db = next(get_database_session())
+                try:
+                    pending = db.query(MeetingRecording).filter(
+                        MeetingRecording.status.in_(("recording", "processing"))
+                    ).all()
+                    egress_ids = [row.egress_id for row in pending if row.status == "processing" and row.egress_id]
+                    conference_ids = [int(row.conference_id) for row in pending if row.status == "recording"]
+                    statuses = await _recording_egress_statuses(egress_ids)
+                    rooms = await _recording_rooms_open(conference_ids)
+
+                    def egress_status(egress_id):
+                        return statuses.get(egress_id)
+
+                    def room_open(conference_id):
+                        return rooms.get(int(conference_id))
+
+                    actions = self_dm.sweep_recordings(
+                        db, datetime.now(timezone.utc), RECORDINGS_DIR, egress_status, room_open, _recording_sizes,
+                    )
+                    for action in actions:
+                        if action.get("action") == "ready" and action.get("run_ai"):
+                            asyncio.create_task(_run_meeting_ai(int(action["id"])))
+                        for message in action.get("messages") or []:
+                            title = "Meeting notes" if message.content_type == "meeting_notes" else "Meeting recording"
+                            body = (
+                                "Meeting notes are ready in your You chat"
+                                if message.content_type == "meeting_notes"
+                                else "A new recording is in your You chat"
+                            )
+                            await _announce_self_card(db, message, message.content_type, title, body)
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.error("recording sweep error: %s", type(e).__name__)
+
     retention_task = asyncio.create_task(periodic_retention_enforcement())
+    recording_sweep_task = asyncio.create_task(periodic_recording_sweep())
     uptime_task = asyncio.create_task(periodic_uptime_checks())
     endpoint_metrics_task = asyncio.create_task(periodic_endpoint_metric_flush())
 
@@ -4920,6 +4963,7 @@ async def lifespan(app: FastAPI):
     cleanup_task.cancel()
     meeting_reminder_task.cancel()
     retention_task.cancel()
+    recording_sweep_task.cancel()
     uptime_task.cancel()
     endpoint_metrics_task.cancel()
 
@@ -7462,24 +7506,27 @@ async def send_message(message_data: MessageSend,
         recipient_id = int(getattr(message, 'recipient_id', 0))
         sender_username = str(getattr(current_user, 'username', ''))
         mentioned = bool(message_data.mentions and sender_username not in message_data.mentions and message_data.username in message_data.mentions)
+        fanout = self_dm.dm_fanout(
+            sender_username, message_data.username, str(getattr(message, "content_type", "") or "encrypted"),
+        )
         ws_sent = await ws_manager.send_to_user(recipient_id, {
             "type": "new_message",
             "data": {
                 "message_id": getattr(message, "id", None),
-                "sender_username": sender_username,
-                "recipient_username": message_data.username,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                **fanout["ws"],
             },
         })
-        if not ws_sent:
+        if fanout["push"] and not ws_sent:
             # Recipient offline — fall back to APNs push (sound matches in-app beep)
             title = "You were mentioned" if mentioned else "New message"
             await push_to_user(db, recipient_id, title, "You have a new message", sound="beep.caf")
-        await _fire_webhooks(db, "message.sent", {
-            "message_id": getattr(message, "id", None),
-            "sender_username": sender_username,
-            "recipient_username": message_data.username,
-        })
+        if fanout["webhook"]:
+            await _fire_webhooks(db, "message.sent", {
+                "message_id": getattr(message, "id", None),
+                "sender_username": sender_username,
+                "recipient_username": message_data.username,
+            })
         response = {
             "username": message_data.username,
             "message": "sent"
@@ -8431,7 +8478,7 @@ async def conference_livekit_token(
     meta = _conference_public(db, conf)
     recording = db.query(MeetingRecording).filter(
         MeetingRecording.conference_id == conference_id,
-        MeetingRecording.status == "recording",
+        MeetingRecording.status.in_(("recording", "processing")),
     ).first() is not None
     return {
         "url": LIVEKIT_URL,
@@ -8645,7 +8692,7 @@ async def start_conference_recording(
 
     existing = db.query(MeetingRecording).filter(
         MeetingRecording.conference_id == conference_id,
-        MeetingRecording.status == "recording",
+        MeetingRecording.status.in_(("recording", "processing")),
     ).first()
     if existing:
         raise HTTPException(status_code=409, detail="Already recording")
@@ -8713,6 +8760,85 @@ async def _stop_egress_quietly(egress_id: Optional[str]):
         await api.aclose()
 
 
+_recording_sizes = {}
+
+
+async def _recording_egress_statuses(egress_ids: list) -> dict:
+    """None for an id means LiveKit could not be asked. A name is the egress status."""
+    found = {egress_id: None for egress_id in egress_ids}
+    if not egress_ids or not (lk_api and LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        return found
+    api = lk_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        for egress_id in egress_ids:
+            try:
+                listed = await api.egress.list_egress(lk_api.ListEgressRequest(egress_id=egress_id))
+                items = list(getattr(listed, "items", []) or [])
+                if items:
+                    found[egress_id] = self_dm._egress_status_name({"status": getattr(items[0], "status", None)})
+            except Exception:
+                found[egress_id] = None
+    finally:
+        await api.aclose()
+    return found
+
+
+async def _recording_rooms_open(conference_ids: list) -> dict:
+    """None means the room list could not be read, so the row stays recording."""
+    found = {int(conference_id): None for conference_id in conference_ids}
+    if not conference_ids or not (lk_api and LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        return found
+    api = lk_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        listed = await api.room.list_rooms(lk_api.ListRoomsRequest())
+        names = {getattr(room, "name", "") for room in (getattr(listed, "rooms", []) or [])}
+        for conference_id in found:
+            found[conference_id] = f"conf-{conference_id}" in names
+    except Exception:
+        return {int(conference_id): None for conference_id in conference_ids}
+    finally:
+        await api.aclose()
+    return found
+
+
+async def _announce_ready_cards(db: Session, messages: list):
+    for message in messages:
+        if message.content_type == "meeting_notes":
+            await _announce_self_card(
+                db, message, "meeting_notes", "Meeting notes", "Meeting notes are ready in your You chat",
+            )
+        else:
+            await _announce_self_card(
+                db, message, "meeting_recording", "Meeting recording", "A new recording is in your You chat",
+            )
+
+
+async def _after_livekit_webhook(db: Session, outcome: dict):
+    for egress_id in outcome.get("stop_egress") or []:
+        await _stop_egress_quietly(egress_id)
+    conference_id = outcome.get("conference_id")
+    if conference_id and outcome.get("notify_user_ids"):
+        for user_id in outcome["notify_user_ids"]:
+            await ws_manager.send_to_user(user_id, {
+                "type": "conference_ended",
+                "data": {"conference_id": conference_id},
+            })
+    if conference_id and outcome.get("recording_ids"):
+        members = db.query(ConferenceParticipant).filter(
+            ConferenceParticipant.conference_id == conference_id,
+            ConferenceParticipant.is_active == True,
+        ).all()
+        for member in members:
+            await ws_manager.send_to_user(member.user_id, {
+                "type": "conference_recording_stopped",
+                "data": {"conference_id": conference_id},
+            })
+    for ready in outcome.get("ready") or []:
+        if ready.get("run_ai"):
+            asyncio.create_task(_run_meeting_ai(int(ready["id"])))
+        await _announce_ready_cards(db, ready.get("messages") or [])
+
+
 async def _announce_self_card(db: Session, message: Message, content_type: str, push_title: Optional[str] = None, push_body: Optional[str] = None):
     user = db.query(User).filter(User.id == message.recipient_id).first()
     username = str(getattr(user, "username", "") or "")
@@ -8736,16 +8862,7 @@ async def _deliver_recording_cards(recording_id: int):
     db = SessionLocal()
     try:
         messages = self_dm.deliver_recording_cards(db, recording_id, RECORDINGS_DIR)
-        for message in messages:
-            title = "Meeting"
-            try:
-                title = json.loads(message.encrypted_content).get("meeting_title") or title
-            except Exception:
-                pass
-            await _announce_self_card(
-                db, message, "meeting_recording",
-                "Meeting recording", f"Your recording of {title} is ready",
-            )
+        await _announce_ready_cards(db, messages)
         logger.info("recording cards delivered recording_id=%s count=%s", recording_id, len(messages))
     except Exception as e:
         logger.error("recording card delivery failed for %s: %s", recording_id, type(e).__name__)
@@ -8758,8 +8875,7 @@ async def _deliver_notes_cards(recording_id: int):
     db = SessionLocal()
     try:
         messages = self_dm.deliver_notes_cards(db, recording_id)
-        for message in messages:
-            await _announce_self_card(db, message, "meeting_notes")
+        await _announce_ready_cards(db, messages)
         logger.info("notes cards delivered recording_id=%s count=%s", recording_id, len(messages))
     except Exception as e:
         logger.error("notes card delivery failed for %s: %s", recording_id, type(e).__name__)
@@ -8768,38 +8884,20 @@ async def _deliver_notes_cards(recording_id: int):
 
 
 async def _complete_live_recordings(db: Session, conference_id: int, background_tasks: BackgroundTasks) -> list:
-    """Stop any in-progress egress for this room and queue cards. Cards never fail the caller."""
-    rows = db.query(MeetingRecording).filter(
-        MeetingRecording.conference_id == conference_id,
-        MeetingRecording.status == "recording",
+    """Claim recording → processing before stopping egress. The file is not ready yet."""
+    claimed = await self_dm.complete_live_recordings(db, conference_id, _stop_egress_quietly)
+    if not claimed:
+        return []
+    members = db.query(ConferenceParticipant).filter(
+        ConferenceParticipant.conference_id == conference_id,
+        ConferenceParticipant.is_active == True,
     ).all()
-    done = []
-    for rec in rows:
-        await _stop_egress_quietly(rec.egress_id)
-        rec.status = "completed"
-        rec.ended_at = meeting_notes.naive_utc()
-        stored = meeting_ai.resolve_recording_path(rec.file_path, RECORDINGS_DIR)
-        if stored and os.path.exists(stored) and os.path.getsize(stored) > 0:
-            rec.file_size = os.path.getsize(stored)
-        db.commit()
-        members = db.query(ConferenceParticipant).filter(
-            ConferenceParticipant.conference_id == conference_id,
-            ConferenceParticipant.is_active == True,
-        ).all()
-        for member in members:
-            await ws_manager.send_to_user(member.user_id, {
-                "type": "conference_recording_stopped",
-                "data": {"conference_id": conference_id},
-            })
-        host = db.query(User).filter(User.id == rec.started_by_user_id).first()
-        if meeting_notes.queue_if_enabled(db, rec, getattr(host, "organization_id", None)):
-            background_tasks.add_task(_run_meeting_ai, int(rec.id))
-        try:
-            background_tasks.add_task(_deliver_recording_cards, int(rec.id))
-        except Exception as e:
-            logger.error("recording card schedule failed for %s: %s", rec.id, type(e).__name__)
-        done.append(rec)
-    return done
+    for member in members:
+        await ws_manager.send_to_user(member.user_id, {
+            "type": "conference_recording_stopped",
+            "data": {"conference_id": conference_id},
+        })
+    return claimed
 
 
 @app.post("/calls/conference/{conference_id}/recording/stop")
@@ -8826,7 +8924,8 @@ async def stop_conference_recording(
 
     done = await _complete_live_recordings(db, conference_id, background_tasks)
     finished = done[0] if done else rec
-    return {"recording_id": finished.id, "status": "completed"}
+    db.refresh(finished)
+    return {"recording_id": finished.id, "status": finished.status}
 
 
 # ─── Scheduled meetings ────────────────────────────────────────────────────────
@@ -19837,9 +19936,21 @@ async def _run_meeting_ai(recording_id: int):
 
 
 install_meeting_notes_routes(app, get_current_user, get_database_session, _run_meeting_ai, _audit)
+live_captions.install_live_caption_routes(
+    app, get_current_user, get_database_session,
+    lambda db, cid: _conference_host_id(db, cid),
+    ws_manager.send_to_user,
+    lambda db, uid: getattr(db.query(User).filter(User.id == uid).first(), "username", None),
+)
 self_dm.install_recording_library_routes(
     app, get_current_user, _user_for_session_token, get_database_session, lambda: RECORDINGS_DIR,
 )
+self_dm.install_livekit_webhook_route(
+    app, get_database_session,
+    lambda: LIVEKIT_API_KEY, lambda: LIVEKIT_API_SECRET, lambda: RECORDINGS_DIR,
+    _after_livekit_webhook,
+)
+logging.getLogger("uvicorn.access").addFilter(self_dm.RedactRecordingQuery())
 
 
 @app.post("/admin/drive/recordings/{recording_id}/notes", status_code=202)
@@ -19909,8 +20020,14 @@ async def admin_download_drive_recording(
         raise HTTPException(status_code=403, detail="Admin only")
 
     r = db.query(MeetingRecording).filter(MeetingRecording.id == recording_id).first()
-    recording_path = meeting_ai.resolve_recording_path(r.file_path if r else None, RECORDINGS_DIR)
-    if not r or not recording_path or not os.path.exists(recording_path):
+    if not r:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    if r.status == "failed":
+        raise HTTPException(status_code=404, detail="This recording failed")
+    if r.status in ("recording", "processing"):
+        raise HTTPException(status_code=409, detail="Recording is still being processed")
+    recording_path = meeting_ai.resolve_recording_path(r.file_path, RECORDINGS_DIR)
+    if not recording_path or not os.path.exists(recording_path):
         raise HTTPException(status_code=404, detail="Recording not found")
     return FileResponse(recording_path, filename=os.path.basename(recording_path), media_type="video/mp4")
 

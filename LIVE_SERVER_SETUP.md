@@ -104,6 +104,25 @@ strict work-only fallback generator.
 
 Older rows may store `meeting_recordings/<file>.mp4` relative to the process working directory. The API still opens those. New rows store the absolute path.
 
+A recording stays `processing` until Egress finishes the MP4. LiveKit must POST that event to this API, or a killed app never delivers the card. On the VPS, set the LiveKit server config to the same API key this app uses as `LIVEKIT_API_KEY`:
+
+```yaml
+webhook:
+  api_key: <LIVEKIT_API_KEY>
+  urls:
+    - https://<api-host>/livekit/webhook
+```
+
+`LIVEKIT_WEBHOOK_URL` is that same URL (`https://<api-host>/livekit/webhook`). The secret is the one already paired with that API key in the LiveKit `keys` section. This has to be set on the VPS. Without it, the API only notices a finished file on its two-minute sweeper.
+
+The API strips the query string from its own access log for `GET /meetings/recordings/{id}/file`. If nginx proxies that route, log `$uri` for it rather than `$request_uri`, so `sig` is not written to the nginx log either.
+
+Card delivery is idempotent. Run once on the server:
+
+```bash
+python3 migrate_add_message_hash_card_index.py
+```
+
 ## Quick checklist
 
 | Step | Command |
