@@ -3,7 +3,7 @@ PostgreSQL Database Models for Secure Messaging System
 Using SQLAlchemy ORM for data modeling and relationships
 """
 
-from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, DateTime, Boolean, LargeBinary, ForeignKey, Float, JSON, UniqueConstraint, Index
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, DateTime, Boolean, LargeBinary, ForeignKey, Float, JSON, UniqueConstraint, Index, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, relationship
 from sqlalchemy.sql import func
 from datetime import datetime, timezone
@@ -639,7 +639,17 @@ class Group(Base):
     is_archived = Column(Boolean, default=False, nullable=False)
     posting_policy = Column(String(20), default="everyone", nullable=False)
     slug = Column(String(80), nullable=True, index=True)
-    
+
+    __table_args__ = (
+        Index(
+            "uq_channels_org_slug",
+            "organization_id", "slug",
+            unique=True,
+            postgresql_where=text("kind = 'channel'"),
+            sqlite_where=text("kind = 'channel'"),
+        ),
+    )
+
     # Relationships
     members = relationship("GroupMember", back_populates="group", cascade="all, delete-orphan")
     messages = relationship("Message", back_populates="group")

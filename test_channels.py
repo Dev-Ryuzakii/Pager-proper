@@ -10,6 +10,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import channels
+from sqlalchemy.exc import IntegrityError
+
 from database_models import Base, Group, GroupMember, HiddenMessage, Message, Organization, User
 
 
@@ -271,6 +273,24 @@ class ChannelHttpTests(unittest.TestCase):
         root = self.db.query(Message).filter(Message.id == root_id).one()
         self.assertEqual(root.thread_reply_count, 2)
         self.assertIsInstance(root.thread_last_reply_at, datetime)
+
+    def test_slug_unique_per_organization(self):
+        first = self._create()
+        self._as("owner")
+        second = self.client.post("/channels", json={
+            "name": "Launch Plans", "visibility": "public", "posting_policy": "everyone",
+        })
+        self.assertEqual(second.status_code, 201, second.text)
+        self.assertEqual(second.json()["slug"], "launch-plans-2")
+        dup = Group(
+            name="other", created_by=self.users["owner"].id, kind="channel",
+            organization_id=self.org_id, slug=first["slug"], visibility="public",
+            posting_policy="everyone", is_archived=False,
+        )
+        self.db.add(dup)
+        with self.assertRaises(IntegrityError):
+            self.db.commit()
+        self.db.rollback()
 
     def test_thread_filters_hidden_expired_and_scrubs_deleted(self):
         created = self._create()

@@ -23,6 +23,7 @@ STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS ix_groups_kind ON groups (kind)",
     "CREATE INDEX IF NOT EXISTS ix_groups_organization_id ON groups (organization_id)",
     "CREATE INDEX IF NOT EXISTS ix_groups_slug ON groups (slug)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_channels_org_slug ON groups (organization_id, slug) WHERE kind = 'channel'",
     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS thread_root_id INTEGER",
     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS thread_reply_count INTEGER DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS thread_last_reply_at TIMESTAMP",

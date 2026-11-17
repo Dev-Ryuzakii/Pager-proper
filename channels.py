@@ -12,6 +12,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database_models import Group, GroupMember, GroupMessageRead, HiddenMessage, Message, ThreadFollow, User
@@ -264,30 +265,40 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
             raise HTTPException(status_code=400, detail="visibility must be public or private")
         if body.posting_policy not in ("everyone", "admins"):
             raise HTTPException(status_code=400, detail="posting_policy must be everyone or admins")
-        slug = _unique_slug(db, org_id, body.name)
-        channel = Group(
-            name=body.name.strip(),
-            description=(body.description or "").strip() or None,
-            topic=(body.topic or "").strip() or None,
-            created_by=int(current_user.id),
-            kind="channel",
-            visibility=body.visibility,
-            organization_id=org_id,
-            posting_policy=body.posting_policy,
-            slug=slug,
-            is_archived=False,
-        )
-        db.add(channel)
-        db.flush()
-        db.add(GroupMember(group_id=channel.id, user_id=int(current_user.id), role="owner"))
+        channel = None
         notified = [int(current_user.id)]
-        for username in body.members:
-            member = _user_in_org(db, username, org_id)
-            if member.id == current_user.id:
-                continue
-            db.add(GroupMember(group_id=channel.id, user_id=member.id, role="member"))
-            notified.append(int(member.id))
-        db.commit()
+        for _attempt in range(5):
+            slug = _unique_slug(db, org_id, body.name)
+            channel = Group(
+                name=body.name.strip(),
+                description=(body.description or "").strip() or None,
+                topic=(body.topic or "").strip() or None,
+                created_by=int(current_user.id),
+                kind="channel",
+                visibility=body.visibility,
+                organization_id=org_id,
+                posting_policy=body.posting_policy,
+                slug=slug,
+                is_archived=False,
+            )
+            db.add(channel)
+            try:
+                db.flush()
+                db.add(GroupMember(group_id=channel.id, user_id=int(current_user.id), role="owner"))
+                notified = [int(current_user.id)]
+                for username in body.members:
+                    member = _user_in_org(db, username, org_id)
+                    if member.id == current_user.id:
+                        continue
+                    db.add(GroupMember(group_id=channel.id, user_id=member.id, role="member"))
+                    notified.append(int(member.id))
+                db.commit()
+                break
+            except IntegrityError:
+                db.rollback()
+                channel = None
+        if channel is None or getattr(channel, "id", None) is None:
+            raise HTTPException(status_code=409, detail="Could not reserve a channel name")
         db.refresh(channel)
         audit(db, int(current_user.id), "channel_created", f"Channel {channel.id} created")
         await notify(notified, {"type": "channel_updated", "data": {"channel_id": int(channel.id), "event": "created"}})
@@ -393,24 +404,33 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
         current_user=Depends(get_current_user),
         db: Session = Depends(get_database_session),
     ):
-        channel = _channel(db, channel_id)
-        _require_manager(db, channel, current_user)
-        if body.name is not None and body.name.strip():
-            channel.name = body.name.strip()
-            channel.slug = _unique_slug(db, channel.organization_id, channel.name, ignore_id=int(channel.id))
-        if body.topic is not None:
-            channel.topic = body.topic.strip() or None
-        if body.description is not None:
-            channel.description = body.description.strip() or None
-        if body.visibility is not None:
-            if body.visibility not in ("public", "private"):
-                raise HTTPException(status_code=400, detail="visibility must be public or private")
-            channel.visibility = body.visibility
-        if body.posting_policy is not None:
-            if body.posting_policy not in ("everyone", "admins"):
-                raise HTTPException(status_code=400, detail="posting_policy must be everyone or admins")
-            channel.posting_policy = body.posting_policy
-        db.commit()
+        saved = False
+        for _attempt in range(5):
+            channel = _channel(db, channel_id)
+            _require_manager(db, channel, current_user)
+            if body.name is not None and body.name.strip():
+                channel.name = body.name.strip()
+                channel.slug = _unique_slug(db, channel.organization_id, channel.name, ignore_id=int(channel.id))
+            if body.topic is not None:
+                channel.topic = body.topic.strip() or None
+            if body.description is not None:
+                channel.description = body.description.strip() or None
+            if body.visibility is not None:
+                if body.visibility not in ("public", "private"):
+                    raise HTTPException(status_code=400, detail="visibility must be public or private")
+                channel.visibility = body.visibility
+            if body.posting_policy is not None:
+                if body.posting_policy not in ("everyone", "admins"):
+                    raise HTTPException(status_code=400, detail="posting_policy must be everyone or admins")
+                channel.posting_policy = body.posting_policy
+            try:
+                db.commit()
+                saved = True
+                break
+            except IntegrityError:
+                db.rollback()
+        if not saved:
+            raise HTTPException(status_code=409, detail="Could not reserve a channel name")
         audit(db, int(current_user.id), "channel_updated", f"Channel {channel_id} updated")
         return channel_dict(db, channel, int(current_user.id))
 
