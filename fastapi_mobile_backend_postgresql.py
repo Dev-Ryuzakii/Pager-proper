@@ -8379,6 +8379,11 @@ async def conference_participants(
 # the conference_id so LiveKit rooms map 1:1 onto existing ConferenceSession
 # rows rather than a third parallel concept.
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
+# Server-side API calls (Egress, room admin) go straight to the local LiveKit
+# server. LIVEKIT_URL is the public address handed to clients; behind the
+# reverse proxy only /rtc reaches LiveKit, so Twirp calls sent there land on
+# this API and 404.
+LIVEKIT_SERVER_URL = os.getenv("LIVEKIT_SERVER_URL", "") or LIVEKIT_URL
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
 
@@ -8701,7 +8706,7 @@ async def start_conference_recording(
     filename = f"{room_name}-{int(datetime.now(timezone.utc).timestamp())}.mp4"
     file_path = os.path.join(RECORDINGS_DIR, filename)
 
-    api = lk_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    api = lk_api.LiveKitAPI(LIVEKIT_SERVER_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
         info = await api.egress.start_room_composite_egress(
             lk_api.RoomCompositeEgressRequest(
@@ -8751,7 +8756,7 @@ async def _stop_egress_quietly(egress_id: Optional[str]):
     """Egress stop can 404 once the room is already empty. Local completion still proceeds."""
     if not egress_id or not (lk_api and LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         return
-    api = lk_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    api = lk_api.LiveKitAPI(LIVEKIT_SERVER_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
         await api.egress.stop_egress(lk_api.StopEgressRequest(egress_id=egress_id))
     except Exception as e:
@@ -8768,7 +8773,7 @@ async def _recording_egress_statuses(egress_ids: list) -> dict:
     found = {egress_id: None for egress_id in egress_ids}
     if not egress_ids or not (lk_api and LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         return found
-    api = lk_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    api = lk_api.LiveKitAPI(LIVEKIT_SERVER_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
         for egress_id in egress_ids:
             try:
@@ -8788,7 +8793,7 @@ async def _recording_rooms_open(conference_ids: list) -> dict:
     found = {int(conference_id): None for conference_id in conference_ids}
     if not conference_ids or not (lk_api and LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         return found
-    api = lk_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    api = lk_api.LiveKitAPI(LIVEKIT_SERVER_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
         listed = await api.room.list_rooms(lk_api.ListRoomsRequest())
         names = {getattr(room, "name", "") for room in (getattr(listed, "rooms", []) or [])}

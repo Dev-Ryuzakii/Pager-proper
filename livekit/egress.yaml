@@ -1,9 +1,8 @@
 # LiveKit Egress config — renders a room composite (every published track
-# muxed together) to MP4. Needs its OWN redis (LiveKit server itself doesn't
-# use one in single-node mode — this is unrelated, just Egress's internal
-# IPC between the service and its per-recording handler process).
+# muxed together) to MP4. LiveKit server hands recording jobs to Egress over
+# Redis, so livekit.yaml needs the SAME redis address as below.
 #
-# Fill api_key/api_secret with the SAME pair from livekit.yaml's keys: block.
+# Fill api_key/api_secret with the SAME pair from livekit.yaml's keys:
 
 api_key: APIkey0000000000
 api_secret: your-generated-secret-here
