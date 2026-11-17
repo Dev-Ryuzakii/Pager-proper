@@ -46,6 +46,11 @@ def posting_cases():
     assert channels.can_join("private", False) == "Private channels are invite-only"
     assert channels.can_leave("owner") == "Transfer ownership before leaving"
     assert channels.can_leave("member") is None
+    assert channels.member_change_block("admin", "member", False, "remove") is None
+    assert channels.member_change_block("admin", "admin", False, "demote") == "Only the owner can change a channel admin"
+    assert channels.member_change_block("admin", "member", False, "promote") == "Only the owner can promote a channel admin"
+    assert channels.member_change_block("owner", "admin", False, "demote") is None
+    assert channels.member_change_block("admin", "admin", True, "remove") is None
     assert channels.slugify("Launch Plans!") == "launch-plans"
     assert channels.is_group_admin_role("admin") is True
     assert channels.is_group_admin_role("owner") is True

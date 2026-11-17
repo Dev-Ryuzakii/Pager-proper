@@ -61,6 +61,17 @@ def can_manage(role: Optional[str], org_admin: bool) -> bool:
     return org_admin or role in ("owner", "admin")
 
 
+def member_change_block(actor_role: Optional[str], target_role: str, org_admin: bool, action: str) -> Optional[str]:
+    """Admins may add or remove members. Only the owner changes an admin."""
+    if target_role == "owner":
+        return "Transfer ownership before changing the owner"
+    if action == "promote" and actor_role != "owner" and not org_admin:
+        return "Only the owner can promote a channel admin"
+    if target_role == "admin" and actor_role != "owner" and not org_admin:
+        return "Only the owner can change a channel admin"
+    return None
+
+
 def group_write_uses_channel_api(kind: Optional[str]) -> bool:
     """Old /groups writes must not change a channel."""
     return kind == "channel"
@@ -465,6 +476,11 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
             raise HTTPException(status_code=404, detail="User is not a member of this channel")
         if membership.role == "owner":
             raise HTTPException(status_code=403, detail="Transfer ownership before removing the owner")
+        actor_role = _role(db, channel_id, int(current_user.id))
+        org_admin = is_org_channel_admin(current_user) and same_org(current_user, channel.organization_id)
+        blocked = member_change_block(actor_role, membership.role, org_admin, "remove")
+        if blocked:
+            raise HTTPException(status_code=403, detail=blocked)
         db.delete(membership)
         db.commit()
         return {"removed": username}
@@ -582,6 +598,12 @@ def _set_role(db, channel_id, username, role, current_user):
         raise HTTPException(status_code=404, detail="User is not a member of this channel")
     if membership.role == "owner":
         raise HTTPException(status_code=403, detail="Transfer ownership instead of changing the owner's role")
+    actor_role = _role(db, channel_id, int(current_user.id))
+    org_admin = is_org_channel_admin(current_user) and same_org(current_user, channel.organization_id)
+    action = "promote" if role == "admin" else "demote"
+    blocked = member_change_block(actor_role, membership.role, org_admin, action)
+    if blocked:
+        raise HTTPException(status_code=403, detail=blocked)
     membership.role = role
     db.commit()
     return {"username": username, "role": role}
