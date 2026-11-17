@@ -215,8 +215,11 @@ def test_diarized_call_returns_none_on_error():
 def test_paid_providers_refuse_without_keys():
     meeting_ai.DEEPGRAM_API_KEY = ""
     assert meeting_ai._transcribe_deepgram("/x") is None
-    meeting_ai.ANTHROPIC_API_KEY = ""
-    assert asyncio.run(meeting_ai._llm("s", "u", "claude")) is None
+
+
+def test_summaries_only_use_local_ollama():
+    assert meeting_ai.SUMMARY_PROVIDER == "ollama"
+    assert not hasattr(meeting_ai, "ANTHROPIC_API_KEY")
 
 
 def test_meeting_notes_endpoint_permissions():

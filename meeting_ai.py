@@ -1,15 +1,14 @@
 """
 Meeting transcripts, summaries and action items.
 
-Two interchangeable providers per stage, picked by env so the same feature
-ships as a free self-hosted tier and a paid hosted tier:
+Transcription is picked by env; summaries always run on the local Ollama:
 
     TRANSCRIBE_PROVIDER = local (default, faster-whisper) | deepgram
-    SUMMARY_PROVIDER    = ollama (default, local)         | claude
+    SUMMARY_PROVIDER    = ollama (the only summary provider)
 
-Free tier: nothing leaves this server. Paid tier: the recording audio (deepgram)
-and/or transcript text (claude) go to that third party — the caller (admin
-endpoint) records which providers were used on the row so this is auditable.
+With the defaults nothing leaves this server. Deepgram, if switched on, sends
+the recording audio to that third party; the row records which providers ran
+so this is auditable.
 
 All functions are synchronous/async-safe building blocks; the endpoint runs
 `process_recording` in the background so a long meeting never blocks a request.
@@ -25,14 +24,14 @@ import httpx
 logger = logging.getLogger(__name__)
 
 TRANSCRIBE_PROVIDER = os.getenv("TRANSCRIBE_PROVIDER", "local").lower()
-SUMMARY_PROVIDER = os.getenv("SUMMARY_PROVIDER", "ollama").lower()
+# Ollama is the only summariser. Any other value is ignored on purpose so a
+# stray env var can never send transcripts to a hosted model.
+SUMMARY_PROVIDER = "ollama"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_SUMMARY_MODEL = os.getenv("CLAUDE_SUMMARY_MODEL", "claude-haiku-5-5")
 
 # Transcript chunk size for the summary map step. Keeps local 7B models
-# inside a comfortable context window; Claude just gets fewer, bigger calls.
+# inside a comfortable context window.
 _CHUNK_CHARS = 12000
 
 _SYSTEM_PROMPT = """You turn a meeting transcript into structured notes.
@@ -170,31 +169,6 @@ def transcribe_file(path: str, provider: Optional[str] = None) -> Optional[str]:
 
 async def _llm(system: str, user: str, provider: str) -> Optional[str]:
     try:
-        if provider == "claude":
-            if not ANTHROPIC_API_KEY:
-                logger.warning("[meeting_ai] SUMMARY_PROVIDER=claude but ANTHROPIC_API_KEY is unset")
-                return None
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": ANTHROPIC_API_KEY,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={
-                        "model": CLAUDE_SUMMARY_MODEL,
-                        "max_tokens": 2000,
-                        "temperature": 0.2,
-                        "system": system,
-                        "messages": [{"role": "user", "content": user}],
-                    },
-                )
-            if resp.status_code != 200:
-                logger.warning(f"[meeting_ai] Claude returned {resp.status_code}: {resp.text[:200]}")
-                return None
-            return "".join(b.get("text", "") for b in resp.json().get("content", []))
-
         from copilot_ollama import _ollama_generate
         return await _ollama_generate(system, user, json_mode=True, timeout=180.0)
     except Exception as e:

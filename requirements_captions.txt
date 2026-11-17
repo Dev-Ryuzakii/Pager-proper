@@ -1,0 +1,5 @@
+# Live meeting transcript worker (captions_worker.py). Install into the API venv:
+#   pip install -r requirements_captions.txt
+livekit>=1.0.0,<2
+faster-whisper>=1.0.0
+numpy>=1.26
