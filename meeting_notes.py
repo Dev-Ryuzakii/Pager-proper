@@ -6,12 +6,14 @@ the text this module formats.
 """
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 import channels
@@ -240,13 +242,9 @@ def install_meeting_notes_routes(app: FastAPI, get_current_user, get_database_se
     ):
         recording = _load(db, recording_id)
         _require_reader(db, recording, current_user)
-        block = start_block(recording.status, recording.ai_status, recording.ai_started_at)
-        if block:
-            raise HTTPException(status_code=block[0], detail=block[1])
-        recording.ai_status = "processing"
-        recording.ai_error = None
-        recording.ai_started_at = datetime.now(timezone.utc)
-        db.commit()
+        denied = take_notes_job(db, recording, current_user, False)
+        if denied:
+            raise HTTPException(status_code=denied[0], detail=denied[1])
         background_tasks.add_task(start_job, recording_id)
         return {"recording_id": recording_id, "ai_status": "processing"}
 
@@ -370,6 +368,70 @@ def _can_edit_org(user) -> bool:
 
 def consent_audit_text(conference_id: int) -> str:
     return f"Recording and transcription started for conference {conference_id}"
+
+
+def rerun_block(ai_status: Optional[str], is_host: bool, is_admin: bool) -> Optional[tuple]:
+    if ai_status == "done" and not (is_host or is_admin):
+        return 403, "Only the host or an admin can run notes again"
+    return None
+
+
+def rate_limit_block(hits, now: datetime, limit: int, window_seconds: int) -> bool:
+    recent = [t for t in hits if (now - t).total_seconds() < window_seconds]
+    return len(recent) >= limit
+
+
+def remember_hit(hits, now: datetime, window_seconds: int) -> list:
+    recent = [t for t in hits if (now - t).total_seconds() < window_seconds]
+    recent.append(now)
+    return recent
+
+
+_notes_hits = {}
+
+
+def claim_notes_job(db: Session, recording_id: int, now: datetime) -> bool:
+    """One winner. A stale processing row can be claimed again."""
+    cutoff = now - timedelta(hours=2)
+    claimed = db.query(MeetingRecording).filter(
+        MeetingRecording.id == recording_id,
+        or_(
+            MeetingRecording.ai_status.is_(None),
+            MeetingRecording.ai_status != "processing",
+            and_(
+                MeetingRecording.ai_status == "processing",
+                or_(MeetingRecording.ai_started_at.is_(None), MeetingRecording.ai_started_at < cutoff),
+            ),
+        ),
+    ).update(
+        {MeetingRecording.ai_status: "processing", MeetingRecording.ai_error: None, MeetingRecording.ai_started_at: now},
+        synchronize_session="fetch",
+    )
+    db.commit()
+    return claimed == 1
+
+
+def take_notes_job(db: Session, recording, user, allow_rerun: bool, now: Optional[datetime] = None) -> Optional[tuple]:
+    """None when this caller owns the job. Otherwise (status, detail)."""
+    now = now or datetime.now(timezone.utc)
+    block = start_block(recording.status, recording.ai_status, getattr(recording, "ai_started_at", None), now)
+    if block:
+        return block
+    denied = rerun_block(
+        recording.ai_status,
+        int(getattr(recording, "started_by_user_id", 0) or 0) == int(user.id),
+        bool(allow_rerun or getattr(user, "is_admin", False)),
+    )
+    if denied:
+        return denied
+    limit = int(os.environ.get("MEETING_AI_PER_HOUR", "5") or "5")
+    hits = _notes_hits.get(int(user.id), [])
+    if rate_limit_block(hits, now, limit, 3600):
+        return 429, "Too many transcription requests"
+    if not claim_notes_job(db, int(recording.id), now):
+        return 409, "Already processing"
+    _notes_hits[int(user.id)] = remember_hit(hits, now, 3600)
+    return None
 
 
 def queue_if_enabled(db: Session, recording: MeetingRecording, organization_id: Optional[int]) -> bool:

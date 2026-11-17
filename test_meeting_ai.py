@@ -130,6 +130,15 @@ def test_notes_access_rules_and_share_text():
     stuck = type("R", (), {"ai_status": "processing", "ai_started_at": None, "ai_error": None})()
     assert meeting_notes.fail_stale_jobs([stuck], now) == 1
     assert stuck.ai_status == "failed"
+    assert meeting_notes.rerun_block("done", False, False)[0] == 403
+    assert meeting_notes.rerun_block("done", True, False) is None
+    assert meeting_notes.rerun_block("failed", False, False) is None
+    assert meeting_notes.rate_limit_block([now, now], now, 2, 3600) is True
+    assert meeting_notes.rate_limit_block([now], now, 2, 3600) is False
+    import meeting_ai
+    assert meeting_ai.concurrency_limit("1") == 1
+    assert meeting_ai.concurrency_limit("0") == 1
+    assert meeting_ai.concurrency_limit("nope") == 1
     assert meeting_notes.start_block("completed", "done") is None
     people = [
         {"id": 1, "username": "sam", "full_name": "Sam Lee"},
@@ -240,6 +249,15 @@ def test_meeting_notes_endpoint_permissions():
     assert again.status_code == 409
     recording.notes_json = '{"action_items":[{"task":"Write the recap","owner":"host"}]}'
     db.commit()
+    recording.ai_status = "done"
+    recording.ai_started_at = None
+    db.commit()
+    holder["user"] = people["guest"]
+    denied_rerun = client.post(f"/meetings/recordings/{rid}/notes")
+    assert denied_rerun.status_code == 403, denied_rerun.text
+    holder["user"] = people["host"]
+    host_rerun = client.post(f"/meetings/recordings/{rid}/notes")
+    assert host_rerun.status_code == 202, host_rerun.text
     holder["user"] = people["guest"]
     created = client.post(f"/meetings/recordings/{rid}/notes/action-items/0/task")
     assert created.status_code == 201, created.text

@@ -19784,14 +19784,9 @@ async def admin_generate_recording_notes(
     rec = db.query(MeetingRecording).filter(MeetingRecording.id == recording_id).first()
     if not rec:
         raise HTTPException(status_code=404, detail="Recording not found")
-    if rec.status != "completed":
-        raise HTTPException(status_code=409, detail="Recording is not finished yet")
-    if rec.ai_status == "processing" and not meeting_notes.processing_is_stale(rec.ai_status, getattr(rec, "ai_started_at", None), datetime.now(timezone.utc)):
-        raise HTTPException(status_code=409, detail="Already processing")
-    rec.ai_status = "processing"
-    rec.ai_error = None
-    rec.ai_started_at = datetime.now(timezone.utc)
-    db.commit()
+    denied = meeting_notes.take_notes_job(db, rec, current_user, True)
+    if denied:
+        raise HTTPException(status_code=denied[0], detail=denied[1])
     background_tasks.add_task(_run_meeting_ai, recording_id)
     return {"recording_id": recording_id, "ai_status": "processing"}
 

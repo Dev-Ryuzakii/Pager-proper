@@ -267,7 +267,33 @@ async def summarize_transcript(transcript: str, provider: Optional[str] = None) 
 
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
+def concurrency_limit(raw: Optional[str]) -> int:
+    try:
+        value = int(raw if raw is not None else "1")
+    except (TypeError, ValueError):
+        return 1
+    return value if value > 0 else 1
+
+
+_AI_LIMIT = concurrency_limit(os.environ.get("MEETING_AI_CONCURRENCY"))
+_AI_SEM = None
+
+
+def _notes_semaphore():
+    global _AI_SEM
+    if _AI_SEM is None:
+        import asyncio
+        _AI_SEM = asyncio.Semaphore(_AI_LIMIT)
+    return _AI_SEM
+
+
 async def process_file(path: str) -> Dict[str, Any]:
+    """One transcription at a time unless MEETING_AI_CONCURRENCY says otherwise."""
+    async with _notes_semaphore():
+        return await _process_file_body(path)
+
+
+async def _process_file_body(path: str) -> Dict[str, Any]:
     """
     Transcribe then summarise one recording. Always returns a dict:
     {"status": "done"|"failed", "error"?, "transcript"?, "notes"?,
