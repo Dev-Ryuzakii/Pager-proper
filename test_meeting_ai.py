@@ -169,6 +169,13 @@ def test_notes_access_rules_and_share_text():
     assert meeting_notes.assignee_for_action(True, 9, 3) == 9
 
 
+def test_diarized_call_returns_none_on_error():
+    meeting_ai.DEEPGRAM_API_KEY = "present"
+    text, segments = meeting_ai._transcribe_deepgram_diarized("/no/such/recording.mp4")
+    assert text is None and segments is None
+    meeting_ai.DEEPGRAM_API_KEY = ""
+
+
 def test_paid_providers_refuse_without_keys():
     meeting_ai.DEEPGRAM_API_KEY = ""
     assert meeting_ai._transcribe_deepgram("/x") is None

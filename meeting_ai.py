@@ -118,6 +118,14 @@ def _transcribe_deepgram_diarized(path: str):
     if not DEEPGRAM_API_KEY:
         logger.warning("[meeting_ai] TRANSCRIBE_PROVIDER=deepgram but DEEPGRAM_API_KEY is unset")
         return None, None
+    try:
+        return _deepgram_diarized_request(path)
+    except Exception as e:
+        logger.warning(f"[meeting_ai] transcribe(deepgram) failed: {type(e).__name__}: {e}")
+        return None, None
+
+
+def _deepgram_diarized_request(path: str):
     with open(path, "rb") as f:
         resp = httpx.post(
             "https://api.deepgram.com/v1/listen",
