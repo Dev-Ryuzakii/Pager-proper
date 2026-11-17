@@ -12319,8 +12319,21 @@ async def deliver_group_message(db: Session, current_user, group_id: int, fields
                     until = until.replace(tzinfo=timezone.utc)
                 if until is None or until > now:
                     muted.add(row.user_id)
-            for uid in channels.thread_push_recipients(followers, root.sender_id, user_id, muted):
-                await push_to_user(db, uid, "Thread reply", "New reply in a thread you follow", sound="beep.caf")
+            mentioned_ids = []
+            if mentioned_usernames:
+                member_ids = [member.user_id for member in members]
+                mentioned_ids = [
+                    row.id for row in db.query(User.id).filter(
+                        User.username.in_(list(mentioned_usernames)),
+                        User.id.in_(member_ids),
+                    ).all()
+                ]
+            mentioned_set = set(mentioned_ids)
+            for uid in channels.thread_push_recipients(followers, root.sender_id, user_id, muted, mentioned_ids):
+                if uid in mentioned_set:
+                    await push_to_user(db, uid, "You were mentioned", "You were mentioned", sound="beep.caf")
+                else:
+                    await push_to_user(db, uid, "Thread reply", "New reply in a thread you follow", sound="beep.caf")
                 
         monitor_record_event("messages", "send_group", user_id=user_id)
         await _fire_webhooks(db, "message.sent", {

@@ -101,11 +101,13 @@ def can_leave(role: Optional[str]) -> Optional[str]:
     return None
 
 
-def thread_push_recipients(follower_ids, author_id, sender_id, muted_ids) -> list:
-    """Followers and the root author, except the sender and muted chats."""
+def thread_push_recipients(follower_ids, author_id, sender_id, muted_ids, mentioned_ids=None) -> list:
+    """Followers, the root author, and mentioned members, except the sender and muted chats."""
     ids = set(follower_ids or [])
     if author_id:
         ids.add(int(author_id))
+    for mentioned in mentioned_ids or []:
+        ids.add(int(mentioned))
     ids.discard(int(sender_id))
     muted = set(muted_ids or [])
     return sorted(uid for uid in ids if uid not in muted)

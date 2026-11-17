@@ -48,6 +48,7 @@ def posting_cases():
     assert channels.can_join("public", False, archived=True) == "This channel is archived"
     assert channels.can_join("private", False) == "Private channels are invite-only"
     assert channels.thread_push_recipients([2, 3], 4, 3, [2]) == [4]
+    assert channels.thread_push_recipients([2], 4, 3, [2], [5, 3]) == [4, 5]
     assert channels.can_leave("owner") == "Transfer ownership before leaving"
     assert channels.can_leave("member") is None
     assert channels.member_change_block("admin", "member", False, "remove") is None
