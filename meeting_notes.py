@@ -55,6 +55,14 @@ def notes_view(recording, include_transcript: bool = False) -> dict:
     return out
 
 
+def naive_utc(now: Optional[datetime] = None) -> datetime:
+    """ai_started_at is TIMESTAMP WITHOUT TIME ZONE. Store naive UTC so the session TimeZone cannot shift it."""
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is not None:
+        return now.astimezone(timezone.utc).replace(tzinfo=None)
+    return now
+
+
 def processing_is_stale(ai_status: Optional[str], started_at: Optional[datetime], now: datetime) -> bool:
     """A restart can leave a job processing. Two hours is long enough to have died."""
     if ai_status != "processing" or started_at is None:
@@ -399,7 +407,8 @@ _notes_hits = {}
 
 def claim_notes_job(db: Session, recording_id: int, now: datetime) -> bool:
     """One winner. A stale processing row can be claimed again."""
-    cutoff = now - timedelta(hours=2)
+    stored = naive_utc(now)
+    cutoff = stored - timedelta(hours=2)
     claimed = db.query(MeetingRecording).filter(
         MeetingRecording.id == recording_id,
         or_(
@@ -411,7 +420,7 @@ def claim_notes_job(db: Session, recording_id: int, now: datetime) -> bool:
             ),
         ),
     ).update(
-        {MeetingRecording.ai_status: "processing", MeetingRecording.ai_error: None, MeetingRecording.ai_started_at: now},
+        {MeetingRecording.ai_status: "processing", MeetingRecording.ai_error: None, MeetingRecording.ai_started_at: stored},
         synchronize_session="fetch",
     )
     db.commit()
@@ -452,6 +461,6 @@ def queue_if_enabled(db: Session, recording: MeetingRecording, organization_id: 
         return False
     recording.ai_status = "processing"
     recording.ai_error = None
-    recording.ai_started_at = datetime.now(timezone.utc)
+    recording.ai_started_at = naive_utc()
     db.commit()
     return True

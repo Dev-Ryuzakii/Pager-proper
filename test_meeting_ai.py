@@ -108,6 +108,16 @@ def test_segments_group_speakers_and_local_tier_has_none():
     assert meeting_ai.segments_from_words(None) == []
 
 
+def test_ai_started_at_is_stored_as_naive_utc():
+    from datetime import datetime, timezone
+    import meeting_notes
+    aware = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    stored = meeting_notes.naive_utc(aware)
+    assert stored.tzinfo is None
+    assert stored == datetime(2026, 1, 1, 12, 0)
+    assert meeting_notes.naive_utc(stored) == stored
+
+
 def test_denied_callers_are_not_revived():
     from conference_access import can_revive_original_caller
     assert can_revive_original_caller("call", "left") is True
