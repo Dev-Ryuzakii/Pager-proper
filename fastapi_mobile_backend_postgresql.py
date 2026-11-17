@@ -4299,7 +4299,7 @@ class AdminService:
                 MeetingRecording.started_by_user_id == user_id
             ).all()
             for rec in recordings:
-                fp = getattr(rec, 'file_path', None)
+                fp = meeting_ai.resolve_recording_path(getattr(rec, 'file_path', None), RECORDINGS_DIR)
                 if fp and os.path.exists(fp):
                     try:
                         os.remove(fp)
@@ -4449,7 +4449,7 @@ class AdminService:
                     MeetingRecording.conference_id.in_(owned_conference_ids)
                 ).all()
                 for rec in owned_conf_recs:
-                    fp = getattr(rec, 'file_path', None)
+                    fp = meeting_ai.resolve_recording_path(getattr(rec, 'file_path', None), RECORDINGS_DIR)
                     if fp and os.path.exists(fp):
                         try:
                             os.remove(fp)
@@ -4902,7 +4902,7 @@ async def lifespan(app: FastAPI):
                             MeetingRecording.ended_at <= cutoff,
                         ).all()
                         for rec in old_recordings:
-                            fp = getattr(rec, "file_path", None)
+                            fp = meeting_ai.resolve_recording_path(getattr(rec, "file_path", None), RECORDINGS_DIR)
                             if fp and os.path.exists(fp):
                                 try:
                                     os.remove(fp)

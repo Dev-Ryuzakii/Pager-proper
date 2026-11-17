@@ -139,7 +139,6 @@ def test_notes_access_rules_and_share_text():
     assert meeting_ai.concurrency_limit("1") == 1
     assert meeting_ai.concurrency_limit("0") == 1
     assert meeting_ai.concurrency_limit("nope") == 1
-    assert meeting_ai.resolve_recording_path("room.mp4", "/var/recordings") == "/var/recordings/room.mp4"
     assert meeting_ai.resolve_recording_path("/tmp/room.mp4", "/var/recordings") == "/tmp/room.mp4"
     assert meeting_ai.resolve_recording_path("", "/var/recordings") == ""
     assert meeting_notes.start_block("completed", "done") is None
@@ -172,6 +171,28 @@ def test_notes_access_rules_and_share_text():
     assert meeting_notes.assignee_for_action(False, 9, 3) is None
     assert meeting_notes.assignee_for_action(False, 3, 3) == 3
     assert meeting_notes.assignee_for_action(True, 9, 3) == 9
+
+
+def test_resolve_legacy_and_absolute_recording_paths():
+    import tempfile
+    old = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        os.chdir(tmp)
+        try:
+            os.makedirs("meeting_recordings")
+            open("meeting_recordings/conf-1-1.mp4", "wb").close()
+            recordings = os.path.join(tmp, "srv_recordings")
+            os.makedirs(recordings)
+            legacy = meeting_ai.resolve_recording_path("meeting_recordings/conf-1-1.mp4", recordings)
+            assert legacy == os.path.abspath("meeting_recordings/conf-1-1.mp4")
+            os.remove(legacy)
+            fallen = meeting_ai.resolve_recording_path("meeting_recordings/conf-1-1.mp4", recordings)
+            assert fallen == os.path.join(recordings, "conf-1-1.mp4")
+            absolute = os.path.join(recordings, "kept.mp4")
+            open(absolute, "wb").close()
+            assert meeting_ai.resolve_recording_path(absolute, "/elsewhere") == absolute
+        finally:
+            os.chdir(old)
 
 
 def test_diarized_call_returns_none_on_error():

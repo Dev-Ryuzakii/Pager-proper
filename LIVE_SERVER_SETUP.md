@@ -98,6 +98,12 @@ strict work-only fallback generator.
 
 ---
 
+## Meeting recordings
+
+`RECORDINGS_DIR` is an absolute path (default: `<app>/meeting_recordings`). LiveKit Egress receives that same path when a recording starts. The Egress container must mount that directory at the identical path. If it writes somewhere else, the API cannot find the file and notes, download, and file size all fail.
+
+Older rows may store `meeting_recordings/<file>.mp4` relative to the process working directory. The API still opens those. New rows store the absolute path.
+
 ## Quick checklist
 
 | Step | Command |

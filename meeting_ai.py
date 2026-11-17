@@ -276,12 +276,21 @@ async def summarize_transcript(transcript: str, provider: Optional[str] = None) 
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
 def resolve_recording_path(file_path: Optional[str], recordings_dir: str) -> str:
-    """Egress may store a relative name. The API looks beside RECORDINGS_DIR."""
+    """Find a recording file.
+
+    Older rows stored a cwd-relative path such as meeting_recordings/conf-1.mp4.
+    Joining that onto an absolute RECORDINGS_DIR doubles the directory. Try the
+    old absolute form first, then the file name inside recordings_dir.
+    """
     if not file_path:
         return ""
     if os.path.isabs(file_path):
         return file_path
-    return os.path.join(os.path.abspath(recordings_dir), file_path)
+    legacy = os.path.abspath(file_path)
+    named = os.path.join(os.path.abspath(recordings_dir), os.path.basename(file_path))
+    if os.path.exists(legacy):
+        return legacy
+    return named
 
 
 def concurrency_limit(raw: Optional[str]) -> int:
