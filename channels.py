@@ -194,18 +194,45 @@ def _require_manager(db: Session, channel: Group, user) -> str:
     return role or "admin"
 
 
-def channel_dict(db: Session, channel: Group, viewer_id: Optional[int]) -> dict:
-    role = _role(db, int(channel.id), int(viewer_id)) if viewer_id else None
-    unread = 0
+def _channel_stats(db: Session, channel_ids: list, viewer_id: Optional[int]):
+    """Member and unread counts for a page of channels, one query each."""
+    if not channel_ids:
+        return {}, {}, {}
+    members = dict(
+        db.query(GroupMember.group_id, func.count(GroupMember.id))
+        .filter(GroupMember.group_id.in_(channel_ids))
+        .group_by(GroupMember.group_id)
+        .all()
+    )
+    roles = {}
+    unread = {}
     if viewer_id:
+        roles = dict(
+            db.query(GroupMember.group_id, GroupMember.role)
+            .filter(GroupMember.user_id == viewer_id, GroupMember.group_id.in_(channel_ids))
+            .all()
+        )
         read_ids = db.query(GroupMessageRead.message_id).filter(GroupMessageRead.user_id == viewer_id)
-        unread = db.query(Message).filter(
-            Message.group_id == channel.id,
-            Message.sender_id != viewer_id,
-            Message.thread_root_id.is_(None),
-            Message.is_deleted.is_(False),
-            ~Message.id.in_(read_ids),
-        ).count()
+        unread = dict(
+            db.query(Message.group_id, func.count(Message.id))
+            .filter(
+                Message.group_id.in_(channel_ids),
+                Message.sender_id != viewer_id,
+                Message.thread_root_id.is_(None),
+                Message.is_deleted.is_(False),
+                ~Message.id.in_(read_ids),
+            )
+            .group_by(Message.group_id)
+            .all()
+        )
+    return members, unread, roles
+
+
+def channel_dict(db: Session, channel: Group, viewer_id: Optional[int], stats=None) -> dict:
+    if stats is None:
+        members, unread, roles = _channel_stats(db, [int(channel.id)], viewer_id)
+    else:
+        members, unread, roles = stats
     return {
         "id": int(channel.id),
         "name": channel.name,
@@ -217,11 +244,16 @@ def channel_dict(db: Session, channel: Group, viewer_id: Optional[int]) -> dict:
         "is_archived": bool(channel.is_archived),
         "organization_id": channel.organization_id,
         "created_by": int(channel.created_by),
-        "member_count": db.query(GroupMember).filter(GroupMember.group_id == channel.id).count(),
-        "my_role": role,
-        "unread_count": unread,
+        "member_count": int(members.get(channel.id, 0)),
+        "my_role": roles.get(channel.id),
+        "unread_count": int(unread.get(channel.id, 0)),
         "kind": "channel",
     }
+
+
+def channel_dicts(db: Session, channels: list, viewer_id: Optional[int]) -> list:
+    stats = _channel_stats(db, [int(channel.id) for channel in channels], viewer_id)
+    return [channel_dict(db, channel, viewer_id, stats) for channel in channels]
 
 
 def _unique_slug(db: Session, organization_id: int, name: str, ignore_id: Optional[int] = None) -> str:
@@ -327,8 +359,8 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
             hay = " ".join(filter(None, [channel.name, channel.topic, channel.description])).lower()
             if term and term not in hay:
                 continue
-            rows.append(channel_dict(db, channel, int(current_user.id)))
-        return rows
+            rows.append(channel)
+        return channel_dicts(db, rows, int(current_user.id))
 
     @app.get("/channels")
     async def list_channels(
@@ -339,9 +371,12 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
         joined_ids = {
             row.group_id for row in db.query(GroupMember.group_id).filter(GroupMember.user_id == user_id).all()
         }
-        query = db.query(Group).filter(Group.kind == "channel", Group.id.in_(joined_ids or [-1]))
-        seen = {row.id for row in query.all()}
-        rows = list(query.all()) if joined_ids else []
+        rows = []
+        seen = set()
+        if joined_ids:
+            for channel in db.query(Group).filter(Group.kind == "channel", Group.id.in_(joined_ids)).all():
+                rows.append(channel)
+                seen.add(channel.id)
         if is_org_channel_admin(current_user):
             extra = db.query(Group).filter(Group.kind == "channel")
             org_id = getattr(current_user, "organization_id", None)
@@ -350,7 +385,7 @@ def install_channel_routes(app: FastAPI, get_current_user, get_database_session,
             for channel in extra.all():
                 if channel.id not in seen:
                     rows.append(channel)
-        return [channel_dict(db, channel, user_id) for channel in rows]
+        return channel_dicts(db, rows, user_id)
 
     @app.get("/channels/{channel_id}")
     async def get_channel(
@@ -690,20 +725,25 @@ def search_channel_rows(db: Session, user, term: str, limit: int) -> list:
     if org_id and not getattr(user, "is_admin", False):
         query = query.filter(Group.organization_id == org_id)
     joined = {row.group_id for row in db.query(GroupMember.group_id).filter(GroupMember.user_id == int(user.id)).all()}
-    out = []
+    matched = []
     for channel in query.limit(limit * 3).all():
         visible = channel.id in joined or (
             channel.visibility == "public" and same_org(user, channel.organization_id)
         ) or (is_org_channel_admin(user) and same_org(user, channel.organization_id))
-        if not visible:
-            continue
+        if visible:
+            matched.append(channel)
+        if len(matched) >= limit:
+            break
+    members, _, _ = _channel_stats(db, [int(channel.id) for channel in matched], None)
+    out = []
+    for channel in matched:
         out.append({
             "id": int(channel.id),
             "name": channel.name,
             "topic": channel.topic,
             "description": channel.description,
             "visibility": channel.visibility,
-            "member_count": db.query(GroupMember).filter(GroupMember.group_id == channel.id).count(),
+            "member_count": int(members.get(channel.id, 0)),
         })
         if len(out) >= limit:
             break
