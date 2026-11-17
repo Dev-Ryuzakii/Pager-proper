@@ -49,6 +49,10 @@ def posting_cases():
     assert channels.can_join("private", False) == "Private channels are invite-only"
     assert channels.thread_push_recipients([2, 3], 4, 3, [2]) == [4]
     assert channels.thread_push_recipients([2], 4, 3, [2], [5, 3]) == [4, 5]
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert channels.should_log_history_view(90, 90, t0) is True
+    assert channels.should_log_history_view(90, 90, t0 + timedelta(minutes=30)) is False
+    assert channels.should_log_history_view(90, 90, t0 + timedelta(hours=2)) is True
     assert channels.can_leave("owner") == "Transfer ownership before leaving"
     assert channels.can_leave("member") is None
     assert channels.member_change_block("admin", "member", False, "remove") is None
@@ -302,6 +306,22 @@ class ChannelHttpTests(unittest.TestCase):
         })
         self.assertEqual(missing.status_code, 404, missing.text)
         self.assertEqual(self.db.query(Message).count(), before)
+
+    def test_unread_skips_expired_and_hidden(self):
+        created = self._create()
+        self._as("admin")
+        visible = self.client.post(f"/channels/{created['id']}/messages", json={"message": "visible"}).json()
+        hidden = self.client.post(f"/channels/{created['id']}/messages", json={"message": "hidden"}).json()
+        expired = self.client.post(f"/channels/{created['id']}/messages", json={"message": "old"}).json()
+        self.db.add(HiddenMessage(user_id=self.users["member"].id, message_id=hidden["message_id"]))
+        old = self.db.query(Message).filter(Message.id == expired["message_id"]).one()
+        old.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        self.db.commit()
+        self._as("member")
+        listed = self.client.get("/channels").json()
+        mine = next(item for item in listed if item["id"] == created["id"])
+        self.assertEqual(mine["unread_count"], 1)
+        self.assertNotEqual(visible["message_id"], hidden["message_id"])
 
     def test_thread_filters_hidden_expired_and_scrubs_deleted(self):
         created = self._create()

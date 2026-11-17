@@ -101,6 +101,20 @@ def can_leave(role: Optional[str]) -> Optional[str]:
     return None
 
 
+_history_views = {}
+
+
+def should_log_history_view(user_id, channel_id, now=None, window_seconds=3600) -> bool:
+    """One audit row per admin per channel per hour. The store is this process."""
+    now = now or datetime.now(timezone.utc)
+    key = (int(user_id), int(channel_id))
+    last = _history_views.get(key)
+    if last is not None and (now - last).total_seconds() < window_seconds:
+        return False
+    _history_views[key] = now
+    return True
+
+
 def thread_push_recipients(follower_ids, author_id, sender_id, muted_ids, mentioned_ids=None) -> list:
     """Followers, the root author, and mentioned members, except the sender and muted chats."""
     ids = set(follower_ids or [])
@@ -234,6 +248,8 @@ def _channel_stats(db: Session, channel_ids: list, viewer_id: Optional[int]):
             .all()
         )
         read_ids = db.query(GroupMessageRead.message_id).filter(GroupMessageRead.user_id == viewer_id)
+        hidden_ids = db.query(HiddenMessage.message_id).filter(HiddenMessage.user_id == viewer_id)
+        now = datetime.now(timezone.utc)
         unread = dict(
             db.query(Message.group_id, func.count(Message.id))
             .filter(
@@ -241,7 +257,9 @@ def _channel_stats(db: Session, channel_ids: list, viewer_id: Optional[int]):
                 Message.sender_id != viewer_id,
                 Message.thread_root_id.is_(None),
                 Message.is_deleted.is_(False),
+                or_(Message.expires_at.is_(None), Message.expires_at > now),
                 ~Message.id.in_(read_ids),
+                ~Message.id.in_(hidden_ids),
             )
             .group_by(Message.group_id)
             .all()

@@ -12184,10 +12184,11 @@ async def get_group_messages(
         if not org_admin:
             raise HTTPException(status_code=403, detail="You are not a member of this group")
         # Compliance access: ciphertext only, and it must not look like the admin read the channel.
-        AuditService.log_event(
-            db, user_id, "channel_history_viewed_by_org_admin",
-            f"Organization admin viewed channel {group_id} history",
-        )
+        if channels.should_log_history_view(user_id, group_id):
+            AuditService.log_event(
+                db, user_id, "channel_history_viewed_by_org_admin",
+                f"Organization admin viewed channel {group_id} history",
+            )
 
     history = db.query(Message).filter(Message.group_id == group_id)
     if group and getattr(group, "kind", None) == "channel":

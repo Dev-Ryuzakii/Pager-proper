@@ -402,6 +402,7 @@ def remember_hit(hits, now: datetime, window_seconds: int) -> list:
     return recent
 
 
+# Per process. One API worker is enough; each extra worker keeps its own window.
 _notes_hits = {}
 
 
