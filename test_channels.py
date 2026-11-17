@@ -58,6 +58,12 @@ def posting_cases():
     assert channels.reply_target_block(None, 1) == "Reply target is not in this conversation"
     assert channels.reply_target_block(2, 1) == "Reply target is not in this conversation"
     assert channels.reply_target_block(1, 1) is None
+    from fastapi import HTTPException
+    try:
+        channels.prepare_thread_root(None, type("G", (), {"id": 1, "kind": "group"})(), 9)
+        raise AssertionError("groups must reject threads")
+    except HTTPException as exc:
+        assert exc.status_code == 400
     assert channels.slugify("Launch Plans!") == "launch-plans"
     assert channels.is_group_admin_role("admin") is True
     assert channels.is_group_admin_role("owner") is True
@@ -127,6 +133,8 @@ class ChannelHttpTests(unittest.TestCase):
 
         async def deliver(db, user, group_id, fields):
             channels.guard_channel_post(db, group_id, user)
+            group = db.query(Group).filter(Group.id == group_id).first()
+            root = channels.prepare_thread_root(db, group, fields.get("thread_root_id"))
             reply_to = fields.get("reply_to_message_id")
             if reply_to:
                 target = db.query(Message).filter(Message.id == reply_to).first()
@@ -134,14 +142,6 @@ class ChannelHttpTests(unittest.TestCase):
                 if blocked:
                     from fastapi import HTTPException
                     raise HTTPException(status_code=400, detail=blocked)
-            root = None
-            if fields.get("thread_root_id"):
-                root = db.query(Message).filter(
-                    Message.id == fields["thread_root_id"], Message.group_id == group_id
-                ).first()
-                if not root or root.thread_root_id is not None:
-                    from fastapi import HTTPException
-                    raise HTTPException(status_code=404, detail="Thread not found")
             message = Message(
                 sender_id=int(user.id), group_id=group_id,
                 encrypted_content=fields.get("message") or "",
@@ -291,6 +291,16 @@ class ChannelHttpTests(unittest.TestCase):
         with self.assertRaises(IntegrityError):
             self.db.commit()
         self.db.rollback()
+
+    def test_bad_thread_root_inserts_nothing(self):
+        created = self._create()
+        self._as("member")
+        before = self.db.query(Message).count()
+        missing = self.client.post(f"/channels/{created['id']}/messages", json={
+            "message": "nope", "thread_root_id": 999999,
+        })
+        self.assertEqual(missing.status_code, 404, missing.text)
+        self.assertEqual(self.db.query(Message).count(), before)
 
     def test_thread_filters_hidden_expired_and_scrubs_deleted(self):
         created = self._create()

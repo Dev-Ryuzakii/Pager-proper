@@ -1712,7 +1712,8 @@ class MessageService:
                              content_type: str = "encrypted",
                              reply_to_message_id: Optional[int] = None,
                              forwarded_from_message_id: Optional[int] = None,
-                             mentions: Optional[List[str]] = None) -> Message:
+                             mentions: Optional[List[str]] = None,
+                             thread_root_id: Optional[int] = None) -> Message:
         """Send a message to a group"""
         # Verify sender is a member
         membership = db.query(GroupMember).filter(
@@ -1754,7 +1755,8 @@ class MessageService:
             iv=iv,
             reply_to_message_id=reply_to_message_id,
             forwarded_from_message_id=forwarded_from_message_id,
-            mentions=mentions
+            mentions=mentions,
+            thread_root_id=thread_root_id,
         )
         
         db.add(message)
@@ -12234,6 +12236,8 @@ async def deliver_group_message(db: Session, current_user, group_id: int, fields
     try:
         user_id = int(getattr(current_user, 'id', 0))
         channels.guard_channel_post(db, group_id, current_user)
+        group = db.query(Group).filter(Group.id == group_id).first()
+        root = channels.prepare_thread_root(db, group, fields.get("thread_root_id"))
         reply_to = fields.get("reply_to_message_id")
         if reply_to:
             target = db.query(Message).filter(Message.id == reply_to).first()
@@ -12267,15 +12271,9 @@ async def deliver_group_message(db: Session, current_user, group_id: int, fields
             reply_to_message_id=fields.get("reply_to_message_id"),
             forwarded_from_message_id=fields.get("forwarded_from_message_id"),
             mentions=fields.get("mentions"),
+            thread_root_id=int(root.id) if root else None,
         )
-        root = None
-        if fields.get("thread_root_id"):
-            root = db.query(Message).filter(
-                Message.id == fields["thread_root_id"], Message.group_id == group_id
-            ).first()
-            if not root or root.thread_root_id is not None:
-                raise HTTPException(status_code=404, detail="Thread not found")
-            message.thread_root_id = root.id
+        if root:
             channels.apply_thread_reply(db, int(root.id))
             db.commit()
             db.refresh(root)

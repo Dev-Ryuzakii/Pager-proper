@@ -111,6 +111,25 @@ def thread_push_recipients(follower_ids, author_id, sender_id, muted_ids) -> lis
     return sorted(uid for uid in ids if uid not in muted)
 
 
+def prepare_thread_root(db: Session, group, thread_root_id):
+    """Resolve a thread root before any message is inserted.
+
+    Returns the root row, or None when this send is not a reply. A bad id
+    raises so the caller never stores a timeline message by mistake.
+    """
+    if not thread_root_id:
+        return None
+    if group is None or getattr(group, "kind", None) != "channel":
+        raise HTTPException(status_code=400, detail="Threads are only available in channels")
+    root = db.query(Message).filter(
+        Message.id == int(thread_root_id),
+        Message.group_id == int(group.id),
+    ).first()
+    if not root or root.thread_root_id is not None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return root
+
+
 def reply_target_block(target_group_id, group_id) -> Optional[str]:
     if target_group_id is None or int(target_group_id) != int(group_id):
         return "Reply target is not in this conversation"
