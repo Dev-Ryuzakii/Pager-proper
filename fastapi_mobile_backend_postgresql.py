@@ -663,6 +663,36 @@ async def _send_transactional_email(to_email: str, subject: str, text_body: str,
         return False
 
 
+def _queue_recovery_code_email(background_tasks: Optional[BackgroundTasks], user: "User", code: str, reason: str) -> bool:
+    """Email a freshly issued recovery code to the account's own address. The
+    code is still returned to the app/web once as before; the email is a copy
+    the owner can find later. Returns whether an email was queued."""
+    to_email = (getattr(user, "email", None) or "").strip()
+    if not to_email or not _valid_email(to_email):
+        return False
+    username = str(getattr(user, "username", "") or "")
+    paragraphs = [
+        f"A new recovery code was issued for your Dilarion account @{username} ({reason}).",
+        "Keep it somewhere safe. You can use it to reset your login token or your two-factor (2FA) password if you forget them. Any earlier recovery code no longer works.",
+        "If you did not do this, contact your administrator immediately.",
+    ]
+    args = (
+        to_email,
+        "Your new Dilarion recovery code",
+        "Hello,\n\n" + "\n\n".join(paragraphs) + f"\n\nRecovery code: {code}\n\nKind regards,\nThe Dilarion Team",
+        _email_template(
+            "Your recovery code", "Hello,", paragraphs,
+            eyebrow="Account security", code_label="Recovery code", code=code,
+            after=["Never share this code. Dilarion staff will never ask for it."],
+        ),
+    )
+    if background_tasks is not None:
+        background_tasks.add_task(_send_transactional_email, *args)
+    else:
+        asyncio.create_task(_send_transactional_email(*args))
+    return True
+
+
 async def _email_organization_request_submitted(request_id: int, organization_name: str, contact_name: str, contact_email: str) -> None:
     subject = f"We received your Dilarion request — {organization_name}"
     paragraphs = [
@@ -948,7 +978,9 @@ class OrganizationRequestCreate(BaseModel):
 
 
 class OrganizationAccountLogin(BaseModel):
-    username: str = Field(..., min_length=3, max_length=50)
+    # Username or email (the account's own email or the organization's
+    # contact email). Field keeps the name "username" for older clients.
+    username: str = Field(..., min_length=3, max_length=120)
     password: str = Field(..., min_length=8, max_length=128)
 
 
@@ -1139,6 +1171,12 @@ class MasterToken2FAEnableRequest(BaseModel):
 
 class MasterToken2FADisableRequest(BaseModel):
     two_fa_password: str = Field(..., description="Current 2FA password")
+
+class MasterToken2FARecoveryReset(BaseModel):
+    recovery_code: str = Field(..., min_length=4, max_length=40, description="Account recovery code")
+    # Optional: set a new 2FA password in the same step. Omitted = 2FA is
+    # turned off and can be set up again later.
+    new_two_fa_password: Optional[str] = Field(None, min_length=4, max_length=128)
 
 class AccountDeletionRequestCreate(BaseModel):
     reason: Optional[str] = Field(None, max_length=1000)
@@ -6223,18 +6261,14 @@ async def organization_account_login(
     payload: OrganizationAccountLogin,
     db: Session = Depends(get_database_session),
 ):
-    account = db.query(User).filter(
-        User.username == payload.username.strip().lower(),
-        User.organization_role == "viewer",
-        User.is_active == True,
-        User.suspended_at.is_(None),
-    ).first()
+    account = _find_org_portal_account(db, payload.username)
     if not account or not account.password_hash or not verify_password(payload.password, account.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid organization username or password")
+        raise HTTPException(status_code=401, detail="Invalid organization username/email or password")
     session = SessionService.create_session(db, int(account.id), "organization_portal", "web")
     organization = db.query(Organization).filter(Organization.id == account.organization_id).first()
     return {
         "token": session.session_token,
+        "username": account.username,
         "access": "invite",
         "organization": {"id": int(organization.id), "name": organization.name} if organization else None,
     }
@@ -6244,14 +6278,22 @@ def _find_org_portal_account(db: Session, identifier: str) -> Optional[User]:
     """Resolve a portal (viewer) account by its username or by its
     organization's contact email."""
     ident = (identifier or "").strip().lower()
-    account = db.query(User).filter(
-        User.username == ident,
+    if not ident:
+        return None
+    active_viewer = (
         User.organization_role == "viewer",
         User.is_active == True,
         User.suspended_at.is_(None),
-    ).first()
+    )
+    # Case-insensitive: accounts created or renamed by an admin may carry
+    # mixed-case usernames, while input is always lowercased.
+    account = db.query(User).filter(func.lower(User.username) == ident, *active_viewer).first()
     if account:
         return account
+    if "@" in ident:
+        account = db.query(User).filter(func.lower(User.email) == ident, *active_viewer).first()
+        if account:
+            return account
     org = db.query(Organization).filter(func.lower(Organization.contact_email) == ident).first()
     if not org:
         return None
@@ -6914,7 +6956,7 @@ async def brand_logo():
 
 
 @app.post("/auth/activate")
-async def activate_invitation(payload: InvitationActivation, db: Session = Depends(get_database_session)):
+async def activate_invitation(payload: InvitationActivation, background_tasks: BackgroundTasks, db: Session = Depends(get_database_session)):
     """Consume an invite and let the user privately choose their login token."""
     # Accept the bare code or a pasted "...?code=<code>" link.
     raw_code = payload.invitation_code.strip()
@@ -6938,6 +6980,7 @@ async def activate_invitation(payload: InvitationActivation, db: Session = Depen
     db.commit()
     session = SessionService.create_session(db, int(user.id), "mobile", "invitation_activation")
     AuditService.log_event(db, int(user.id), "invitation_accepted", "User accepted organization invitation")
+    _queue_recovery_code_email(background_tasks, user, recovery_code, "account activated")
     return {
         "username": user.username,
         "token": session.session_token,
@@ -14096,6 +14139,44 @@ async def disable_mastertoken_2fa(
     return {"enabled": False}
 
 
+@app.post("/mastertoken/2fa/reset-with-recovery-code")
+async def reset_mastertoken_2fa_with_recovery_code(
+    payload: MasterToken2FARecoveryReset,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Forgotten 2FA password: the signed-in owner proves themselves with the
+    account recovery code instead. The code is single-use, so a fresh one is
+    issued, returned once and emailed to the account's address."""
+    user_id = int(getattr(current_user, 'id', 0))
+    user_row = db.query(User).filter(User.id == user_id).first()
+    if not user_row:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not user_row.recovery_code_hash or not verify_password(
+            payload.recovery_code.strip().upper(), user_row.recovery_code_hash):
+        AuditService.log_event(db, user_id, "mastertoken_2fa_recovery_failed", "Wrong recovery code for 2FA reset")
+        raise HTTPException(status_code=403, detail="Incorrect recovery code")
+
+    if payload.new_two_fa_password:
+        salt = base64.b64encode(os.urandom(32)).decode()
+        setattr(user_row, 'mastertoken_2fa_salt', salt)
+        setattr(user_row, 'mastertoken_2fa_hash', hashlib.sha256((payload.new_two_fa_password + salt).encode()).hexdigest())
+        setattr(user_row, 'mastertoken_2fa_enabled', True)
+    else:
+        setattr(user_row, 'mastertoken_2fa_enabled', False)
+        setattr(user_row, 'mastertoken_2fa_hash', None)
+        setattr(user_row, 'mastertoken_2fa_salt', None)
+    new_code = _issue_recovery_code(user_row)
+    db.commit()
+
+    enabled = bool(payload.new_two_fa_password)
+    AuditService.log_event(db, user_id, "mastertoken_2fa_recovered",
+                           "2FA password reset with recovery code" if enabled else "2FA disabled with recovery code")
+    emailed = _queue_recovery_code_email(background_tasks, user_row, new_code, "2FA reset with your recovery code")
+    return {"enabled": enabled, "recovery_code": new_code, "emailed": emailed}
+
+
 # ─── Account deletion requests (self-service ask, admin approves/denies) ───────
 
 @app.post("/account/delete-request")
@@ -14361,6 +14442,7 @@ class RecoveryCodeReset(BaseModel):
 @app.post("/auth/reset-with-recovery-code")
 async def reset_with_recovery_code(
     payload: RecoveryCodeReset,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_database_session),
 ):
     """Fully self-service — no admin involved. Requires the one-time recovery
@@ -14396,11 +14478,13 @@ async def reset_with_recovery_code(
                            f"{payload.username} self-reset their password via recovery code")
     monitor_record_event("auth", "self_reset", user_id=int(getattr(user, 'id', 0)))
 
+    _queue_recovery_code_email(background_tasks, user, new_recovery_code, "login token reset with recovery code")
     return {"username": payload.username, "recovery_code": new_recovery_code}
 
 
 @app.post("/users/me/recovery-code/regenerate")
 async def regenerate_recovery_code(
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
 ):
@@ -14409,7 +14493,10 @@ async def regenerate_recovery_code(
     code (if any) stops working immediately."""
     code = _issue_recovery_code(current_user)
     db.commit()
-    return {"recovery_code": code}
+    emailed = _queue_recovery_code_email(background_tasks, current_user, code, "regenerated from your signed-in app")
+    AuditService.log_event(db, int(current_user.id), "recovery_code_regenerated",
+                           f"{current_user.username} regenerated their recovery code")
+    return {"recovery_code": code, "emailed": emailed}
 
 
 @app.get("/admin/password-reset-requests")
