@@ -5323,6 +5323,32 @@ class ConnectionManager:
                 pass
         return closed
 
+    async def disconnect_devices(self, user_id: int, device_ids: set[str]) -> int:
+        """Close sockets whose login sessions were replaced by another device."""
+        conns = self._connections.get(user_id)
+        if not conns or not device_ids:
+            return 0
+        closed = 0
+        for device_id in device_ids:
+            ws = conns.pop(device_id, None)
+            if ws is None:
+                continue
+            self._devices.pop(device_id, None)
+            try:
+                await ws.close(code=4001, reason="session_replaced")
+                closed += 1
+            except Exception:
+                pass
+        if not conns:
+            self._connections.pop(user_id, None)
+            self._usernames.pop(user_id, None)
+        if closed:
+            try:
+                await self.broadcast_online_status()
+            except Exception:
+                logger.warning("Failed to broadcast status after session replacement", exc_info=True)
+        return closed
+
     async def send_to_user(self, user_id: int, data: dict) -> bool:
         """Send to ALL devices of a user. Returns True if at least one sent."""
         # Hold the dict reference: a concurrent disconnect() can pop user_id
@@ -5411,9 +5437,15 @@ class ConnectionManager:
 
 
 ws_manager = ConnectionManager()
+WS_SESSION_RECHECK_SECONDS = 30
 
 
 # Authentication dependency
+def _session_was_replaced(db: Session, token: str) -> bool:
+    session = db.query(UserSession).filter(UserSession.session_token == token).first()
+    return bool(session and session.logout_reason == "replaced")
+
+
 async def _user_for_session_token(db: Session, token: str) -> User:
     """Resolve a session token the same way Authorization: Bearer does."""
     try:
@@ -5433,9 +5465,10 @@ async def _user_for_session_token(db: Session, token: str) -> User:
                 db.commit()
 
         if not user_id:
+            detail = "Session replaced by another login" if _session_was_replaced(db, token) else "Invalid or expired session"
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired session",
+                detail=detail,
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
@@ -5597,7 +5630,8 @@ async def websocket_chat(
         session = SessionService.validate_session(db, token)
         if not session:
             _ws_auth_fail(token)
-            await websocket.close(code=4001)
+            reason = "session_replaced" if _session_was_replaced(db, token) else ""
+            await websocket.close(code=4001, reason=reason)
             return
         _ws_auth_ok(token)
         user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
@@ -5637,8 +5671,35 @@ async def websocket_chat(
             pass
         db = None
 
+        last_session_check = time.monotonic()
         while True:
-            raw = await websocket.receive_text()
+            # A replacement login may be handled by another server worker.
+            # Recheck the session even when this socket is idle so a revoked
+            # tab cannot keep receiving realtime events indefinitely.
+            remaining = max(0.1, WS_SESSION_RECHECK_SECONDS - (time.monotonic() - last_session_check))
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
+            except asyncio.TimeoutError:
+                raw = None
+            if time.monotonic() - last_session_check >= WS_SESSION_RECHECK_SECONDS:
+                check_db = db_config.get_session()
+                try:
+                    if check_db:
+                        active = check_db.query(UserSession).filter(
+                            UserSession.session_token == token,
+                            UserSession.is_active == True,
+                            UserSession.expires_at > datetime.now(timezone.utc),
+                        ).first()
+                        if not active:
+                            reason = "session_replaced" if _session_was_replaced(check_db, token) else "session_expired"
+                            await websocket.close(code=4001, reason=reason)
+                            break
+                finally:
+                    if check_db:
+                        check_db.close()
+                last_session_check = time.monotonic()
+            if raw is None:
+                continue
             try:
                 msg = json.loads(raw)
                 if msg.get("type") == "ping":
@@ -7122,6 +7183,7 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
         # signed in (for example, web login does not replace the desktop app).
         device_id = (login_data.device_id or "").strip() or None
         group = _platform_group(login_data.platform)
+        revoked_device_ids: set[str] = set()
         if device_id:
             now = datetime.now(timezone.utc)
             live = db.query(UserSession).filter(
@@ -7139,6 +7201,7 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
                 for old_session in replaced:
                     old_session.is_active = False
                     old_session.logout_reason = "replaced"
+                    revoked_device_ids.add(old_session.device_id)
                 db.commit()
                 AuditService.log_event(
                     db, user_id, "login_replaced_other_device",
@@ -7157,13 +7220,20 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
             session.device_name = (login_data.device_name or "").strip() or None
             session.platform = (login_data.platform or "").lower() or None
             # Older sessions on this same device are superseded.
-            db.query(UserSession).filter(
+            superseded = db.query(UserSession).filter(
                 UserSession.user_id == user_id,
                 UserSession.device_id == device_id,
                 UserSession.id != session.id,
                 UserSession.is_active == True,
             ).update({"is_active": False, "logout_reason": "replaced"}, synchronize_session=False)
             db.commit()
+
+            if superseded:
+                revoked_device_ids.add(device_id)
+            # An old tab must not keep receiving realtime events after its
+            # HTTP token has been revoked. Other server workers reject that
+            # token when their sockets reconnect.
+            await ws_manager.disconnect_devices(user_id, revoked_device_ids)
 
         monitor_record_event("auth", "login", user_id=user_id)
         return {
