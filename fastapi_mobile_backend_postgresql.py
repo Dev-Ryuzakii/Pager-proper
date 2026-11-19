@@ -1871,7 +1871,7 @@ class GroupService:
         """Create a new group and add initial members. Any user can do this —
         the creator becomes the group's first admin."""
         creator = db.query(User).filter(User.id == creator_id, User.is_active == True).first()
-        if not creator or not creator.organization_id:
+        if not creator or (not creator.organization_id and not creator.is_admin):
             raise HTTPException(status_code=403, detail="An organization membership is required")
         requested_members = []
         for username in member_usernames:
@@ -4685,7 +4685,7 @@ async def lifespan(app: FastAPI):
                                     "meeting_id": meeting.id,
                                     "title": title_text,
                                     "join_code": meeting.join_code,
-                                    "scheduled_at": meeting.scheduled_at.isoformat(),
+                                    "scheduled_at": _iso(meeting.scheduled_at),
                                 }
                             })
                             if not ws_sent:
@@ -9416,7 +9416,7 @@ async def create_meeting(
         creator_id=creator_id,
         group_id=payload.group_id,
         title=payload.title,
-        scheduled_at=payload.scheduled_at,
+        scheduled_at=_as_utc(payload.scheduled_at).replace(tzinfo=None),
         duration_minutes=payload.duration_minutes or 60,
         recurrence=payload.recurrence,
         join_code=join_code,
@@ -9451,7 +9451,7 @@ async def create_meeting(
             "meeting_id": meeting.id,
             "join_code": join_code,
             "title": meeting.title,
-            "scheduled_at": meeting.scheduled_at.isoformat(),
+            "scheduled_at": _iso(meeting.scheduled_at),
             "duration_minutes": meeting.duration_minutes,
         },
         group_id=payload.group_id,
@@ -9461,7 +9461,7 @@ async def create_meeting(
     await _fire_webhooks(db, "meeting.scheduled", {
         "meeting_id": meeting.id,
         "title": meeting.title,
-        "scheduled_at": meeting.scheduled_at.isoformat(),
+        "scheduled_at": _iso(meeting.scheduled_at),
         "creator_username": str(getattr(current_user, 'username', '')),
     })
 
@@ -9470,7 +9470,7 @@ async def create_meeting(
     return {
         "meeting_id": meeting.id,
         "join_code": join_code,
-        "scheduled_at": meeting.scheduled_at.isoformat(),
+        "scheduled_at": _iso(meeting.scheduled_at),
     }
 
 
@@ -9489,15 +9489,20 @@ async def list_upcoming_meetings(
         Meeting.status.in_(["upcoming", "live"]),
     ).order_by(Meeting.scheduled_at.asc()).all()
 
+    now = datetime.now(timezone.utc)
     result = []
     for m in meetings:
+        starts_at = _as_utc(m.scheduled_at)
+        ends_at = starts_at + timedelta(minutes=m.duration_minutes or 60)
+        if ends_at <= now:
+            continue
         creator = db.query(User).filter(User.id == m.creator_id).first()
         result.append({
             "id": m.id,
             "title": m.title,
-            "scheduled_at": m.scheduled_at.isoformat(),
+            "scheduled_at": _iso(m.scheduled_at),
             "duration_minutes": m.duration_minutes,
-            "status": m.status,
+            "status": "live" if m.status == "live" and starts_at <= now else "upcoming",
             "join_code": m.join_code,
             "creator_username": str(getattr(creator, "username", "")),
             "group_id": m.group_id,
@@ -10974,6 +10979,9 @@ async def join_meeting_by_code(
     if meeting.status == "ended":
         monitor_record_event("meetings", "join_by_code", status="error", detail="Meeting has already ended", user_id=int(getattr(current_user, 'id', 0)))
         raise HTTPException(status_code=400, detail="Meeting has already ended")
+    if not meeting.recurrence and _as_utc(meeting.scheduled_at) + timedelta(minutes=meeting.duration_minutes or 60) <= datetime.now(timezone.utc):
+        monitor_record_event("meetings", "join_by_code", status="error", detail="Meeting has already ended", user_id=int(getattr(current_user, 'id', 0)))
+        raise HTTPException(status_code=400, detail="Meeting has already ended")
     monitor_record_event("meetings", "join_by_code", user_id=int(getattr(current_user, 'id', 0)))
 
     user_id = int(getattr(current_user, 'id', 0))
@@ -12197,7 +12205,11 @@ async def get_group_members(
             GroupMember.user_id == user_id
         ).first()
         if not membership:
-            raise HTTPException(status_code=403, detail="You are not a member of this group")
+            group = db.query(Group).filter(Group.id == group_id).first()
+            if group and getattr(group, "kind", None) == "channel":
+                channels._require_reader(db, group, current_user)
+            else:
+                raise HTTPException(status_code=403, detail="You are not a member of this group")
             
         return GroupService.get_group_members(db, group_id)
     except HTTPException:
@@ -13776,7 +13788,7 @@ async def unified_search(
     people_q = db.query(User).filter(
         User.is_active == True,
         User.id != user_id,
-        User.organization_role != "viewer",
+        or_(User.organization_role.is_(None), User.organization_role != "viewer"),
         or_(
             func.lower(User.username).like(like),
             func.lower(func.coalesce(User.full_name, "")).like(like),
@@ -13813,12 +13825,12 @@ async def unified_search(
         "content_type": m.content_type,
         "file_size": m.file_size,
         "group_id": m.group_id,
-        "created_at": _iso(m.created_at),
+        "created_at": _iso(m.uploaded_at),
     } for m in db.query(Media).filter(
         or_(Media.sender_id == user_id, Media.recipient_id == user_id),
-        Media.is_active == True,
         func.lower(Media.filename).like(like),
-    ).order_by(Media.created_at.desc()).limit(limit).all()]
+        or_(Media.expires_at.is_(None), Media.expires_at > datetime.now(timezone.utc).replace(tzinfo=None)),
+    ).order_by(Media.uploaded_at.desc()).limit(limit).all()]
 
     return {
         "query": term,
