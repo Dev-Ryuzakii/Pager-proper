@@ -7,6 +7,7 @@ import os
 import json
 import time
 import base64
+import binascii
 import hashlib
 import hmac
 import logging
@@ -5627,10 +5628,55 @@ def _authorized_live_chunk(db: Session, sender_id: int, admin_id: int,
     return True
 
 
+def _make_ws_ticket(session: UserSession) -> str:
+    """A short-lived URL credential scoped to WebSocket authentication only."""
+    expiry = int(time.time()) + 30
+    nonce = secrets.token_urlsafe(12)
+    payload = f"{session.id}:{expiry}:{nonce}"
+    signature = hmac.new(session.session_token.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).rstrip(b"=").decode()
+
+
+def _validate_ws_ticket(db: Session, ticket: str) -> Optional[UserSession]:
+    if not ticket or len(ticket) > 256:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(ticket + "=" * (-len(ticket) % 4)).decode()
+        session_id, expiry_text, nonce, signature = raw.split(":")
+        expiry = int(expiry_text)
+        if expiry < int(time.time()) or expiry > int(time.time()) + 30:
+            return None
+        if not session_id.isdecimal() or len(session_id) > 18 or len(nonce) > 32 or len(signature) != 64:
+            return None
+        session = db.query(UserSession).filter(UserSession.id == int(session_id)).first()
+        if not session or not session.is_active:
+            return None
+        payload = f"{session_id}:{expiry}:{nonce}"
+        expected = hmac.new(session.session_token.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        return SessionService.validate_session(db, session.session_token)
+    except (ValueError, UnicodeDecodeError, TypeError, binascii.Error):
+        return None
+
+
+@app.post("/auth/ws-ticket")
+async def create_ws_ticket(response: Response,
+                           credentials: HTTPAuthorizationCredentials = Depends(security),
+                           current_user: User = Depends(get_current_user),
+                           db: Session = Depends(get_database_session)):
+    session = SessionService.validate_session(db, credentials.credentials)
+    if not session or session.user_id != current_user.id:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    response.headers["Cache-Control"] = "no-store"
+    return {"ticket": _make_ws_ticket(session), "expires_in": 30}
+
+
 @app.websocket("/ws")
 async def websocket_chat(
     websocket: WebSocket,
     token: Optional[str] = None,
+    ticket: Optional[str] = None,
     device_id: Optional[str] = None,
     device_type: Optional[str] = "mobile",
     device_name: Optional[str] = "Unknown",
@@ -5638,13 +5684,17 @@ async def websocket_chat(
 ):
     """
     WebSocket for real-time chat.
-    Query params: token, device_id, device_type (mobile|desktop|web), device_name, platform
+    Query params: ticket (preferred), or legacy token, plus device metadata.
     """
     import uuid as _uuid
     user_id = None
     db = None
     try:
-        if not token:
+        if not ticket and not token:
+            authorization = websocket.headers.get("authorization", "")
+            if authorization.startswith("Bearer "):
+                token = authorization[7:]
+        if not token and not ticket:
             await websocket.close(code=4001)
             return
 
@@ -5652,7 +5702,7 @@ async def websocket_chat(
         # token reconnect every second forever; without this each attempt runs a
         # DB query and floods the log. After a few failures we reject instantly
         # for a short window, no DB touched.
-        if _ws_auth_blocked(token):
+        if token and _ws_auth_blocked(token):
             await websocket.close(code=4001)
             return
 
@@ -5660,12 +5710,14 @@ async def websocket_chat(
         if not db:
             await websocket.close(code=4010)
             return
-        session = SessionService.validate_session(db, token)
+        session = _validate_ws_ticket(db, ticket) if ticket else SessionService.validate_session(db, token)
         if not session:
-            _ws_auth_fail(token)
-            reason = "session_replaced" if _session_was_replaced(db, token) else ""
+            if token:
+                _ws_auth_fail(token)
+            reason = "session_replaced" if token and _session_was_replaced(db, token) else ""
             await websocket.close(code=4001, reason=reason)
             return
+        token = session.session_token
         _ws_auth_ok(token)
         user = db.query(User).filter(User.id == session.user_id, User.is_active == True, User.suspended_at.is_(None)).first()
         if not user:
