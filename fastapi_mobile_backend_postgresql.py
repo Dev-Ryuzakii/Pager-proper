@@ -1613,34 +1613,73 @@ def _recent_decoy_context(rows: List[Message], sender_id: int) -> List[Dict[str,
     return result
 
 
+def _decoy_story(db: Session, conditions: List[Any], sender_id: int, conv_key: str, is_group: bool = False) -> Dict[str, Any]:
+    """
+    Where this conversation's cover story stands: which day of the story it is,
+    who spoke in what order today, and every decoy already shown, so the next
+    decoy continues the thread and is never a repeat.
+    """
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    base = [*conditions, Message.is_deleted == False]
+    try:
+        day_index = db.query(func.count(func.distinct(func.date(Message.timestamp)))).filter(
+            *base, Message.timestamp < today_start,
+        ).scalar() or 0
+        today_senders = [
+            int(r[0]) for r in db.query(Message.sender_id).filter(
+                *base, Message.timestamp >= today_start,
+            ).order_by(Message.timestamp.asc(), Message.id.asc()).limit(400).all()
+        ]
+        used = [
+            str(r[0]) for r in db.query(Message.decoy_content).filter(
+                *conditions, Message.decoy_content.isnot(None),
+            ).order_by(Message.timestamp.desc()).limit(2000).all() if r[0]
+        ]
+    except Exception:
+        logger.exception("decoy story state unavailable")
+        day_index, today_senders, used = 0, [], []
+    return {
+        "conv_key": conv_key,
+        "day_index": int(day_index),
+        "today_senders": today_senders,
+        "sender": int(sender_id),
+        "used": used,
+        "is_group": is_group,
+    }
+
+
 def _direct_decoy_context(db: Session, sender: User, recipient: User) -> Dict[str, Any]:
     sender_id = int(getattr(sender, "id", 0))
     recipient_id = int(getattr(recipient, "id", 0))
-    recent = db.query(Message).filter(
+    conditions = [
         Message.group_id.is_(None),
         Message.conference_id.is_(None),
         or_(
             and_(Message.sender_id == sender_id, Message.recipient_id == recipient_id),
             and_(Message.sender_id == recipient_id, Message.recipient_id == sender_id),
         ),
-        Message.is_deleted == False,
-    ).order_by(Message.timestamp.desc()).limit(6).all()
+    ]
+    recent = db.query(Message).filter(
+        *conditions, Message.is_deleted == False,
+    ).order_by(Message.timestamp.desc()).limit(10).all()
+    pair = sorted([sender_id, recipient_id])
     return {
         "organization": _organization_name(db, sender),
         "sender_department": getattr(sender, "department", None) or "general operations",
         "recipient_department": getattr(recipient, "department", None) or "another department",
         "conversation_type": "direct coworker conversation",
         "recent_messages": _recent_decoy_context(recent, sender_id),
+        "story": _decoy_story(db, conditions, sender_id, f"dm:{pair[0]}:{pair[1]}"),
     }
 
 
 def _group_decoy_context(db: Session, sender: User, group_id: int) -> Dict[str, Any]:
     sender_id = int(getattr(sender, "id", 0))
     group = db.query(Group).filter(Group.id == group_id).first()
+    conditions = [Message.group_id == group_id]
     recent = db.query(Message).filter(
-        Message.group_id == group_id,
-        Message.is_deleted == False,
-    ).order_by(Message.timestamp.desc()).limit(6).all()
+        *conditions, Message.is_deleted == False,
+    ).order_by(Message.timestamp.desc()).limit(10).all()
     group_name = str(getattr(group, "name", "") or "team")[:80]
     return {
         "organization": _organization_name(db, sender),
@@ -1648,21 +1687,23 @@ def _group_decoy_context(db: Session, sender: User, group_id: int) -> Dict[str, 
         "recipient_department": "cross-functional team",
         "conversation_type": f"work group: {group_name}",
         "recent_messages": _recent_decoy_context(recent, sender_id),
+        "story": _decoy_story(db, conditions, sender_id, f"group:{group_id}", is_group=True),
     }
 
 
 def _conference_decoy_context(db: Session, sender: User, conference_id: int) -> Dict[str, Any]:
     sender_id = int(getattr(sender, "id", 0))
+    conditions = [Message.conference_id == conference_id]
     recent = db.query(Message).filter(
-        Message.conference_id == conference_id,
-        Message.is_deleted == False,
-    ).order_by(Message.timestamp.desc()).limit(6).all()
+        *conditions, Message.is_deleted == False,
+    ).order_by(Message.timestamp.desc()).limit(10).all()
     return {
         "organization": _organization_name(db, sender),
         "sender_department": getattr(sender, "department", None) or "general operations",
         "recipient_department": "meeting participants",
         "conversation_type": "internal meeting chat",
         "recent_messages": _recent_decoy_context(recent, sender_id),
+        "story": _decoy_story(db, conditions, sender_id, f"conf:{conference_id}", is_group=True),
     }
 
 
