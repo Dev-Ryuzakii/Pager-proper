@@ -236,7 +236,8 @@ class Message(Base):
 
     # Message content (encrypted)
     encrypted_content = Column(Text, nullable=False)
-    content_type = Column(String(50), default="text")  # text, file, image, etc.
+    # Holds full MIME types for files (a .docx type is 71 characters).
+    content_type = Column(String(255), default="text")  # text, file, image, etc.
     
     # Add decoy text field
     decoy_content = Column(Text, nullable=True)  # Fake text shown as placeholder
@@ -499,7 +500,7 @@ class Media(Base):
     filename = Column(String(255), nullable=False)  # Original filename
     file_size = Column(Integer, nullable=False)  # Size in bytes
     media_type = Column(String(50), nullable=False)  # photo, video, document
-    content_type = Column(String(100), nullable=False)  # MIME type
+    content_type = Column(String(255), nullable=False)  # MIME type
     
     # Encryption metadata
     encryption_metadata = Column(JSON, nullable=True)  # Encryption details
