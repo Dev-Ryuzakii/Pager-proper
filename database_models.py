@@ -150,6 +150,9 @@ class User(Base):
     # status_text is a free-form custom message shown alongside it, Slack-style.
     availability_status = Column(String(20), default="available")
     status_text = Column(String(100), nullable=True)
+    # Short "about" line the user writes themselves, shown under their name in
+    # chat headers. Falls back to job_title in the clients when empty.
+    bio = Column(String(300), nullable=True)
 
     # Relationships
     sent_messages = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")

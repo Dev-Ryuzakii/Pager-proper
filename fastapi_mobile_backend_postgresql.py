@@ -11769,6 +11769,9 @@ def _group_dict(db: Session, g: Group, viewer_id: Optional[int] = None) -> Dict[
     }
 
 
+                "full_name": getattr(user, "full_name", None),
+                "job_title": getattr(user, "job_title", None),
+                "bio": getattr(user, "bio", None),
 def _reject_channel_group_write(db: Session, group_id: int) -> None:
     """Channels have their own routes. These group writes would skip them."""
     group = db.query(Group).filter(Group.id == group_id).first()
@@ -13719,6 +13722,40 @@ async def set_availability_status(
 
 class NotificationSettingsUpdate(BaseModel):
     mute_all_notifications: Optional[bool] = None
+# ─── Bio (the user's own "about" line, shown under their name in chats) ──
+
+class BioUpdate(BaseModel):
+    bio: Optional[str] = Field(None, max_length=300)
+
+
+@app.get("/users/me/bio")
+async def get_my_bio(current_user: User = Depends(get_current_user)):
+    return {"bio": getattr(current_user, "bio", None), "job_title": getattr(current_user, "job_title", None)}
+
+
+@app.put("/users/me/bio")
+async def set_my_bio(
+    payload: BioUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    """Set or clear (empty / null) the caller's bio."""
+    text = re.sub(r"\s+", " ", payload.bio or "").strip() or None
+    current_user.bio = text
+    db.commit()
+    # Open chat headers update live; same audience as availability changes.
+    org_id = getattr(current_user, "organization_id", None)
+    query = db.query(User).filter(User.is_active == True, User.id != current_user.id)
+    if org_id:
+        query = query.filter(User.organization_id == org_id)
+    for contact in query.all():
+        await ws_manager.send_to_user(contact.id, {
+            "type": "profile_updated",
+            "data": {"username": str(current_user.username), "bio": text, "job_title": getattr(current_user, "job_title", None)},
+        })
+    return {"bio": text, "job_title": getattr(current_user, "job_title", None)}
+
+
     quiet_hours_enabled: Optional[bool] = None
     quiet_hours_start: Optional[int] = Field(None, ge=0, le=23)
     quiet_hours_end: Optional[int] = Field(None, ge=0, le=23)
