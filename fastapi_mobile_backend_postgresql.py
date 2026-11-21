@@ -11769,6 +11769,9 @@ async def get_users(current_user: User = Depends(get_current_user),
                 "availability_status": str(getattr(user, "availability_status", None) or "available"),
                 "status_text": getattr(user, "status_text", None),
                 "has_profile_picture": bool(getattr(user, "profile_picture_path", None)),
+                "full_name": getattr(user, "full_name", None),
+                "job_title": getattr(user, "job_title", None),
+                "bio": getattr(user, "bio", None),
             })
         return result
     except Exception as e:
@@ -11799,9 +11802,6 @@ def _group_dict(db: Session, g: Group, viewer_id: Optional[int] = None) -> Dict[
     }
 
 
-                "full_name": getattr(user, "full_name", None),
-                "job_title": getattr(user, "job_title", None),
-                "bio": getattr(user, "bio", None),
 def _reject_channel_group_write(db: Session, group_id: int) -> None:
     """Channels have their own routes. These group writes would skip them."""
     group = db.query(Group).filter(Group.id == group_id).first()
@@ -13722,36 +13722,6 @@ async def delete_profile_picture(
     return {"message": "Profile picture removed"}
 
 
-# ─── Availability status (busy/DND/away — separate from WS online/offline) ──
-
-_VALID_AVAILABILITY_STATUSES = {"available", "busy", "dnd", "away", "offline"}
-
-@app.post("/users/me/availability")
-async def set_availability_status(
-    payload: AvailabilityStatusUpdate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_database_session),
-):
-    if payload.availability_status not in _VALID_AVAILABILITY_STATUSES:
-        raise HTTPException(status_code=400, detail=f"availability_status must be one of {sorted(_VALID_AVAILABILITY_STATUSES)}")
-    setattr(current_user, 'availability_status', payload.availability_status)
-    setattr(current_user, 'status_text', payload.status_text)
-    db.commit()
-
-    # Best-effort broadcast so open chats update live instead of only on next
-    # contact-list refresh — matches the existing presence push pattern.
-    username = str(getattr(current_user, 'username', ''))
-    for contact in db.query(User).filter(User.is_active == True, User.id != current_user.id).all():
-        await ws_manager.send_to_user(contact.id, {
-            "type": "availability_changed",
-            "data": {"username": username, "availability_status": payload.availability_status, "status_text": payload.status_text},
-        })
-
-    return {"availability_status": payload.availability_status, "status_text": payload.status_text}
-
-
-class NotificationSettingsUpdate(BaseModel):
-    mute_all_notifications: Optional[bool] = None
 # ─── Bio (the user's own "about" line, shown under their name in chats) ──
 
 class BioUpdate(BaseModel):
@@ -13786,6 +13756,36 @@ async def set_my_bio(
     return {"bio": text, "job_title": getattr(current_user, "job_title", None)}
 
 
+# ─── Availability status (busy/DND/away — separate from WS online/offline) ──
+
+_VALID_AVAILABILITY_STATUSES = {"available", "busy", "dnd", "away", "offline"}
+
+@app.post("/users/me/availability")
+async def set_availability_status(
+    payload: AvailabilityStatusUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    if payload.availability_status not in _VALID_AVAILABILITY_STATUSES:
+        raise HTTPException(status_code=400, detail=f"availability_status must be one of {sorted(_VALID_AVAILABILITY_STATUSES)}")
+    setattr(current_user, 'availability_status', payload.availability_status)
+    setattr(current_user, 'status_text', payload.status_text)
+    db.commit()
+
+    # Best-effort broadcast so open chats update live instead of only on next
+    # contact-list refresh — matches the existing presence push pattern.
+    username = str(getattr(current_user, 'username', ''))
+    for contact in db.query(User).filter(User.is_active == True, User.id != current_user.id).all():
+        await ws_manager.send_to_user(contact.id, {
+            "type": "availability_changed",
+            "data": {"username": username, "availability_status": payload.availability_status, "status_text": payload.status_text},
+        })
+
+    return {"availability_status": payload.availability_status, "status_text": payload.status_text}
+
+
+class NotificationSettingsUpdate(BaseModel):
+    mute_all_notifications: Optional[bool] = None
     quiet_hours_enabled: Optional[bool] = None
     quiet_hours_start: Optional[int] = Field(None, ge=0, le=23)
     quiet_hours_end: Optional[int] = Field(None, ge=0, le=23)
