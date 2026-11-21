@@ -153,10 +153,18 @@ class LiveCaptionRouteTests(unittest.TestCase):
         listed = self.client.get(f"/calls/conference/{self.conf_id}/captions").json()["languages"]
         self.assertEqual(listed[0]["code"], "auto")
 
-    def test_only_the_host_can_start_or_stop(self):
+    def test_anyone_in_the_meeting_can_start_or_stop(self):
         self.as_user("guest")
-        self.assertEqual(self.client.post(f"/calls/conference/{self.conf_id}/captions/start").status_code, 403)
-        self.assertEqual(self.client.post(f"/calls/conference/{self.conf_id}/captions/stop").status_code, 403)
+        res = self.client.post(f"/calls/conference/{self.conf_id}/captions/start", json={"language": "en"})
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["started_by"], "guest")
+        self.assertEqual(self.client.post(f"/calls/conference/{self.conf_id}/captions/stop").status_code, 200)
+
+    def test_people_outside_the_meeting_cannot_start_or_stop(self):
+        for name in ("waiting", "stranger"):
+            self.as_user(name)
+            self.assertEqual(self.client.post(f"/calls/conference/{self.conf_id}/captions/start").status_code, 403)
+            self.assertEqual(self.client.post(f"/calls/conference/{self.conf_id}/captions/stop").status_code, 403)
 
     def test_disabled_server_says_so(self):
         os.environ["CAPTIONS_ENABLED"] = "0"

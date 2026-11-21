@@ -1,6 +1,6 @@
 """Live meeting transcript (captions while the meeting is happening).
 
-The host turns it on. A separate process (captions_worker.py) joins the LiveKit
+Anyone in the meeting can turn it on, switch its language or turn it off. A separate process (captions_worker.py) joins the LiveKit
 room as a hidden participant, transcribes each speaker's audio on this server
 with faster-whisper, writes segments to the database and asks this API to push
 them to everyone in the meeting over the existing WebSocket.
@@ -11,9 +11,9 @@ stored in plain text like recordings and meeting notes, readable only by people
 who were admitted to the meeting.
 
 Routes (installed by `install_live_caption_routes`):
-    POST /calls/conference/{id}/captions/start   host only; body {"language": "en"|"auto"|...}
+    POST /calls/conference/{id}/captions/start   anyone in the meeting; body {"language": "en"|"auto"|...}
                                                  also changes the language while it runs
-    POST /calls/conference/{id}/captions/stop    host only
+    POST /calls/conference/{id}/captions/stop    anyone in the meeting
     GET  /calls/conference/{id}/captions         admitted participants
     POST /internal/captions/broadcast            captions worker only (shared secret)
 
@@ -224,12 +224,13 @@ def install_live_caption_routes(
             names[int(session.started_by_user_id)] = username_for(db, int(session.started_by_user_id))
         return state_json(conference_id, session, names)
 
-    def require_host(db: Session, conference_id: int, user) -> None:
+    def require_member(db: Session, conference_id: int, user) -> None:
+        """The host or anyone currently admitted to the meeting."""
         conf = db.query(ConferenceSession).filter(ConferenceSession.id == conference_id).first()
         if not conf:
             raise HTTPException(status_code=404, detail="Meeting not found")
-        if host_id_for(db, conference_id) != int(user.id):
-            raise HTTPException(status_code=403, detail="Only the host can turn the live transcript on or off")
+        if host_id_for(db, conference_id) != int(user.id) and int(user.id) not in active_user_ids(db, conference_id):
+            raise HTTPException(status_code=403, detail="Join the meeting to use the live transcript")
         if not bool(getattr(conf, "is_active", False)):
             raise HTTPException(status_code=409, detail="This meeting has ended")
 
@@ -242,7 +243,7 @@ def install_live_caption_routes(
     ):
         if not captions_enabled():
             raise HTTPException(status_code=503, detail="Live transcript isn't available on this server")
-        require_host(db, conference_id, current_user)
+        require_member(db, conference_id, current_user)
         language = normalize_language(body.language) if body is not None else None
         session = active_session(db, conference_id)
         if session is None:
@@ -274,7 +275,7 @@ def install_live_caption_routes(
         current_user=Depends(get_current_user),
         db: Session = Depends(get_database_session),
     ):
-        require_host(db, conference_id, current_user)
+        require_member(db, conference_id, current_user)
         session = active_session(db, conference_id)
         if session is not None:
             session.status = "stopped"
