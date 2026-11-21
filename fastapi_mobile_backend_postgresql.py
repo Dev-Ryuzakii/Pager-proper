@@ -90,6 +90,7 @@ from org_privileges import (
 import meeting_notes
 import self_dm
 import live_captions  # defines its tables on Base, so import before create_all
+import login_approval  # same: the login_requests table
 from channels import install_channel_routes, search_channel_rows
 from meeting_notes import install_meeting_notes_routes
 from decoy_document import generate_decoy_document
@@ -7074,6 +7075,11 @@ def _platform_group(platform: Optional[str]) -> str:
 def _client_ip(request: Optional[Request]) -> Optional[str]:
     if request is None:
         return None
+    # nginx sets X-Real-IP to the address it actually saw; X-Forwarded-For's
+    # first entry can be written by the client, so it's only a fallback.
+    real = (request.headers.get("x-real-ip") or "").strip()
+    if real:
+        return real
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
         return fwd.split(",")[0].strip()
@@ -7081,31 +7087,11 @@ def _client_ip(request: Optional[Request]) -> Optional[str]:
 
 
 async def _approximate_location(ip: Optional[str]) -> Optional[str]:
-    """City/country for an IP, for the "someone tried to sign in" alert.
-    Uses GEOIP_URL (default ip-api.com); set GEOIP_DISABLED=1 to turn off."""
-    if not ip or os.getenv("GEOIP_DISABLED") == "1":
+    """City/region/country for an IP from the local GeoLite2 database
+    (GEOIP_DB_PATH). Nothing is sent to a third party; None when unknown."""
+    if os.getenv("GEOIP_DISABLED") == "1":
         return None
-    try:
-        import ipaddress
-        addr = ipaddress.ip_address(ip)
-        if addr.is_private or addr.is_loopback or addr.is_link_local:
-            return None
-    except ValueError:
-        return None
-    url = os.getenv("GEOIP_URL", "http://ip-api.com/json/{ip}?fields=status,city,regionName,country").replace("{ip}", ip)
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            data = (await client.get(url)).json()
-        if data.get("status") not in (None, "success"):
-            return None
-        parts = [data.get("city"), data.get("regionName"), data.get("country")]
-        seen = []
-        for part in parts:
-            if part and part not in seen:
-                seen.append(part)
-        return ", ".join(seen) or None
-    except Exception:
-        return None
+    return login_approval.locate_ip(ip)
 
 
 async def _alert_blocked_login(db: Session, user: User, attempt: Dict[str, Any]) -> None:
@@ -7143,6 +7129,92 @@ async def _alert_blocked_login(db: Session, user: User, attempt: Dict[str, Any])
         )
 
 
+def _issue_login_session(db: Session, user: User, device_id: Optional[str], device_name: Optional[str],
+                         platform: Optional[str], ip: Optional[str]):
+    """Create the app session and build the /auth/login response. Older
+    sessions on this same device are retired; other devices are untouched."""
+    user_id = int(getattr(user, "id", 0))
+    session = SessionService.create_session(db, user_id, "mobile", ip or "mobile_app")
+    session.device_id = device_id
+    session.device_name = device_name
+    session.platform = platform
+    if device_id:
+        db.query(UserSession).filter(
+            UserSession.user_id == user_id,
+            UserSession.device_id == device_id,
+            UserSession.id != session.id,
+            UserSession.is_active == True,
+        ).update({"is_active": False, "logout_reason": "replaced"}, synchronize_session=False)
+    db.commit()
+    response = {
+        "username": str(getattr(user, "username", "")),
+        # Android 2.0.2 also reads this unannotated response field as "a".
+        "a": str(getattr(user, "username", "")),
+        "token": str(getattr(session, "session_token", "")),
+        "is_admin": bool(getattr(user, "is_admin", False)),
+        "organization_id": getattr(user, "organization_id", None),
+        "onboarding_required": not bool(getattr(user, "onboarding_completed_at", None)),
+    }
+    return response, session
+
+
+async def _finish_approved_login(db: Session, user: User, req) -> Dict[str, Any]:
+    response, session = _issue_login_session(db, user, req.device_id, req.device_name, req.platform, req.ip_address)
+    req.session_id = int(session.id)
+    db.commit()
+    return response
+
+
+async def _revoke_session_by_id(db: Session, user_id: int, session_id: int) -> None:
+    row = db.query(UserSession).filter(UserSession.id == session_id, UserSession.user_id == user_id).first()
+    if not row:
+        return
+    row.is_active = False
+    row.logout_reason = "signed_out_by_owner"
+    db.commit()
+    if row.device_id:
+        await ws_manager.disconnect_devices(user_id, {row.device_id})
+
+
+async def _current_user_session(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_database_session),
+):
+    return db.query(UserSession).filter(
+        UserSession.session_token == credentials.credentials,
+        UserSession.is_active == True,
+    ).first()
+
+
+def _public_api_url(request: Optional[Request]) -> str:
+    explicit = os.getenv("DILARION_API_URL", "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    if request is None:
+        return ""
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",")[0].strip()
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}"
+
+
+_start_login_request, _record_auto_login = login_approval.install_login_approval_routes(
+    app,
+    get_current_user=get_current_user,
+    get_current_session=_current_user_session,
+    get_database_session=get_database_session,
+    finish_login=_finish_approved_login,
+    send_to_user=lambda uid, payload: ws_manager.send_to_user(uid, payload),
+    push_to_user=push_to_user,
+    send_email=_send_transactional_email,
+    email_template=_email_template,
+    validate_master_token=lambda db, uid, token: validate_master_token(db, uid, token),
+    check_two_fa=login_approval.two_fa_matches,
+    revoke_session=_revoke_session_by_id,
+    audit=lambda db, uid, kind, text: AuditService.log_event(db, uid, kind, text),
+    public_base_url=_public_api_url,
+)
+
+
 @app.post("/auth/login")
 async def login_user(login_data: UserLogin, db: Session = Depends(get_database_session), request: Request = None):
     """Login user with username and token - simplified JSON: {username, token}"""
@@ -7159,80 +7231,38 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
         if getattr(user, "organization_role", None) == "viewer":
             raise HTTPException(status_code=403, detail="Use the organization portal login")
 
-        # Create session
-        user_id = int(getattr(user, 'id', 0)) if hasattr(getattr(user, 'id', 0), '__int__') else int(getattr(user, 'id', 0))
+        user_id = int(getattr(user, "id", 0))
         ip = _client_ip(request)
-
-        # Keep one signed-in device per platform group.  A new login replaces
-        # an older session in that group instead of leaving the user locked
-        # out until the old session expires.  This is especially important for
-        # browsers, whose per-install device id can change when site data is
-        # cleared or the app is reinstalled.  Other platform groups remain
-        # signed in (for example, web login does not replace the desktop app).
         device_id = (login_data.device_id or "").strip() or None
-        group = _platform_group(login_data.platform)
-        revoked_device_ids: set[str] = set()
-        if device_id:
-            now = datetime.now(timezone.utc)
-            live = db.query(UserSession).filter(
-                UserSession.user_id == user_id,
-                UserSession.is_active == True,
-                UserSession.expires_at > now,
-                UserSession.device_id.isnot(None),
-                UserSession.device_id != device_id,
-            ).all()
-            replaced = [x for x in live if _platform_group(x.platform) == group]
-            if replaced:
-                replaced_names = sorted({
-                    (x.device_name or x.platform or "unknown device") for x in replaced
-                })
-                for old_session in replaced:
-                    old_session.is_active = False
-                    old_session.logout_reason = "replaced"
-                    revoked_device_ids.add(old_session.device_id)
-                db.commit()
-                AuditService.log_event(
-                    db, user_id, "login_replaced_other_device",
-                    f"New {group} sign-in replaced {len(replaced)} active session(s): "
-                    + ", ".join(replaced_names),
-                )
-                monitor_record_event(
-                    "auth", "login", status="success",
-                    detail=f"replaced {len(replaced)} active {group} session(s)",
-                    user_id=user_id,
-                )
+        device_name = (login_data.device_name or "").strip()[:120] or None
+        platform = (login_data.platform or "").lower().strip() or None
+        location = await _approximate_location(ip)
 
-        session = SessionService.create_session(db, user_id, "mobile", ip or "mobile_app")
-        if device_id:
-            session.device_id = device_id
-            session.device_name = (login_data.device_name or "").strip() or None
-            session.platform = (login_data.platform or "").lower() or None
-            # Older sessions on this same device are superseded.
-            superseded = db.query(UserSession).filter(
-                UserSession.user_id == user_id,
-                UserSession.device_id == device_id,
-                UserSession.id != session.id,
-                UserSession.is_active == True,
-            ).update({"is_active": False, "logout_reason": "replaced"}, synchronize_session=False)
-            db.commit()
+        # Signing in never signs the account out anywhere else. If another
+        # device is already signed in, a device this account hasn't used
+        # before has to be approved first: from a signed-in device, the email
+        # link, or the master token. A device it has used (idle-lock unlock,
+        # signing back in) is trusted, unless the owner signed it out remotely.
+        last_here = db.query(UserSession).filter(
+            UserSession.user_id == user_id, UserSession.device_id == device_id,
+        ).order_by(UserSession.id.desc()).first() if device_id else None
+        known_device = last_here is not None and getattr(last_here, "logout_reason", None) != "signed_out_by_owner"
+        if not known_device and login_approval.other_signed_in_sessions(db, user_id, device_id):
+            body = await _start_login_request(
+                db, user, device_id=device_id, device_name=device_name, platform=platform,
+                ip=ip, location=location, request=request,
+            )
+            monitor_record_event("auth", "login", status="success", detail="approval required", user_id=user_id)
+            return JSONResponse(status_code=202, content=body)
 
-            if superseded:
-                revoked_device_ids.add(device_id)
-            # An old tab must not keep receiving realtime events after its
-            # HTTP token has been revoked. Other server workers reject that
-            # token when their sockets reconnect.
-            await ws_manager.disconnect_devices(user_id, revoked_device_ids)
-
+        first_time_here = last_here is None
+        response, session = _issue_login_session(db, user, device_id, device_name, platform, ip)
+        await _record_auto_login(
+            db, user, int(session.id), device_id=device_id, device_name=device_name, platform=platform,
+            ip=ip, location=location, request=request, email=first_time_here,
+        )
         monitor_record_event("auth", "login", user_id=user_id)
-        return {
-            "username": str(getattr(user, 'username', '')),
-            # Android 2.0.2 also reads this unannotated response field as "a".
-            "a": str(getattr(user, 'username', '')),
-            "token": str(getattr(session, 'session_token', '')),
-            "is_admin": bool(getattr(user, 'is_admin', False)),
-            "organization_id": getattr(user, "organization_id", None),
-            "onboarding_required": not bool(getattr(user, "onboarding_completed_at", None)),
-        }
+        return response
 
     except HTTPException:
         raise

@@ -53,32 +53,6 @@ def test_replaced_device_socket_is_closed_without_closing_other_devices():
     manager.broadcast_online_status.assert_awaited_once()
 
 
-def test_new_web_login_closes_replaced_web_socket(monkeypatch):
-    old = SimpleNamespace(device_id="old-web", device_name="Chrome", platform="web",
-                          is_active=True, logout_reason=None)
-    user = SimpleNamespace(id=7, username="admin", is_admin=True, organization_id=None,
-                           onboarding_completed_at=None)
-    new = SimpleNamespace(id=99, session_token="new-token")
-    db = MagicMock()
-    db.query.return_value.filter.return_value.all.return_value = [old]
-    db.query.return_value.filter.return_value.update.return_value = 0
-    monkeypatch.setattr(backend.AdminService, "authenticate_user", lambda *args, **kwargs: user)
-    monkeypatch.setattr(backend.SessionService, "create_session", lambda *args, **kwargs: new)
-    monkeypatch.setattr(backend.AuditService, "log_event", lambda *args, **kwargs: None)
-    monkeypatch.setattr(backend, "monitor_record_event", lambda *args, **kwargs: None)
-    close = AsyncMock(return_value=1)
-    monkeypatch.setattr(backend.ws_manager, "disconnect_devices", close)
-    login_data = SimpleNamespace(username="admin", token="password", device_id="new-web",
-                                 device_name="Chrome QA", platform="web")
-
-    result = asyncio.run(backend.login_user(login_data, db, None))
-
-    assert result["token"] == "new-token"
-    assert old.is_active is False
-    assert old.logout_reason == "replaced"
-    close.assert_awaited_once_with(7, {"old-web"})
-
-
 def test_idle_socket_closes_after_replacement_in_another_worker(monkeypatch):
     class Query:
         def __init__(self, db, model):
