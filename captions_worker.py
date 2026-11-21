@@ -16,7 +16,8 @@ Environment:
     CAPTIONS_WORKER_SECRET     shared with the API's /internal/captions/broadcast
     CAPTIONS_API_URL           default http://127.0.0.1:8000
     CAPTIONS_MODEL             faster-whisper size, default "small"
-    CAPTIONS_LANGUAGE          e.g. "en"; empty = detect per utterance
+    CAPTIONS_LANGUAGE          default when the host picks "detect automatically",
+                               e.g. "en"; empty = detect per utterance
     CAPTIONS_MAX_WORKERS       parallel transcriptions, default 2
     CAPTIONS_VAD_RMS           speech threshold (0..1 float RMS), default 0.012
 """
@@ -187,11 +188,11 @@ class Transcriber:
             self._model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
         return self._model
 
-    def _run(self, audio: np.ndarray) -> str:
+    def _run(self, audio: np.ndarray, language: Optional[str]) -> str:
         model = self._load()
         segments, _info = model.transcribe(
             audio,
-            language=LANGUAGE,
+            language=language or LANGUAGE,
             beam_size=1,
             vad_filter=False,
             condition_on_previous_text=False,
@@ -203,10 +204,10 @@ class Transcriber:
     def busy(self) -> bool:
         return self._inflight >= MAX_WORKERS + MAX_BACKLOG
 
-    async def transcribe(self, audio: np.ndarray) -> str:
+    async def transcribe(self, audio: np.ndarray, language: Optional[str] = None) -> str:
         self._inflight += 1
         try:
-            return await asyncio.get_running_loop().run_in_executor(self._pool, self._run, audio)
+            return await asyncio.get_running_loop().run_in_executor(self._pool, self._run, audio, language)
         finally:
             self._inflight -= 1
 
@@ -247,23 +248,25 @@ def set_session(session_id: int, **fields) -> Optional[str]:
         db.close()
 
 
-def session_should_run(session_id: int) -> bool:
+def session_should_run(session_id: int) -> tuple:
+    """(keep running?, language the host picked or None for automatic)."""
     from database_models import ConferenceSession
     from live_captions import ACTIVE_STATUSES, MeetingCaptionSession
     db = db_session()
     try:
         row = db.query(MeetingCaptionSession).filter(MeetingCaptionSession.id == session_id).first()
         if not row or row.status not in ACTIVE_STATUSES:
-            return False
+            return False, None
         conf = db.query(ConferenceSession).filter(ConferenceSession.id == row.conference_id).first()
         if not conf or not bool(conf.is_active):
             row.status = "stopped"
             row.stopped_at = naive_utc()
             db.commit()
-            return False
+            return False, None
         row.heartbeat_at = naive_utc()
+        language = getattr(row, "language", None) or None
         db.commit()
-        return True
+        return True, language
     finally:
         db.close()
 
@@ -300,6 +303,7 @@ def pending_sessions() -> List[tuple]:
 class RoomCaptioner:
     def __init__(self, session_id: int, conference_id: int, transcriber: Transcriber):
         self.session_id = session_id
+        self.language: Optional[str] = None
         self.conference_id = conference_id
         self.transcriber = transcriber
         self.room = None
@@ -342,7 +346,10 @@ class RoomCaptioner:
         await broadcast({"session_id": self.session_id})
         logger.info("captions running conference=%s", self.conference_id)
         try:
-            while session_should_run(self.session_id):
+            while True:
+                keep, self.language = session_should_run(self.session_id)
+                if not keep:
+                    break
                 await asyncio.sleep(3)
         finally:
             for task in list(self.tasks.values()):
@@ -383,7 +390,7 @@ class RoomCaptioner:
             logger.warning("captions backlog full; dropping %.1fs of %s", len(utt.audio) / SAMPLE_RATE, username)
             return
         try:
-            text = clean_text(await self.transcriber.transcribe(utt.audio), len(utt.audio) / SAMPLE_RATE)
+            text = clean_text(await self.transcriber.transcribe(utt.audio, self.language), len(utt.audio) / SAMPLE_RATE)
         except Exception as e:
             logger.warning("transcribe failed: %s", type(e).__name__)
             return

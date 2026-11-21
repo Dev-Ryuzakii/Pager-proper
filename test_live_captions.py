@@ -130,6 +130,29 @@ class LiveCaptionRouteTests(unittest.TestCase):
         self.client.post(f"/calls/conference/{self.conf_id}/captions/start")
         self.assertEqual(self.db.query(live_captions.MeetingCaptionSession).count(), 1)
 
+    def test_host_picks_and_switches_the_language(self):
+        url = f"/calls/conference/{self.conf_id}/captions/start"
+        res = self.client.post(url, json={"language": "fr"})
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["language"], "fr")
+        self.sent.clear()
+        # While it runs, naming another language switches it and tells the room.
+        res = self.client.post(url, json={"language": "auto"})
+        self.assertEqual(res.json()["language"], "auto")
+        self.assertTrue(any(p["type"] == "meeting_captions_state" and p["data"]["language"] == "auto" for _, p in self.sent))
+        db = self.Session()
+        row = db.query(live_captions.MeetingCaptionSession).first()
+        self.assertIsNone(row.language)
+        self.assertEqual(db.query(live_captions.MeetingCaptionSession).count(), 1)
+        # A plain start (no body) leaves the language alone.
+        self.client.post(url, json={"language": "yo"})
+        self.client.post(url)
+        db = self.Session()
+        self.assertEqual(db.query(live_captions.MeetingCaptionSession).first().language, "yo")
+        self.assertEqual(self.client.post(url, json={"language": "xx"}).status_code, 400)
+        listed = self.client.get(f"/calls/conference/{self.conf_id}/captions").json()["languages"]
+        self.assertEqual(listed[0]["code"], "auto")
+
     def test_only_the_host_can_start_or_stop(self):
         self.as_user("guest")
         self.assertEqual(self.client.post(f"/calls/conference/{self.conf_id}/captions/start").status_code, 403)

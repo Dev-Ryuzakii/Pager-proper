@@ -11,13 +11,14 @@ stored in plain text like recordings and meeting notes, readable only by people
 who were admitted to the meeting.
 
 Routes (installed by `install_live_caption_routes`):
-    POST /calls/conference/{id}/captions/start   host only
+    POST /calls/conference/{id}/captions/start   host only; body {"language": "en"|"auto"|...}
+                                                 also changes the language while it runs
     POST /calls/conference/{id}/captions/stop    host only
     GET  /calls/conference/{id}/captions         admitted participants
     POST /internal/captions/broadcast            captions worker only (shared secret)
 
 WebSocket events sent to active participants:
-    meeting_captions_state  {conference_id, enabled, status, started_by}
+    meeting_captions_state  {conference_id, enabled, status, started_by, language}
     meeting_caption         {conference_id, id, speaker_username, speaker_name, text, started_at, ended_at}
 """
 
@@ -27,7 +28,7 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import Column, DateTime, Integer, String, Text
 from sqlalchemy.orm import Session
@@ -37,6 +38,41 @@ from database_models import Base, ConferenceParticipant, ConferenceSession
 logger = logging.getLogger(__name__)
 
 ACTIVE_STATUSES = ("requested", "running")
+
+# Spoken languages the host can pick. "auto" lets the model detect the language
+# of each utterance; picking one is faster and more accurate. Codes are the
+# ones faster-whisper takes.
+CAPTION_LANGUAGES = [
+    ("auto", "Detect automatically"),
+    ("en", "English"),
+    ("fr", "French"),
+    ("es", "Spanish"),
+    ("pt", "Portuguese"),
+    ("de", "German"),
+    ("it", "Italian"),
+    ("nl", "Dutch"),
+    ("ar", "Arabic"),
+    ("zh", "Chinese"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("hi", "Hindi"),
+    ("ru", "Russian"),
+    ("tr", "Turkish"),
+    ("sw", "Swahili"),
+    ("yo", "Yoruba"),
+    ("ha", "Hausa"),
+]
+_LANGUAGE_CODES = {code for code, _ in CAPTION_LANGUAGES}
+
+
+def normalize_language(value: Optional[str]) -> Optional[str]:
+    """None means detect automatically. Raises 400 for a code we don't offer."""
+    code = (value or "").strip().lower()
+    if code in ("", "auto"):
+        return None
+    if code not in _LANGUAGE_CODES:
+        raise HTTPException(status_code=400, detail="That language isn't supported for the live transcript")
+    return code
 
 
 def captions_enabled() -> bool:
@@ -73,6 +109,8 @@ class MeetingCaptionSession(Base):
     started_at = Column(DateTime, nullable=True)
     stopped_at = Column(DateTime, nullable=True)
     heartbeat_at = Column(DateTime, nullable=True)
+    # Spoken language for transcription; NULL = detect automatically.
+    language = Column(String(10), nullable=True)
 
 
 class MeetingCaptionSegment(Base):
@@ -116,12 +154,13 @@ def segment_json(row: MeetingCaptionSegment) -> dict:
 
 def state_json(conference_id: int, session: Optional[MeetingCaptionSession], usernames: dict) -> dict:
     if session is None or session.status not in ACTIVE_STATUSES:
-        return {"conference_id": conference_id, "enabled": False, "status": "off", "started_by": None, "error": getattr(session, "error", None)}
+        return {"conference_id": conference_id, "enabled": False, "status": "off", "started_by": None, "language": None, "error": getattr(session, "error", None)}
     return {
         "conference_id": conference_id,
         "enabled": True,
         "status": "running" if session.status == "running" else "starting",
         "started_by": usernames.get(int(session.started_by_user_id)),
+        "language": session.language or "auto",
         "error": None,
     }
 
@@ -147,6 +186,10 @@ def active_user_ids(db: Session, conference_id: int) -> list:
         ConferenceParticipant.is_active == True,  # noqa: E712
     ).all()
     return sorted({int(uid) for uid, status in rows if (status or "admitted") == "admitted"})
+
+
+class StartBody(BaseModel):
+    language: Optional[str] = None
 
 
 class BroadcastBody(BaseModel):
@@ -193,22 +236,33 @@ def install_live_caption_routes(
     @app.post("/calls/conference/{conference_id}/captions/start")
     async def start_live_captions(
         conference_id: int,
+        body: Optional[StartBody] = Body(None),
         current_user=Depends(get_current_user),
         db: Session = Depends(get_database_session),
     ):
         if not captions_enabled():
             raise HTTPException(status_code=503, detail="Live transcript isn't available on this server")
         require_host(db, conference_id, current_user)
+        language = normalize_language(body.language) if body is not None else None
         session = active_session(db, conference_id)
         if session is None:
             session = MeetingCaptionSession(
                 conference_id=conference_id,
                 started_by_user_id=int(current_user.id),
                 status="requested",
+                language=language,
             )
             db.add(session)
             db.commit()
             db.refresh(session)
+            state = state_for(db, conference_id, session)
+            await push_to_room(db, conference_id, "meeting_captions_state", state)
+            return state
+        # Already on: a request that names a language switches to it. The
+        # worker reads it on its next check, a few seconds later.
+        if body is not None and body.language is not None and session.language != language:
+            session.language = language
+            db.commit()
             state = state_for(db, conference_id, session)
             await push_to_room(db, conference_id, "meeting_captions_state", state)
             return state
@@ -250,6 +304,7 @@ def install_live_caption_routes(
         rows.reverse()
         state = state_for(db, conference_id, active_session(db, conference_id))
         state["available"] = captions_enabled()
+        state["languages"] = [{"code": code, "name": name} for code, name in CAPTION_LANGUAGES]
         state["segments"] = [segment_json(r) for r in rows]
         return state
 
