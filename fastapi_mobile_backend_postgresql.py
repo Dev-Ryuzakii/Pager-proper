@@ -9864,7 +9864,8 @@ async def _refresh_google_token_if_needed(db: Session, link: GoogleCalendarLink)
     (or about to be). Returns None if the refresh itself fails — the caller
     should treat that as 'skip Google events this fetch', not an error, so
     one dead link doesn't break the rest of someone's calendar."""
-    if link.token_expires_at and link.token_expires_at > datetime.now(timezone.utc) + timedelta(minutes=2):
+    # The column is stored without a timezone, so compare as UTC.
+    if link.token_expires_at and _as_utc(link.token_expires_at) > datetime.now(timezone.utc) + timedelta(minutes=2):
         return link.access_token
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -10970,7 +10971,12 @@ async def get_meeting_calendar(
     google_events: List[Dict[str, Any]] = []
     google_link = db.query(GoogleCalendarLink).filter(GoogleCalendarLink.user_id == user_id).first()
     if google_link:
-        google_events = await _fetch_google_events(db, google_link, start, end)
+        # A Google problem must never take the rest of the calendar down.
+        try:
+            google_events = await _fetch_google_events(db, google_link, start, end)
+        except Exception as e:
+            db.rollback()
+            logger.warning(f"Google events skipped for user {user_id}: {e}")
 
     return {"occurrences": result, "count": len(result), "plans": plan_result, "google_events": google_events}
 
