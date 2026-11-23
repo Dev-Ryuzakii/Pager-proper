@@ -91,6 +91,7 @@ import meeting_notes
 import self_dm
 import live_captions  # defines its tables on Base, so import before create_all
 import login_approval  # same: the login_requests table
+from calendar_pages import calendar_page
 from channels import install_channel_routes, search_channel_rows
 from meeting_notes import install_meeting_notes_routes
 from decoy_document import generate_decoy_document
@@ -9728,15 +9729,30 @@ async def google_calendar_callback(
     """Hit directly by the browser via Google's redirect — no auth header,
     hence the state lookup instead of get_current_user."""
     if error:
-        return HTMLResponse(f"<html><body>Google Calendar linking was cancelled ({error}). You can close this tab.</body></html>")
+        cancelled = error == "access_denied"
+        return HTMLResponse(calendar_page(
+            "warning",
+            "Linking cancelled" if cancelled else "Google stopped the link",
+            "Google Calendar wasn't connected. You can try again from Dilarion whenever you're ready.",
+            detail=None if cancelled else f"Google said: {error}",
+        ))
     if not _google_oauth_configured():
-        raise HTTPException(status_code=503, detail="Google Calendar linking is not configured on this server")
+        return HTMLResponse(calendar_page(
+            "error", "Calendar linking is off",
+            "Google Calendar isn't set up on this server yet. Ask your administrator to turn it on.",
+        ), status_code=503)
     if not code or not state or state not in _google_oauth_states:
-        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+        return HTMLResponse(calendar_page(
+            "warning", "This link has expired",
+            "This sign-in link was already used or has expired. Start again from Dilarion to connect your calendar.",
+        ), status_code=400)
 
     entry = _google_oauth_states.pop(state)
     if time.time() - entry["created_at"] > _GOOGLE_OAUTH_STATE_TTL_SECONDS:
-        raise HTTPException(status_code=400, detail="OAuth session expired — try linking again")
+        return HTMLResponse(calendar_page(
+            "warning", "This link has expired",
+            "You took a little too long to finish with Google. Start again from Dilarion to connect your calendar.",
+        ), status_code=400)
     user_id = entry["user_id"]
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -9749,7 +9765,10 @@ async def google_calendar_callback(
         })
         if token_resp.status_code != 200:
             logger.error(f"Google token exchange failed: {token_resp.status_code} {token_resp.text}")
-            return HTMLResponse("<html><body>Could not link Google Calendar — token exchange failed. You can close this tab and try again.</body></html>", status_code=502)
+            return HTMLResponse(calendar_page(
+                "error", "Couldn't connect your calendar",
+                "Google didn't accept the sign-in. Close this tab and try connecting again from Dilarion.",
+            ), status_code=502)
         tokens = token_resp.json()
 
         google_email = None
@@ -9784,12 +9803,12 @@ async def google_calendar_callback(
             setattr(link, 'google_email', google_email)
     else:
         if not refresh_token:
-            return HTMLResponse(
-                "<html><body>Google didn't return a refresh token — revoke Dilarion's access at "
-                "myaccount.google.com/permissions and try linking again (this only happens if you'd "
-                "linked before and Google is reusing an old consent). You can close this tab.</body></html>",
-                status_code=400,
-            )
+            return HTMLResponse(calendar_page(
+                "warning", "One more step",
+                "Google reused an earlier approval, so Dilarion can't stay connected. Remove Dilarion at "
+                "myaccount.google.com/permissions, then connect again from Dilarion.",
+                account=google_email,
+            ), status_code=400)
         link = GoogleCalendarLink(
             user_id=user_id, google_email=google_email,
             access_token=tokens.get("access_token"), refresh_token=refresh_token,
@@ -9799,7 +9818,11 @@ async def google_calendar_callback(
     db.commit()
 
     AuditService.log_event(db, user_id, "google_calendar_linked", f"Google Calendar linked ({google_email or 'unknown email'})")
-    return HTMLResponse("<html><body>Google Calendar linked! You can close this tab and go back to Dilarion.</body></html>")
+    return HTMLResponse(calendar_page(
+        "success", "Google Calendar linked",
+        "Your meetings will now sync with Google Calendar. You can close this tab and go back to Dilarion.",
+        account=google_email,
+    ))
 
 
 @app.get("/calendar/google/status")
