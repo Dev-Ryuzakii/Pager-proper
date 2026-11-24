@@ -21,7 +21,7 @@ from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, Str
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
-from database_models import Base, Group, GroupMember, User
+from database_models import Base, Group, GroupMember, Organization, User
 from org_privileges import ORG_PRIVILEGES, is_org_account
 
 # ─── Permission catalogue ─────────────────────────────────────────────────────
@@ -187,6 +187,44 @@ class ContactMatch(Base):
     synced_at = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
 
+# ─── Organization scope ───────────────────────────────────────────────────────
+
+def is_site_admin(user) -> bool:
+    """Dilarion staff. Every organization permission and boundary is waived for them."""
+    return bool(getattr(user, "is_admin", False))
+
+
+def org_scope(org_id: Optional[int] = Query(None, description="Site admins only: the organization to act on")) -> Optional[int]:
+    return org_id
+
+
+def resolve_org(db: Session, user, requested: Optional[int] = None) -> int:
+    """The organization a request acts on. Members always get their own (a requested
+    id is ignored). Site admins get the requested one, else their own, else the
+    first organization, so they never hit "membership required"."""
+    own = getattr(user, "organization_id", None)
+    if not is_site_admin(user):
+        if not own:
+            raise HTTPException(status_code=403, detail="An organization membership is required")
+        return int(own)
+    oid = requested or own
+    if oid is None:
+        first = db.query(Organization).order_by(Organization.id).first()
+        if not first:
+            raise HTTPException(status_code=404, detail="No organizations exist yet")
+        return int(first.id)
+    if not db.query(Organization.id).filter(Organization.id == oid).first():
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return int(oid)
+
+
+def organization_choices(db: Session, user) -> Optional[List[dict]]:
+    """For site admins: every organization, so the UI can offer a switcher."""
+    if not is_site_admin(user):
+        return None
+    return [{"id": o.id, "name": o.name} for o in db.query(Organization).order_by(Organization.name).all()]
+
+
 # ─── Permission logic ─────────────────────────────────────────────────────────
 
 def ensure_builtin_roles(db: Session, org_id: int) -> Dict[str, OrgRole]:
@@ -330,11 +368,6 @@ class ContactSync(BaseModel):
 
 def install_org_role_routes(app: FastAPI, get_current_user, get_database_session, audit):
 
-    def _org(user) -> int:
-        org_id = getattr(user, "organization_id", None)
-        if not org_id:
-            raise HTTPException(status_code=403, detail="An organization membership is required")
-        return int(org_id)
 
     def _role_dict(r: OrgRole, count: Optional[int] = None) -> dict:
         d = {"id": r.id, "key": r.key, "name": r.name, "description": r.description,
@@ -365,8 +398,8 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
         return {"role": _role_dict(role) if role else None, "permissions": sorted(perms)}
 
     @app.get("/org/roles")
-    async def list_roles(current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+    async def list_roles(scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
+        org_id = resolve_org(db, current_user, scope)
         ensure_builtin_roles(db, org_id)
         db.commit()
         rows = db.query(OrgRole).filter(OrgRole.organization_id == org_id).order_by(OrgRole.id).all()
@@ -377,9 +410,9 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
         return {"roles": out}
 
     @app.post("/org/roles", status_code=201)
-    async def create_role(body: RoleCreate, current_user=Depends(get_current_user),
+    async def create_role(body: RoleCreate, scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user),
                           db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         require_permission(db, current_user, "manage_roles")
         perms = set(_clean(body.permissions))
         if body.base_role:
@@ -396,9 +429,9 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
         return _role_dict(row, 0)
 
     @app.patch("/org/roles/{role_id}")
-    async def update_role(role_id: int, body: RoleUpdate, current_user=Depends(get_current_user),
+    async def update_role(role_id: int, body: RoleUpdate, scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user),
                           db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         require_permission(db, current_user, "manage_roles")
         row = db.query(OrgRole).filter(OrgRole.id == role_id, OrgRole.organization_id == org_id).first()
         if not row:
@@ -421,9 +454,9 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
         return _role_dict(row)
 
     @app.delete("/org/roles/{role_id}", status_code=204)
-    async def delete_role(role_id: int, current_user=Depends(get_current_user),
+    async def delete_role(role_id: int, scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user),
                           db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         require_permission(db, current_user, "manage_roles")
         row = db.query(OrgRole).filter(OrgRole.id == role_id, OrgRole.organization_id == org_id).first()
         if not row:
@@ -438,9 +471,9 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
         db.commit()
 
     @app.put("/org/members/{user_id}/role")
-    async def assign_role(user_id: int, body: RoleAssign, current_user=Depends(get_current_user),
+    async def assign_role(user_id: int, body: RoleAssign, scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user),
                           db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         require_permission(db, current_user, "manage_roles")
         member = db.query(User).filter(User.id == user_id, User.organization_id == org_id).first()
         if not member:
@@ -462,8 +495,8 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
         return {"user_id": member.id, "role": _role_dict(role)}
 
     @app.get("/org/members/roles")
-    async def member_roles(current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+    async def member_roles(scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
+        org_id = resolve_org(db, current_user, scope)
         require_permission(db, current_user, "manage_roles")
         roles = {r.id: r for r in db.query(OrgRole).filter(OrgRole.organization_id == org_id).all()}
         assigned = {a.user_id: a.role_id for a in db.query(OrgRoleAssignment).join(
@@ -485,9 +518,9 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
         return g
 
     @app.get("/org/groups/policies")
-    async def list_group_policies(current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
+    async def list_group_policies(scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
         """Every group and channel in the organization with its settings, for the org portal."""
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         require_permission(db, current_user, "manage_groups")
         groups = db.query(Group).filter(Group.organization_id == org_id, Group.is_archived == False).order_by(Group.name).all()  # noqa: E712
         stored = {p.group_id: p.settings or {} for p in db.query(GroupPolicy).filter(
@@ -500,17 +533,17 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
         } for g in groups]}
 
     @app.get("/groups/{group_id}/policy")
-    async def get_group_policy(group_id: int, current_user=Depends(get_current_user),
+    async def get_group_policy(group_id: int, scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user),
                                db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         _group_in_org(db, group_id, org_id)
         return {"group_id": group_id, "settings": group_settings(db, group_id),
                 "can_edit": has_permission(db, current_user, "manage_group_settings", group_id)}
 
     @app.put("/groups/{group_id}/policy")
-    async def put_group_policy(group_id: int, body: GroupPolicyUpdate, current_user=Depends(get_current_user),
+    async def put_group_policy(group_id: int, body: GroupPolicyUpdate, scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user),
                                db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         _group_in_org(db, group_id, org_id)
         gm = db.query(GroupMember).filter(GroupMember.group_id == group_id,
                                           GroupMember.user_id == int(current_user.id)).first()
@@ -535,11 +568,11 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
     # Contacts: find colleagues from the phone's address book
 
     @app.post("/contacts/sync")
-    async def sync_contacts(body: ContactSync, current_user=Depends(get_current_user),
+    async def sync_contacts(body: ContactSync, scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user),
                             db: Session = Depends(get_database_session)):
         """The app uploads its address book. Only entries matching an active member of
         the caller's organization are kept; everything else is discarded unread."""
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         require_permission(db, current_user, "contact_search")
         members = db.query(User).filter(User.organization_id == org_id, User.is_active == True,  # noqa: E712
                                         User.id != int(current_user.id)).all()
@@ -581,9 +614,9 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
         return {"uploaded": len(body.contacts), "matched": len(found)}
 
     @app.get("/contacts")
-    async def list_contact_matches(current_user=Depends(get_current_user),
+    async def list_contact_matches(scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user),
                                    db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         rows = (db.query(ContactMatch, User).join(User, User.id == ContactMatch.matched_user_id)
                 .filter(ContactMatch.owner_id == int(current_user.id), ContactMatch.organization_id == org_id,
                         User.organization_id == org_id, User.is_active == True)  # noqa: E712
@@ -592,10 +625,10 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
 
     @app.get("/contacts/search")
     async def search_contacts(q: str = Query(..., min_length=1, max_length=100),
-                              current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
+                              scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
         """Search colleagues saved in your phone contacts by the name you saved them
         under, their Dilarion name, username or phone number. Strictly your organization."""
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         require_permission(db, current_user, "contact_search")
         like = f"%{q.strip()}%"
         digits = phone_digits(q)

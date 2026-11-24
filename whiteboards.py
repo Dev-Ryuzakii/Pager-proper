@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
 from database_models import Base, Group, GroupMember, User
-from org_roles import has_permission
+from org_roles import has_permission, is_site_admin, org_scope, organization_choices, resolve_org
 
 ELEMENT_TYPES = {"sticky", "text", "rect", "ellipse", "diamond", "pen", "arrow", "line",
                  "connector", "frame", "image", "task", "mindmap", "comment"}
@@ -125,11 +125,6 @@ def add_element(db: Session, board: Whiteboard, element: Dict[str, Any], user_id
 
 def install_whiteboard_routes(app: FastAPI, get_current_user, get_database_session, notify):
 
-    def _org(user) -> int:
-        org_id = getattr(user, "organization_id", None)
-        if not org_id:
-            raise HTTPException(status_code=403, detail="An organization membership is required")
-        return int(org_id)
 
     def _member_of(db: Session, group_id: int, user_id: int) -> Optional[GroupMember]:
         return db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.user_id == user_id).first()
@@ -144,7 +139,9 @@ def install_whiteboard_routes(app: FastAPI, get_current_user, get_database_sessi
         return b
 
     def _can_view(db: Session, user, b: Whiteboard) -> bool:
-        if int(b.organization_id) != _org(user):
+        if is_site_admin(user):
+            return True
+        if int(b.organization_id) != int(getattr(user, "organization_id", 0) or 0):
             return False
         if b.scope == "org":
             return has_permission(db, user, "view_org_whiteboard")
@@ -187,14 +184,17 @@ def install_whiteboard_routes(app: FastAPI, get_current_user, get_database_sessi
                                                    WhiteboardFavorite.whiteboard_id == board_id).first() is not None
 
     @app.get("/whiteboards")
-    async def list_whiteboards(include_archived: bool = False, current_user=Depends(get_current_user),
+    async def list_whiteboards(include_archived: bool = False, scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user),
                                db: Session = Depends(get_database_session)):
         """The whiteboard page sidebar: the org board first, then boards of groups you are in."""
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         org_board = _org_board(db, org_id, int(current_user.id))
         db.commit()
-        group_ids = [m.group_id for m in db.query(GroupMember.group_id).filter(
-            GroupMember.user_id == int(current_user.id)).all()]
+        if is_site_admin(current_user):  # every group board in the organization
+            group_ids = [g.id for g in db.query(Group.id).filter(Group.organization_id == org_id).all()]
+        else:
+            group_ids = [m.group_id for m in db.query(GroupMember.group_id).filter(
+                GroupMember.user_id == int(current_user.id)).all()]
         q = db.query(Whiteboard).filter(Whiteboard.organization_id == org_id, Whiteboard.scope == "group",
                                         Whiteboard.group_id.in_(group_ids or [-1]))
         if not include_archived:
@@ -208,11 +208,12 @@ def install_whiteboard_routes(app: FastAPI, get_current_user, get_database_sessi
             d["group_name"] = names.get(b.group_id)
             groups.append(d)
         org = board_summary(org_board, org_board.id in favs) if has_permission(db, current_user, "view_org_whiteboard") else None
-        return {"org": org, "groups": groups}
+        return {"org": org, "groups": groups, "organization_id": org_id,
+                "organizations": organization_choices(db, current_user)}
 
     @app.get("/whiteboards/org")
-    async def get_org_whiteboard(current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+    async def get_org_whiteboard(scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
+        org_id = resolve_org(db, current_user, scope)
         b = _org_board(db, org_id, int(current_user.id))
         db.commit()
         if not _can_view(db, current_user, b):
@@ -220,9 +221,9 @@ def install_whiteboard_routes(app: FastAPI, get_current_user, get_database_sessi
         return board_full(b, _fav(db, int(current_user.id), b.id), _can_edit(db, current_user, b))
 
     @app.get("/groups/{group_id}/whiteboards")
-    async def list_group_whiteboards(group_id: int, current_user=Depends(get_current_user),
+    async def list_group_whiteboards(group_id: int, scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user),
                                      db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         if not _member_of(db, group_id, int(current_user.id)) and not has_permission(db, current_user, "manage_groups"):
             raise HTTPException(status_code=404, detail="Group not found")
         rows = db.query(Whiteboard).filter(Whiteboard.organization_id == org_id, Whiteboard.group_id == group_id,
@@ -230,13 +231,13 @@ def install_whiteboard_routes(app: FastAPI, get_current_user, get_database_sessi
         return {"whiteboards": [board_summary(b) for b in rows]}
 
     @app.post("/groups/{group_id}/whiteboards", status_code=201)
-    async def create_group_whiteboard(group_id: int, body: BoardCreate, current_user=Depends(get_current_user),
+    async def create_group_whiteboard(group_id: int, body: BoardCreate, scope: Optional[int] = Depends(org_scope), current_user=Depends(get_current_user),
                                       db: Session = Depends(get_database_session)):
-        org_id = _org(current_user)
+        org_id = resolve_org(db, current_user, scope)
         g = db.query(Group).filter(Group.id == group_id).first()
         if not g or (g.organization_id and int(g.organization_id) != org_id):
             raise HTTPException(status_code=404, detail="Group not found")
-        if not _member_of(db, group_id, int(current_user.id)):
+        if not _member_of(db, group_id, int(current_user.id)) and not is_site_admin(current_user):
             raise HTTPException(status_code=403, detail="Join the group first")
         if not has_permission(db, current_user, "create_group_whiteboards", group_id):
             raise HTTPException(status_code=403, detail="Your role cannot create whiteboards in this group")

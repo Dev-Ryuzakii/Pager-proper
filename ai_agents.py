@@ -34,7 +34,7 @@ import reminders as reminders_mod
 import whiteboards as wb_mod
 from copilot_ollama import _ollama_generate
 from database_models import Base, GroupMember, Task, TaskAssignee, User
-from org_roles import has_permission
+from org_roles import has_permission, is_site_admin, resolve_org
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +156,14 @@ class AgentContext:
         self.run = run
         self.notify = notify
         self.org_id = getattr(user, "organization_id", None)
+        self.unscoped = is_site_admin(user)  # Dilarion admins reach every organization
+
+    def people(self):
+        q = self.db.query(User).filter(User.is_active == True)  # noqa: E712
+        return q if self.unscoped else q.filter(User.organization_id == self.org_id)
+
+    def board_org(self) -> int:
+        return resolve_org(self.db, self.user)
 
     def member(self, name: Optional[str]) -> User:
         if not name or str(name).lower() in ("me", "myself", "self"):
@@ -163,7 +171,7 @@ class AgentContext:
                 return self.db.get(User, self.run.for_user_id)
             return self.user
         n = str(name).lstrip("@").strip()
-        q = self.db.query(User).filter(User.organization_id == self.org_id, User.is_active == True)  # noqa: E712
+        q = self.people()
         u = q.filter(User.username.ilike(n)).first() or q.filter(User.full_name.ilike(n)).first()
         if not u:
             cands = q.filter(User.full_name.ilike(f"%{n}%")).limit(2).all()
@@ -215,10 +223,11 @@ async def _tool_add_whiteboard_note(ctx: AgentContext, a: dict) -> dict:
     if board_name.lower() in ("org", "organization", "organisation"):
         if not has_permission(db, ctx.user, "edit_org_whiteboard"):
             raise PermissionError("Your role cannot edit the organization whiteboard")
-        board = db.query(wb_mod.Whiteboard).filter(wb_mod.Whiteboard.organization_id == ctx.org_id,
+        org_id = ctx.board_org()
+        board = db.query(wb_mod.Whiteboard).filter(wb_mod.Whiteboard.organization_id == org_id,
                                                    wb_mod.Whiteboard.scope == "org").first()
         if not board:
-            board = wb_mod.Whiteboard(organization_id=ctx.org_id, scope="org", title="Organization whiteboard",
+            board = wb_mod.Whiteboard(organization_id=org_id, scope="org", title="Organization whiteboard",
                                       created_by_id=ctx.user.id, elements={})
             db.add(board)
             db.flush()
@@ -234,7 +243,7 @@ async def _tool_add_whiteboard_note(ctx: AgentContext, a: dict) -> dict:
                                                    wb_mod.Whiteboard.is_archived == False).order_by(  # noqa: E712
             wb_mod.Whiteboard.updated_at.desc()).first()
         if not board:
-            board = wb_mod.Whiteboard(organization_id=ctx.org_id, group_id=g.id, scope="group",
+            board = wb_mod.Whiteboard(organization_id=g.organization_id or ctx.board_org(), group_id=g.id, scope="group",
                                       title=f"{g.name} whiteboard", created_by_id=ctx.user.id, elements={})
             db.add(board)
             db.flush()
@@ -257,8 +266,7 @@ async def _tool_draft_meeting(ctx: AgentContext, a: dict) -> dict:
 
 async def _tool_find_people(ctx: AgentContext, a: dict) -> dict:
     q = str(a.get("query") or "").strip()
-    rows = ctx.db.query(User).filter(User.organization_id == ctx.org_id, User.is_active == True,  # noqa: E712
-                                     or_(User.full_name.ilike(f"%{q}%"), User.username.ilike(f"%{q}%"),
+    rows = ctx.people().filter(or_(User.full_name.ilike(f"%{q}%"), User.username.ilike(f"%{q}%"),
                                          User.department.ilike(f"%{q}%"))).limit(10).all()
     return {"people": [{"username": u.username, "full_name": u.full_name, "department": u.department} for u in rows]}
 
@@ -273,8 +281,10 @@ TOOL_FUNCS = {
 
 
 async def plan_run(db: Session, user: User, run: AiAgentRun) -> None:
-    members = db.query(User.username, User.full_name).filter(
-        User.organization_id == user.organization_id, User.is_active == True).limit(200).all()  # noqa: E712
+    roster_q = db.query(User.username, User.full_name).filter(User.is_active == True)  # noqa: E712
+    if not is_site_admin(user):
+        roster_q = roster_q.filter(User.organization_id == user.organization_id)
+    members = roster_q.limit(200).all()
     roster = "\n".join(f"- {m.username} ({m.full_name or ''})" for m in members)
     prompt = (f"Current time (UTC): {datetime.now(timezone.utc).isoformat()}\n"
               f"Requested by: {user.username}\nMembers of the organization:\n{roster}\n\n"
@@ -406,8 +416,10 @@ def install_ai_routes(app: FastAPI, get_current_user, get_database_session, noti
         if body.for_user_id and body.for_user_id != int(user.id):
             if not has_permission(db, user, "ai_agents_for_others"):
                 raise HTTPException(status_code=403, detail="Your role cannot send agents on someone else's behalf")
-            target = db.query(User).filter(User.id == body.for_user_id,
-                                           User.organization_id == user.organization_id).first()
+            tq = db.query(User).filter(User.id == body.for_user_id)
+            if not is_site_admin(user):
+                tq = tq.filter(User.organization_id == user.organization_id)
+            target = tq.first()
             if not target:
                 raise HTTPException(status_code=404, detail="Member not found in your organization")
         run = AiAgentRun(user_id=int(user.id), organization_id=user.organization_id,
