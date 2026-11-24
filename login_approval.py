@@ -41,7 +41,7 @@ import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -121,8 +121,21 @@ def _aware(dt: Optional[datetime]) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def other_signed_in_sessions(db: Session, user_id: int, device_id: Optional[str]) -> List[UserSession]:
-    """Live app sessions on a device other than this one (portal/admin logins don't count)."""
+# A session only counts as "signed in on another device" while that device is
+# actually there: connected right now, or used within this window. A session
+# the device dropped without telling the server (idle lock, app closed, app
+# deleted, a logout call that never arrived) would otherwise keep demanding an
+# approval that no device can give, until it expires a day later.
+LIVE_SESSION_WINDOW = timedelta(minutes=30)
+
+
+def other_signed_in_sessions(db: Session, user_id: int, device_id: Optional[str],
+                             online_device_ids: Optional[Set[str]] = None) -> List[UserSession]:
+    """Live app sessions on a device other than this one (portal/admin logins don't count).
+
+    online_device_ids: devices with an open WebSocket now. When given, a session
+    counts only if its device is online or it was used within LIVE_SESSION_WINDOW.
+    """
     now = datetime.now(timezone.utc)
     rows = db.query(UserSession).filter(
         UserSession.user_id == user_id,
@@ -136,6 +149,10 @@ def other_signed_in_sessions(db: Session, user_id: int, device_id: Optional[str]
             continue
         if device_id and row.device_id == device_id:
             continue
+        if online_device_ids is not None and row.device_id not in online_device_ids:
+            seen = _aware(row.last_activity) or _aware(row.created_at)
+            if seen is None or now - seen > LIVE_SESSION_WINDOW:
+                continue
         out.append(row)
     return out
 

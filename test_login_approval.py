@@ -187,3 +187,31 @@ def test_device_the_owner_signed_out_needs_approval_again(env):
     laptop.logout_reason = "signed_out_by_owner"
     s.commit()
     assert login(env, "laptop-1", platform="desktop").status_code == 202
+
+
+def _age_session(env, token, minutes):
+    from datetime import datetime, timedelta, timezone
+    s = env.Session()
+    row = s.query(UserSession).filter(UserSession.session_token == token).first()
+    row.last_activity = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    s.commit()
+
+
+def test_stale_session_on_another_device_does_not_need_approval(env):
+    # The phone idle-locked or closed without telling the server: its session is
+    # still active but nobody is there to approve, so sign-in goes straight in.
+    first = login(env, "phone-1").json()["token"]
+    _age_session(env, first, login_approval.LIVE_SESSION_WINDOW.total_seconds() / 60 + 5)
+    res = login(env, "laptop-1", name="MacBook Air", platform="desktop")
+    assert res.status_code == 200, res.text
+    assert not [p for _, p in env.sent if p["type"] == "login_approval_request"]
+
+
+def test_idle_device_still_connected_needs_approval(env):
+    # Not used for a while but its app is open (WebSocket connected): it can
+    # approve, so the new device still has to ask.
+    first = login(env, "phone-1").json()["token"]
+    _age_session(env, first, 120)
+    env.monkeypatch.setattr(backend.ws_manager, "get_user_devices", lambda uid: [{"device_id": "phone-1"}])
+    res = login(env, "laptop-1", name="MacBook Air", platform="desktop")
+    assert res.status_code == 202, res.text

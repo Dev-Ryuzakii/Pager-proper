@@ -7342,7 +7342,8 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_database_s
             UserSession.user_id == user_id, UserSession.device_id == device_id,
         ).order_by(UserSession.id.desc()).first() if device_id else None
         known_device = last_here is not None and getattr(last_here, "logout_reason", None) != "signed_out_by_owner"
-        if not known_device and login_approval.other_signed_in_sessions(db, user_id, device_id):
+        online = {d.get("device_id") for d in ws_manager.get_user_devices(user_id)}
+        if not known_device and login_approval.other_signed_in_sessions(db, user_id, device_id, online):
             body = await _start_login_request(
                 db, user, device_id=device_id, device_name=device_name, platform=platform,
                 ip=ip, location=location, request=request,
