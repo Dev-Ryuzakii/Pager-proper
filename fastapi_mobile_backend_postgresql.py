@@ -91,6 +91,10 @@ import meeting_notes
 import self_dm
 import live_captions  # defines its tables on Base, so import before create_all
 import login_approval  # same: the login_requests table
+import reminders  # reminders table
+import org_roles  # roles, group policies, contact matches
+import whiteboards  # standalone org/group whiteboards
+import ai_agents  # AI page conversations and agent runs
 from calendar_pages import calendar_page
 from channels import install_channel_routes, search_channel_rows
 from meeting_notes import install_meeting_notes_routes
@@ -4992,6 +4996,27 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(periodic_message_cleanup())
     meeting_reminder_task = asyncio.create_task(periodic_meeting_reminders())
     task_reminder_task = asyncio.create_task(periodic_task_reminders())
+
+    async def periodic_personal_reminders():
+        """Fire personal reminders (reminders.py) every 30 seconds."""
+        async def _ws_notify(user_ids, payload):
+            for uid in user_ids:
+                try:
+                    await ws_manager.send_to_user(uid, payload)
+                except Exception:
+                    pass
+        while True:
+            try:
+                await asyncio.sleep(30)
+                db = next(get_database_session())
+                try:
+                    await reminders.dispatch_due_reminders(db, _ws_notify, push_to_user)
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.error("personal reminder sweep error: %s", type(e).__name__)
+
+    personal_reminder_task = asyncio.create_task(periodic_personal_reminders())
     async def periodic_recording_sweep():
         """Lost webhooks. Every two minutes, finish recordings whose file has settled."""
         while True:
@@ -5044,6 +5069,7 @@ async def lifespan(app: FastAPI):
     deadmans_task.cancel()
     cleanup_task.cancel()
     meeting_reminder_task.cancel()
+    personal_reminder_task.cancel()
     retention_task.cancel()
     recording_sweep_task.cancel()
     uptime_task.cancel()
@@ -13676,6 +13702,10 @@ async def _notify_users(user_ids, payload):
 
 
 install_channel_routes(app, get_current_user, get_database_session, _audit, _notify_users, deliver_group_message)
+reminders.install_reminder_routes(app, get_current_user, get_database_session)
+org_roles.install_org_role_routes(app, get_current_user, get_database_session, _audit)
+whiteboards.install_whiteboard_routes(app, get_current_user, get_database_session, _notify_users)
+ai_agents.install_ai_routes(app, get_current_user, get_database_session, _notify_users)
 
 
 # ─── Profile picture ─────────────────────────────────────────────────────────
