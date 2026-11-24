@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text, or_
+from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, String, Text, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
@@ -84,6 +84,21 @@ class AiAgentRun(Base):
     created_at = Column(DateTime(timezone=True), default=func.now())
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class AiPreference(Base):
+    """Per-user AI settings. auto_approve = "full control": agents act without
+    asking first (still limited to what the user's role allows)."""
+    __tablename__ = "ai_preferences"
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    auto_approve = Column(Boolean, nullable=False, default=False)
+    updated_at = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
+
+
+def auto_approve_enabled(db: Session, user_id: int) -> bool:
+    row = db.get(AiPreference, int(user_id))
+    return bool(row and row.auto_approve)
 
 
 def _iso(dt):
@@ -354,6 +369,10 @@ class ChatSend(BaseModel):
     text: str = Field(..., min_length=1, max_length=8000)
 
 
+class PreferenceUpdate(BaseModel):
+    auto_approve: bool
+
+
 class PlanEdit(BaseModel):
     plan: List[Dict[str, Any]]
 
@@ -422,14 +441,33 @@ def install_ai_routes(app: FastAPI, get_current_user, get_database_session, noti
             target = tq.first()
             if not target:
                 raise HTTPException(status_code=404, detail="Member not found in your organization")
+        # Full control: the user's auto-approve setting overrides a request to ask first.
+        needs_approval = body.require_approval and not auto_approve_enabled(db, int(user.id))
         run = AiAgentRun(user_id=int(user.id), organization_id=user.organization_id,
                          for_user_id=body.for_user_id or int(user.id), conversation_id=body.conversation_id,
-                         instruction=body.instruction.strip(), require_approval=1 if body.require_approval else 0,
+                         instruction=body.instruction.strip(), require_approval=1 if needs_approval else 0,
                          status="planning")
         db.add(run)
         db.commit()
-        asyncio.create_task(_background(run.id, int(user.id), execute=not body.require_approval))
+        asyncio.create_task(_background(run.id, int(user.id), execute=not needs_approval))
         return run
+
+    # Preferences
+
+    @app.get("/ai/preferences")
+    async def get_preferences(current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
+        return {"auto_approve": auto_approve_enabled(db, int(current_user.id))}
+
+    @app.put("/ai/preferences")
+    async def put_preferences(body: PreferenceUpdate, current_user=Depends(get_current_user),
+                              db: Session = Depends(get_database_session)):
+        row = db.get(AiPreference, int(current_user.id))
+        if row:
+            row.auto_approve = body.auto_approve
+        else:
+            db.add(AiPreference(user_id=int(current_user.id), auto_approve=body.auto_approve))
+        db.commit()
+        return {"auto_approve": body.auto_approve}
 
     # Agents
 
