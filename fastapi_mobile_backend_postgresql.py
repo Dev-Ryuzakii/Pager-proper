@@ -7391,6 +7391,7 @@ async def logout_user(current_user: User = Depends(get_current_user),
 # ── Multi-device linking ────────────────────────────────────────────────────────
 
 VALID_PLATFORMS = {"ios", "android", "desktop", "web"}  # web = browser app at web.dilarion.xyz
+PHONE_PLATFORMS = {"ios", "android"}
 LINK_REQUEST_TTL_MINUTES = 5
 
 def _link_request_expired(req) -> bool:
@@ -7455,6 +7456,22 @@ async def register_device(payload: DeviceRegister,
             last_seen=datetime.now(timezone.utc),
         )
         db.add(device)
+
+    # An account has one phone. When a phone registers a key, any other phone
+    # row (an earlier install, or the migrated 'legacy' row) is a key nobody holds
+    # any more: retire it so senders stop wrapping for it and it stops showing up
+    # as a "linked device" the user never linked.
+    if platform in PHONE_PLATFORMS:
+        now = datetime.now(timezone.utc)
+        stale = db.query(LinkedDevice).filter(
+            LinkedDevice.user_id == user_id,
+            LinkedDevice.platform.in_(PHONE_PLATFORMS | {"legacy"}),
+            LinkedDevice.public_key != pub,
+            LinkedDevice.revoked_at.is_(None),
+        ).all()
+        for d in stale:
+            setattr(d, 'revoked_at', now)
+            setattr(d, 'session_token', None)
 
     # Keep the user's canonical public_key pointing at their primary device so
     # older single-key clients still resolve a usable key.
