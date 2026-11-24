@@ -6508,6 +6508,67 @@ async def organization_invite_staff(
     return {"invited_user_count": count, "message": "Invitations sent by email and SMS"}
 
 
+BULK_RESEND_LIMIT = 50
+BULK_RESEND_COOLDOWN = timedelta(minutes=15)
+
+
+class BulkResendInvites(BaseModel):
+    # Staff to resend to; omitted/empty = the oldest pending invitations, up to the limit.
+    user_ids: Optional[List[int]] = Field(None, max_length=BULK_RESEND_LIMIT)
+
+
+@app.post("/organization/users/resend-invites", status_code=202)
+async def organization_resend_staff_invites_bulk(
+    payload: BulkResendInvites,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_organization_viewer),
+    db: Session = Depends(get_database_session),
+):
+    """Resend activation codes to up to 50 of this organization's pending staff at once.
+
+    Skips anyone already activated, without an email, or sent a code in the last
+    15 minutes (so a double click doesn't send everyone two codes)."""
+    base = db.query(User).filter(User.organization_id == current_user.organization_id,
+                                 or_(User.organization_role.is_(None), User.organization_role != "viewer"))
+    if payload.user_ids:
+        ids = list(dict.fromkeys(int(i) for i in payload.user_ids))[:BULK_RESEND_LIMIT]
+        by_id = {int(u.id): u for u in base.filter(User.id.in_(ids)).all()}
+        targets = [by_id.get(i) for i in ids]
+    else:
+        # Only people a code can go to now, so each batch is 50 real sends.
+        cutoff = datetime.now(timezone.utc) - BULK_RESEND_COOLDOWN
+        targets = (base.filter(User.invitation_accepted_at.is_(None), User.invitation_token_hash.isnot(None),
+                               User.email.isnot(None), User.email != "",
+                               or_(User.invited_at.is_(None), User.invited_at < cutoff))
+                   .order_by(User.invited_at.asc().nullsfirst(), User.id.asc()).limit(BULK_RESEND_LIMIT).all())
+        ids = [int(u.id) for u in targets]
+
+    now = datetime.now(timezone.utc)
+    sent, skipped = [], []
+    for uid, user in zip(ids, targets):
+        if user is None:
+            skipped.append({"id": uid, "username": None, "reason": "Not found in your organization"})
+            continue
+        invited = user.invited_at
+        if invited is not None and invited.tzinfo is None:
+            invited = invited.replace(tzinfo=timezone.utc)
+        if not user.invitation_accepted_at and invited and now - invited < BULK_RESEND_COOLDOWN:
+            skipped.append({"id": uid, "username": user.username, "reason": "Sent less than 15 minutes ago"})
+            continue
+        try:
+            _resend_staff_invitation(db, user, background_tasks)
+            sent.append({"id": uid, "username": user.username})
+        except HTTPException as e:
+            db.rollback()
+            skipped.append({"id": uid, "username": user.username, "reason": str(e.detail)})
+
+    remaining = base.filter(User.invitation_accepted_at.is_(None), User.invitation_token_hash.isnot(None)).count()
+    AuditService.log_event(db, int(current_user.id), "staff_invites_bulk_resent",
+                           f"Organization portal resent {len(sent)} invitations ({len(skipped)} skipped)")
+    return {"sent": sent, "skipped": skipped, "sent_count": len(sent), "skipped_count": len(skipped),
+            "pending_total": remaining, "limit": BULK_RESEND_LIMIT}
+
+
 @app.post("/organization/users/{user_id}/resend-invite", status_code=202)
 async def organization_resend_staff_invite(
     user_id: int,
