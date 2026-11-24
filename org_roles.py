@@ -484,6 +484,21 @@ def install_org_role_routes(app: FastAPI, get_current_user, get_database_session
             raise HTTPException(status_code=404, detail="Group not found")
         return g
 
+    @app.get("/org/groups/policies")
+    async def list_group_policies(current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
+        """Every group and channel in the organization with its settings, for the org portal."""
+        org_id = _org(current_user)
+        require_permission(db, current_user, "manage_groups")
+        groups = db.query(Group).filter(Group.organization_id == org_id, Group.is_archived == False).order_by(Group.name).all()  # noqa: E712
+        stored = {p.group_id: p.settings or {} for p in db.query(GroupPolicy).filter(
+            GroupPolicy.group_id.in_([g.id for g in groups] or [-1])).all()}
+        counts = dict(db.query(GroupMember.group_id, func.count(GroupMember.id)).filter(
+            GroupMember.group_id.in_([g.id for g in groups] or [-1])).group_by(GroupMember.group_id).all())
+        return {"groups": [{
+            "id": g.id, "name": g.name, "kind": g.kind, "member_count": int(counts.get(g.id, 0)),
+            "settings": {**GROUP_DEFAULTS, **stored.get(g.id, {})},
+        } for g in groups]}
+
     @app.get("/groups/{group_id}/policy")
     async def get_group_policy(group_id: int, current_user=Depends(get_current_user),
                                db: Session = Depends(get_database_session)):
