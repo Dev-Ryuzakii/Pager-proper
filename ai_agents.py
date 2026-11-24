@@ -21,10 +21,12 @@ Tools (documents/sheets/slides come later):
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, String, Text, or_
 from sqlalchemy.orm import Session
@@ -93,12 +95,74 @@ class AiPreference(Base):
 
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     auto_approve = Column(Boolean, nullable=False, default=False)
+    # Added later, so nullable (schema_sync adds them without defaults); None = default.
+    timezone = Column(String(64), nullable=True)            # IANA zone the apps report, e.g. Africa/Lagos
+    allow_from_others = Column(Boolean, nullable=True)      # others' agents may set reminders / assign tasks to me
+    disabled_tools = Column(JSON, nullable=True)            # tools agents may not use for me
     updated_at = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
 
 def auto_approve_enabled(db: Session, user_id: int) -> bool:
     row = db.get(AiPreference, int(user_id))
     return bool(row and row.auto_approve)
+
+
+def _prefs(db: Session, user_id: int) -> "AiPreference":
+    row = db.get(AiPreference, int(user_id))
+    if row is None:
+        row = AiPreference(user_id=int(user_id), auto_approve=False)
+        db.add(row)
+    return row
+
+
+def prefs_dict(row: Optional["AiPreference"]) -> dict:
+    return {
+        "auto_approve": bool(row and row.auto_approve),
+        "timezone": (row.timezone if row else None) or "UTC",
+        "allow_from_others": True if not row or row.allow_from_others is None else bool(row.allow_from_others),
+        "disabled_tools": [t for t in ((row.disabled_tools if row else None) or []) if t in TOOL_LABELS],
+    }
+
+
+def user_zone(db: Session, user_id: int) -> ZoneInfo:
+    row = db.get(AiPreference, int(user_id))
+    try:
+        return ZoneInfo(row.timezone) if row and row.timezone else ZoneInfo("UTC")
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def remember_timezone(db: Session, user_id: int, request: Optional[Request]) -> None:
+    """Keep the zone the app reports (X-Timezone) so times like "4pm" mean the user's 4pm."""
+    tz = (request.headers.get("x-timezone") if request is not None else None) or ""
+    tz = tz.strip()[:64]
+    if not tz:
+        return
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        return
+    row = _prefs(db, user_id)
+    if row.timezone != tz:
+        row.timezone = tz
+        db.commit()
+
+
+def tool_disabled(db: Session, user_id: int, tool: str) -> bool:
+    return tool in prefs_dict(db.get(AiPreference, int(user_id)))["disabled_tools"]
+
+
+def accepts_from_others(db: Session, user_id: int) -> bool:
+    return prefs_dict(db.get(AiPreference, int(user_id)))["allow_from_others"]
+
+
+TOOL_LABELS = {
+    "create_reminder": "Set reminders",
+    "create_task": "Create and assign tasks",
+    "add_whiteboard_note": "Add whiteboard notes",
+    "draft_meeting": "Draft meetings",
+    "find_people": "Find people",
+}
 
 
 def _iso(dt):
@@ -127,19 +191,22 @@ def msg_dict(m: AiMessage) -> dict:
 
 _PLAN_PROMPT = """You are a Dilarion AI agent. You turn an instruction into a short plan using ONLY these tools:
 
-create_reminder      {"title": str, "remind_at": ISO-8601 UTC, "for": username or "me", "note": str?, "recurrence": null|"daily"|"weekdays"|"weekly"|"monthly"}
-create_task          {"title": str, "description": str?, "due_at": ISO-8601 UTC or null, "assignees": [username, ...]}
+create_reminder      {"title": str, "remind_at": local time, "for": username or "me", "note": str?, "recurrence": null|"daily"|"weekdays"|"weekly"|"monthly"}
+create_task          {"title": str, "description": str?, "due_at": local time or null, "assignees": [username, ...]}
 add_whiteboard_note  {"board": "org" or a group name, "text": str, "kind": "sticky"|"task", "color": str?}
-draft_meeting        {"title": str, "scheduled_at": ISO-8601 UTC, "duration_minutes": int, "participants": [username, ...]}
+draft_meeting        {"title": str, "scheduled_at": local time, "duration_minutes": int, "participants": [username, ...]}
 find_people          {"query": str}
 
 Respond with ONLY JSON: {"title": short title for the job, "steps": [{"tool": str, "args": {...}, "why": str}], "summary": one sentence describing the plan}
-Rules: at most 8 steps. Use only people named in the instruction or in the provided member list. Resolve relative times ("tomorrow 9am") against the current time given. If the instruction cannot be done with these tools, return an empty steps list and explain in summary."""
+Rules: at most 8 steps. Use only people named in the instruction or in the provided member list.
+Times: write every time as the user's LOCAL wall-clock time "YYYY-MM-DDTHH:MM" with NO timezone or "Z" ("4pm" -> "T16:00").
+Resolve relative times against the current local time given, using the calendar provided: "Friday" means the date listed for Friday; "every Friday at 4pm" starts on the next Friday at 16:00 with recurrence "weekly". Never pick a time already in the past.
+If the instruction cannot be done with these tools, return an empty steps list and explain in summary."""
 
 _CHAT_PROMPT = """You are Dilarion AI, the assistant on the AI page of a secure team messaging app. You can chat, answer questions, and send agents to do work in the app: set reminders, create and assign tasks, add notes to whiteboards, draft meetings, find colleagues.
 
 Respond with ONLY JSON: {"reply": str, "agent_instruction": str or null, "title": short title for this conversation}
-Set agent_instruction to a complete, self-contained instruction ONLY when the user is asking you to do one of those actions; otherwise null. Keep reply concise plain text."""
+Set agent_instruction to a complete, self-contained instruction ONLY when the user is asking you to do one of those actions; otherwise null. Keep the user's days and times exactly as they said them in agent_instruction ("every Friday at 4pm"), never convert them. Keep reply concise plain text."""
 
 
 def _loads(raw: Optional[str]) -> Optional[dict]:
@@ -152,14 +219,57 @@ def _loads(raw: Optional[str]) -> Optional[dict]:
         return None
 
 
-def _parse_dt(value: Any) -> Optional[datetime]:
+def _parse_dt(value: Any, zone: Optional[ZoneInfo] = None) -> Optional[datetime]:
+    """ISO time -> UTC. A time without an offset is the user's local time."""
     if not value:
         return None
     try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
     except ValueError:
         return None
-    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=zone or timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+_WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+_TIME_ARGS = ("remind_at", "due_at", "scheduled_at")
+
+
+def time_context(zone: ZoneInfo) -> str:
+    now = datetime.now(zone)
+    days = "\n".join(f"- {(now + timedelta(days=i)):%A %Y-%m-%d}" + (" (today)" if i == 0 else "")
+                     for i in range(8))
+    return (f"Current local time: {now:%A %Y-%m-%d %H:%M} ({zone.key}, UTC{now:%z})\n"
+            f"Calendar for the next days:\n{days}")
+
+
+def normalize_plan_times(steps: list, instruction: str, zone: ZoneInfo) -> list:
+    """Make plan times exact UTC, and keep them on the weekday the instruction names.
+
+    Small models often ignore "Friday" and use today's date, or treat "4pm" as UTC.
+    """
+    text = (instruction or "").lower()
+    named = [i for i, d in enumerate(_WEEKDAYS) if re.search(rf"\b{d}s?\b", text)]
+    now = datetime.now(timezone.utc)
+    for step in steps:
+        args = step.get("args") or {}
+        for key in _TIME_ARGS:
+            if not args.get(key):
+                continue
+            # The model is told to write local wall-clock time; it sometimes adds a
+            # stray "Z" anyway, so the offset it writes is ignored.
+            try:
+                wall = datetime.fromisoformat(str(args[key]).strip().replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            local = wall.replace(tzinfo=None).replace(tzinfo=zone)
+            if len(named) == 1 and local.weekday() != named[0]:
+                local = local + timedelta(days=(named[0] - local.weekday()) % 7)
+            while local.astimezone(timezone.utc) < now and (args.get("recurrence") or len(named) == 1):
+                local = local + timedelta(days=7 if (args.get("recurrence") == "weekly" or named) else 1)
+            args[key] = local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return steps
 
 
 # ─── Agent execution ──────────────────────────────────────────────────────────
@@ -172,6 +282,7 @@ class AgentContext:
         self.notify = notify
         self.org_id = getattr(user, "organization_id", None)
         self.unscoped = is_site_admin(user)  # Dilarion admins reach every organization
+        self.zone = user_zone(db, user.id)
 
     def people(self):
         q = self.db.query(User).filter(User.is_active == True)  # noqa: E712
@@ -202,7 +313,9 @@ async def _tool_create_reminder(ctx: AgentContext, a: dict) -> dict:
         if not (has_permission(ctx.db, ctx.user, "set_reminders_for_others")
                 and has_permission(ctx.db, ctx.user, "ai_agents_for_others")):
             raise PermissionError("Your role cannot set reminders for other members")
-    at = _parse_dt(a.get("remind_at"))
+        if not accepts_from_others(ctx.db, target.id) or tool_disabled(ctx.db, target.id, "create_reminder"):
+            raise PermissionError(f"{target.username} doesn't accept reminders from other people's agents")
+    at = _parse_dt(a.get("remind_at"), ctx.zone)
     if not at:
         raise ValueError("remind_at is missing or not a valid time")
     r = reminders_mod.create_reminder(ctx.db, target.id, a.get("title"), at, note=a.get("note"),
@@ -217,10 +330,14 @@ async def _tool_create_task(ctx: AgentContext, a: dict) -> dict:
     if any(p.id != ctx.user.id for p in people):
         if not (has_permission(ctx.db, ctx.user, "assign_tasks") and has_permission(ctx.db, ctx.user, "ai_agents_for_others")):
             raise PermissionError("Your role cannot assign tasks to other members")
+        refusing = [p.username for p in people if p.id != ctx.user.id
+                    and (not accepts_from_others(ctx.db, p.id) or tool_disabled(ctx.db, p.id, "create_task"))]
+        if refusing:
+            raise PermissionError(f"{', '.join(refusing)} don't accept tasks from other people's agents")
     title = str(a.get("title") or "").strip()[:255]
     if not title:
         raise ValueError("title is required")
-    due = _parse_dt(a.get("due_at"))
+    due = _parse_dt(a.get("due_at"), ctx.zone)
     t = Task(created_by_id=ctx.user.id, title=title, description=a.get("description"),
              due_at=due.replace(tzinfo=None) if due else None, status="open")
     ctx.db.add(t)
@@ -272,7 +389,7 @@ async def _tool_add_whiteboard_note(ctx: AgentContext, a: dict) -> dict:
 
 
 async def _tool_draft_meeting(ctx: AgentContext, a: dict) -> dict:
-    at = _parse_dt(a.get("scheduled_at"))
+    at = _parse_dt(a.get("scheduled_at"), ctx.zone)
     people = [ctx.member(n).username for n in (a.get("participants") or [])][:50]
     return {"draft": {"title": a.get("title"), "scheduled_at": _iso(at),
                       "duration_minutes": int(a.get("duration_minutes") or 30), "participants": people},
@@ -301,8 +418,11 @@ async def plan_run(db: Session, user: User, run: AiAgentRun) -> None:
         roster_q = roster_q.filter(User.organization_id == user.organization_id)
     members = roster_q.limit(200).all()
     roster = "\n".join(f"- {m.username} ({m.full_name or ''})" for m in members)
-    prompt = (f"Current time (UTC): {datetime.now(timezone.utc).isoformat()}\n"
-              f"Requested by: {user.username}\nMembers of the organization:\n{roster}\n\n"
+    zone = user_zone(db, user.id)
+    blocked = prefs_dict(db.get(AiPreference, int(user.id)))["disabled_tools"]
+    prompt = (f"{time_context(zone)}\n"
+              + (f"Do NOT use these tools (the user turned them off): {', '.join(blocked)}\n" if blocked else "")
+              + f"Requested by: {user.username}\nMembers of the organization:\n{roster}\n\n"
               f"Instruction: {run.instruction}")
     parsed = _loads(await _ollama_generate(_PLAN_PROMPT, prompt, json_mode=True, timeout=120.0))
     if parsed is None:
@@ -310,8 +430,10 @@ async def plan_run(db: Session, user: User, run: AiAgentRun) -> None:
     steps = []
     for s in (parsed.get("steps") or [])[:MAX_STEPS]:
         if isinstance(s, dict) and s.get("tool") in TOOLS and isinstance(s.get("args"), dict):
+            if s["tool"] in blocked:
+                continue
             steps.append({"tool": s["tool"], "args": s["args"], "why": str(s.get("why") or "")[:300]})
-    run.plan = steps
+    run.plan = normalize_plan_times(steps, run.instruction, zone)
     run.title = str(parsed.get("title") or run.instruction)[:150]
     run.summary = str(parsed.get("summary") or "")[:1000]
 
@@ -328,6 +450,8 @@ async def execute_run(db: Session, user: User, run: AiAgentRun, notify) -> None:
             return
         entry = {"tool": step["tool"], "args": step["args"]}
         try:
+            if tool_disabled(db, user.id, step["tool"]):
+                raise PermissionError(f"{TOOL_LABELS.get(step['tool'], step['tool'])} is turned off in your AI settings")
             entry["result"] = await TOOL_FUNCS[step["tool"]](ctx, step["args"])
             entry["status"] = "done"
             db.commit()
@@ -370,7 +494,10 @@ class ChatSend(BaseModel):
 
 
 class PreferenceUpdate(BaseModel):
-    auto_approve: bool
+    auto_approve: Optional[bool] = None
+    allow_from_others: Optional[bool] = None
+    disabled_tools: Optional[List[str]] = None
+    timezone: Optional[str] = Field(None, max_length=64)
 
 
 class PlanEdit(BaseModel):
@@ -455,25 +582,41 @@ def install_ai_routes(app: FastAPI, get_current_user, get_database_session, noti
     # Preferences
 
     @app.get("/ai/preferences")
-    async def get_preferences(current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
-        return {"auto_approve": auto_approve_enabled(db, int(current_user.id))}
+    async def get_preferences(request: Request, current_user=Depends(get_current_user),
+                              db: Session = Depends(get_database_session)):
+        remember_timezone(db, int(current_user.id), request)
+        out = prefs_dict(db.get(AiPreference, int(current_user.id)))
+        out["tools"] = [{"id": k, "label": v} for k, v in TOOL_LABELS.items()]
+        return out
 
     @app.put("/ai/preferences")
     async def put_preferences(body: PreferenceUpdate, current_user=Depends(get_current_user),
                               db: Session = Depends(get_database_session)):
-        row = db.get(AiPreference, int(current_user.id))
-        if row:
+        """Partial update: only the fields sent change."""
+        row = _prefs(db, int(current_user.id))
+        if body.auto_approve is not None:
             row.auto_approve = body.auto_approve
-        else:
-            db.add(AiPreference(user_id=int(current_user.id), auto_approve=body.auto_approve))
+        if body.allow_from_others is not None:
+            row.allow_from_others = body.allow_from_others
+        if body.disabled_tools is not None:
+            row.disabled_tools = sorted({t for t in body.disabled_tools if t in TOOL_LABELS})
+        if body.timezone:
+            try:
+                ZoneInfo(body.timezone)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise HTTPException(status_code=400, detail="Unknown time zone")
+            row.timezone = body.timezone
         db.commit()
-        return {"auto_approve": body.auto_approve}
+        out = prefs_dict(row)
+        out["tools"] = [{"id": k, "label": v} for k, v in TOOL_LABELS.items()]
+        return out
 
     # Agents
 
     @app.post("/ai/agents", status_code=202)
-    async def start_agent(body: AgentCreate, current_user=Depends(get_current_user),
+    async def start_agent(body: AgentCreate, request: Request, current_user=Depends(get_current_user),
                           db: Session = Depends(get_database_session)):
+        remember_timezone(db, int(current_user.id), request)
         return run_dict(_start(db, current_user, body))
 
     @app.get("/ai/agents")
@@ -544,6 +687,15 @@ def install_ai_routes(app: FastAPI, get_current_user, get_database_session, noti
         db.commit()
         return {"id": c.id, "title": c.title, "messages": []}
 
+    @app.delete("/ai/conversations", status_code=204)
+    async def clear_conversations(current_user=Depends(get_current_user), db: Session = Depends(get_database_session)):
+        """Delete every AI chat of the caller (Settings > AI > Clear chat history)."""
+        ids = [c.id for c in db.query(AiConversation.id).filter(AiConversation.user_id == int(current_user.id)).all()]
+        if ids:
+            db.query(AiMessage).filter(AiMessage.conversation_id.in_(ids)).delete(synchronize_session=False)
+            db.query(AiConversation).filter(AiConversation.id.in_(ids)).delete(synchronize_session=False)
+        db.commit()
+
     @app.get("/ai/conversations/{conv_id}")
     async def get_conversation(conv_id: int, current_user=Depends(get_current_user),
                                db: Session = Depends(get_database_session)):
@@ -560,16 +712,17 @@ def install_ai_routes(app: FastAPI, get_current_user, get_database_session, noti
         db.commit()
 
     @app.post("/ai/conversations/{conv_id}/messages")
-    async def send_message(conv_id: int, body: ChatSend, current_user=Depends(get_current_user),
+    async def send_message(conv_id: int, body: ChatSend, request: Request, current_user=Depends(get_current_user),
                            db: Session = Depends(get_database_session)):
         _require_ai(db, current_user)
+        remember_timezone(db, int(current_user.id), request)
         c = _own_conv(db, current_user, conv_id)
         history = db.query(AiMessage).filter(AiMessage.conversation_id == c.id).order_by(AiMessage.id.desc()).limit(20).all()
         transcript = "\n".join(f"{m.role}: {m.content}" for m in reversed(history))
         user_msg = AiMessage(conversation_id=c.id, role="user", content=body.text.strip())
         db.add(user_msg)
         db.commit()
-        prompt = (f"Current time (UTC): {datetime.now(timezone.utc).isoformat()}\n"
+        prompt = (f"{time_context(user_zone(db, current_user.id))}\n"
                   f"Conversation so far:\n{transcript or '(none)'}\n\nuser: {body.text.strip()}")
         parsed = _loads(await _ollama_generate(_CHAT_PROMPT, prompt, json_mode=True))
         if parsed is None:
