@@ -1103,21 +1103,30 @@ class AccountDeletionRequest(Base):
 
 
 class PasswordResetRequest(Base):
-    """Self-service 'forgot password' — there's no email/SMS recovery
-    channel in this app (accounts are admin-provisioned), so this is the
-    same shape as AccountDeletionRequest: the locked-out user submits by
-    phone number (no auth needed, since they can't log in), an admin
-    approves it (generating and setting a new token, relayed out-of-band —
-    never sent back through the app) or denies it."""
+    """'Forgot access token' without a recovery code: the person verifies the
+    account's email with a code, their organization or a Dilarion admin
+    approves, and a fresh recovery code is emailed to them (never shown to the
+    approver). Older apps still submit by phone number with no email check."""
     __tablename__ = "password_reset_requests"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     reason = Column(Text, nullable=True)
-    status = Column(String(20), default="pending")  # pending/approved/denied
+    # verifying (email code sent, not submitted yet) / pending / approved / denied / superseded
+    status = Column(String(20), default="pending")
     requested_at = Column(DateTime, default=func.now())
     processed_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     processed_at = Column(DateTime, nullable=True)
+    # Email-verified flow: the person proves they own the account's email with a
+    # one-time code, then their organization or a Dilarion admin approves, and a
+    # fresh recovery code is emailed to them.
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
+    email_code_hash = Column(String(64), nullable=True)
+    email_code_sent_at = Column(DateTime, nullable=True)
+    email_code_expires_at = Column(DateTime, nullable=True)
+    email_code_attempts = Column(Integer, nullable=True)
+    verified_at = Column(DateTime, nullable=True)
+    decision_note = Column(Text, nullable=True)
 
     user = relationship("User", foreign_keys=[user_id])
     processed_by = relationship("User", foreign_keys=[processed_by_id])

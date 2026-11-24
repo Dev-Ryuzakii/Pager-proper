@@ -1191,8 +1191,15 @@ class AccountDeletionDecision(BaseModel):
     reason: Optional[str] = Field(None, description="Admin's note, e.g. why denied")
 
 class PasswordResetRequestCreate(BaseModel):
-    phone_number: str = Field(..., min_length=10, max_length=20, description="The locked-out account's phone number")
+    email: Optional[str] = Field(None, min_length=3, max_length=254, description="The locked-out account's email")
+    code: Optional[str] = Field(None, max_length=12, description="The code emailed by /auth/forgot-password/email-code")
+    confirm: bool = Field(False, description="The person confirms they own this account")
+    # Older apps still send the phone number with no code; kept so they keep working.
+    phone_number: Optional[str] = Field(None, min_length=10, max_length=20, description="Deprecated: use email + code")
     reason: Optional[str] = Field(None, max_length=1000)
+
+class PasswordResetEmailCode(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
 
 class PasswordResetDecision(BaseModel):
     reason: Optional[str] = Field(None, description="Admin's note, e.g. why denied")
@@ -14640,50 +14647,290 @@ async def deny_account_deletion(
     return {"status": "denied"}
 
 
-# ─── Password reset requests ("Forgot Password") ────────────────────────────
-# No email/SMS on file for accounts (admin-provisioned), so this can't be a
-# real self-service reset — it's a request an admin has to act on, same
-# shape as account deletion requests. Unauthenticated (the whole point is
-# the user can't log in), and deliberately gives the same response whether
-# or not the phone number is registered, so this can't be used to check
-# which numbers have accounts.
+# ─── Password reset requests ("Forgot access token") ────────────────────────
+# Someone who still has their recovery code resets on their own
+# (/auth/reset-with-recovery-code). Without it:
+#   1. POST /auth/forgot-password/email-code {email}: a 6-digit code goes to the
+#      account's email, proving the person owns it.
+#   2. POST /auth/forgot-password {email, code, reason, confirm}: the request
+#      goes to their organization (the organization account and staff with
+#      "manage_staff") and to Dilarion admins/operators: in-app, push and email.
+#   3. Approving it emails the person a fresh recovery code; they reset with it.
+# Unauthenticated (the person can't sign in) and always answers the same way
+# whether or not the email has an account, so it can't be used to find out
+# which addresses do.
+
+RESET_CODE_TTL = timedelta(minutes=15)
+RESET_CODE_RESEND_AFTER = timedelta(seconds=60)
+RESET_CODE_MAX_ATTEMPTS = 5
+
+
+def _reset_code_digest(code: str) -> str:
+    return hashlib.sha256(f"pwreset:{code}".encode("utf-8")).hexdigest()
+
+
+def _naive_utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _as_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+
+
+def _reset_user_by_email(db: Session, email: str) -> Optional[User]:
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    return db.query(User).filter(func.lower(User.email) == email, User.is_active == True).first()
+
+
+def _reset_approvers(db: Session, user: User) -> List[User]:
+    """Who may approve this person's reset: their organization account, staff
+    in their organization with "manage_staff", and Dilarion admins/operators."""
+    people: Dict[int, User] = {}
+    org_id = getattr(user, "organization_id", None)
+    if org_id:
+        for u in db.query(User).filter(User.organization_id == org_id, User.is_active == True,
+                                       User.id != user.id).all():
+            if _is_org_account(u) or _has_org_privilege(u, "manage_staff"):
+                people[int(u.id)] = u
+    for u in db.query(User).filter(User.is_admin == True, User.is_active == True).all():
+        if getattr(u, "admin_role", None) in (None, "superadmin", "admin", "operator"):
+            people[int(u.id)] = u
+    people.pop(int(user.id), None)
+    return list(people.values())
+
+
+def _can_approve_reset(approver: User, req: "PasswordResetRequest") -> bool:
+    if getattr(approver, "is_admin", False):
+        return True
+    org_id = getattr(approver, "organization_id", None)
+    if not org_id or org_id != getattr(req, "organization_id", None):
+        return False
+    if getattr(approver, "organization_role", None) == "viewer":
+        return True   # the organization portal account
+    return _is_org_account(approver) or _has_org_privilege(approver, "manage_staff")
+
+
+def _reset_request_json(db: Session, r: "PasswordResetRequest") -> Dict[str, Any]:
+    requester = db.query(User).filter(User.id == r.user_id).first()
+    processor = db.query(User).filter(User.id == r.processed_by_id).first() if r.processed_by_id else None
+    return {
+        "id": r.id,
+        "username": str(getattr(requester, 'username', '')) if requester else "unknown",
+        "full_name": getattr(requester, 'full_name', None) if requester else None,
+        "email": getattr(requester, 'email', None) if requester else None,
+        "department": getattr(requester, 'department', None) if requester else None,
+        "phone_number": str(getattr(requester, 'phone_number', '')) if requester else None,
+        "reason": r.reason,
+        "status": r.status,
+        "email_verified": r.verified_at is not None,
+        "requested_at": _iso(r.verified_at or r.requested_at),
+        "processed_by": str(getattr(processor, 'username', '')) if processor else None,
+        "processed_at": _iso(r.processed_at),
+        "decision_note": r.decision_note,
+    }
+
+
+async def _email_reset_code(to_email: str, username: str, code: str) -> None:
+    paragraphs = [
+        f"Someone asked to reset the access token for the Dilarion account @{username}.",
+        "Enter this code in Dilarion to continue. It expires in 15 minutes.",
+        "If this wasn't you, ignore this email. Nothing changes unless the code is used and your organization approves.",
+    ]
+    await _send_transactional_email(
+        to_email, "Your Dilarion verification code",
+        "Hello,\n\n" + "\n\n".join(paragraphs) + f"\n\nVerification code: {code}\n\nKind regards,\nThe Dilarion Team",
+        _email_template("Verify it's you", "Hello,", paragraphs, eyebrow="Account security",
+                        code_label="Verification code", code=code,
+                        after=["Never share this code. Dilarion staff will never ask for it."]),
+    )
+
+
+async def _notify_reset_approvers(db: Session, user: User, req: "PasswordResetRequest", request: Optional[Request]) -> None:
+    username = str(getattr(user, 'username', ''))
+    who = getattr(user, 'full_name', None) or username
+    data = {"request_id": req.id, "username": username, "full_name": getattr(user, 'full_name', None),
+            "reason": req.reason, "email_verified": req.verified_at is not None}
+    emails: Dict[str, str] = {}
+    for person in _reset_approvers(db, user):
+        sent = await ws_manager.send_to_user(person.id, {"type": "password_reset_requested", "data": data})
+        if not sent:
+            await push_to_user(db, person.id, "Access reset request", f"{who} can't sign in and asked for a new recovery code")
+        addr = (getattr(person, 'email', None) or "").strip()
+        if addr and _valid_email(addr):
+            emails[addr.lower()] = addr
+    org = db.query(Organization).filter(Organization.id == user.organization_id).first() if user.organization_id else None
+    if org and org.contact_email and _valid_email(org.contact_email):
+        emails.setdefault(org.contact_email.strip().lower(), org.contact_email.strip())
+    org_name = org.name if org else None
+    portal = os.getenv("DILARION_ORG_PORTAL_URL", os.getenv("DILARION_WEB_URL", "")).rstrip("/") or None
+    paragraphs = [
+        f"{who} (@{username}) can't sign in to Dilarion and has asked for a new recovery code.",
+        "They confirmed the request from a code sent to the email on their account. Approve it only if you're sure it's them. Approving emails them a new recovery code; nobody else sees it.",
+    ]
+    details = [("Staff member", f"{who} (@{username})"), ("Email", getattr(user, 'email', '') or "-"),
+               ("Reason", req.reason or "-")]
+    if org_name:
+        details.insert(0, ("Organization", org_name))
+    text = "Hello,\n\n" + "\n\n".join(paragraphs) + "\n\n" + "\n".join(f"{k}: {v}" for k, v in details)
+    for addr in emails.values():
+        asyncio.create_task(_send_transactional_email(
+            addr, f"Access reset request from {who}", text,
+            _email_template("Access reset request", "Hello,", paragraphs, eyebrow="Approval needed",
+                            details=details, cta_label="Review request" if portal else None, cta_url=portal),
+        ))
+
+
+@app.post("/auth/forgot-password/email-code")
+async def send_password_reset_email_code(
+    payload: PasswordResetEmailCode,
+    db: Session = Depends(get_database_session),
+):
+    """Step 1 without a recovery code: email a 6-digit code to the account."""
+    generic = {"message": "If that email is on a Dilarion account, we've sent it a code."}
+    user = _reset_user_by_email(db, payload.email)
+    if not user:
+        return generic
+    now = _naive_utc_now()
+    req = db.query(PasswordResetRequest).filter(
+        PasswordResetRequest.user_id == user.id, PasswordResetRequest.status == "verifying",
+    ).order_by(PasswordResetRequest.id.desc()).first()
+    sent_at = _as_naive_utc(getattr(req, 'email_code_sent_at', None)) if req else None
+    if sent_at and now - sent_at < RESET_CODE_RESEND_AFTER:
+        return generic   # a double tap doesn't send two codes
+    if req is None:
+        req = PasswordResetRequest(user_id=user.id, status="verifying", organization_id=user.organization_id)
+        db.add(req)
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    req.email_code_hash = _reset_code_digest(code)
+    req.email_code_sent_at = now
+    req.email_code_expires_at = now + RESET_CODE_TTL
+    req.email_code_attempts = 0
+    db.commit()
+    asyncio.create_task(_email_reset_code(str(user.email).strip(), str(user.username), code))
+    return generic
+
 
 @app.post("/auth/forgot-password")
 async def request_password_reset(
     payload: PasswordResetRequestCreate,
+    request: Request,
     db: Session = Depends(get_database_session),
 ):
-    generic_response = {"message": "If that phone number is registered, an administrator has been notified."}
+    """Step 2: with the emailed code, send the request for approval."""
+    email = (payload.email or "").strip().lower()
+    phone = (payload.phone_number or "").strip()
 
-    user = db.query(User).filter(User.phone_number == payload.phone_number, User.is_active == True).first()
+    if email:
+        bad_code = HTTPException(status_code=400, detail="That code is wrong or has expired. Request a new one.")
+        code = (payload.code or "").strip()
+        if not code:
+            raise HTTPException(status_code=422, detail="Enter the code we emailed you")
+        if not payload.confirm:
+            raise HTTPException(status_code=422, detail="Confirm that this is your account")
+        reason = (payload.reason or "").strip()
+        if len(reason) < 3:
+            raise HTTPException(status_code=422, detail="Tell your organization why you need a new access token")
+        user = _reset_user_by_email(db, email)
+        if not user:
+            raise bad_code
+        req = db.query(PasswordResetRequest).filter(
+            PasswordResetRequest.user_id == user.id, PasswordResetRequest.status == "verifying",
+        ).order_by(PasswordResetRequest.id.desc()).first()
+        if not req or not req.email_code_hash:
+            raise bad_code
+        expires = _as_naive_utc(req.email_code_expires_at)
+        if (req.email_code_attempts or 0) >= RESET_CODE_MAX_ATTEMPTS or not expires or expires < _naive_utc_now():
+            raise bad_code
+        if not hmac.compare_digest(req.email_code_hash, _reset_code_digest(code)):
+            req.email_code_attempts = (req.email_code_attempts or 0) + 1
+            db.commit()
+            raise bad_code
+        # One open request per person: a newer one replaces any still waiting.
+        db.query(PasswordResetRequest).filter(
+            PasswordResetRequest.user_id == user.id, PasswordResetRequest.status == "pending",
+            PasswordResetRequest.id != req.id,
+        ).update({"status": "superseded"}, synchronize_session=False)
+        req.status = "pending"
+        req.reason = reason
+        req.verified_at = _naive_utc_now()
+        req.email_code_hash = None
+        req.organization_id = user.organization_id
+        db.commit()
+        await _notify_reset_approvers(db, user, req, request)
+        AuditService.log_event(db, int(user.id), "password_reset_requested",
+                               f"{user.username} requested a new recovery code (email verified)")
+        return {"message": "Request sent. When it's approved, we'll email you a new recovery code."}
+
+    if not phone:
+        raise HTTPException(status_code=422, detail="Enter the email address on your account")
+    # Older apps: phone number, no email check. The request still needs approval.
+    generic_response = {"message": "If that phone number is registered, an administrator has been notified."}
+    user = db.query(User).filter(User.phone_number == phone, User.is_active == True).first()
     if not user:
         return generic_response
-
-    user_id = int(getattr(user, 'id', 0))
     existing = db.query(PasswordResetRequest).filter(
-        PasswordResetRequest.user_id == user_id,
-        PasswordResetRequest.status == "pending",
+        PasswordResetRequest.user_id == user.id, PasswordResetRequest.status == "pending",
     ).first()
     if existing:
         return generic_response
-
-    req = PasswordResetRequest(user_id=user_id, reason=payload.reason)
+    req = PasswordResetRequest(user_id=user.id, reason=payload.reason, status="pending",
+                               organization_id=user.organization_id)
     db.add(req)
     db.commit()
     db.refresh(req)
-
-    username = str(getattr(user, 'username', ''))
-    admins = db.query(User).filter(User.is_admin == True, User.is_active == True).all()
-    for admin in admins:
-        ws_sent = await ws_manager.send_to_user(admin.id, {
-            "type": "password_reset_requested",
-            "data": {"request_id": req.id, "username": username, "reason": payload.reason},
-        })
-        if not ws_sent:
-            await push_to_user(db, admin.id, "Password reset request", f"{username} can't log in and requested a reset")
-
-    AuditService.log_event(db, user_id, "password_reset_requested", f"{username} requested a password/token reset")
+    await _notify_reset_approvers(db, user, req, request)
+    AuditService.log_event(db, int(user.id), "password_reset_requested", f"{user.username} requested a password/token reset")
     return generic_response
+
+
+async def _decide_reset(db: Session, approver: User, request_id: int, approve: bool, note: Optional[str],
+                        background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    req = db.query(PasswordResetRequest).filter(PasswordResetRequest.id == request_id).first()
+    if not req or req.status == "verifying":
+        raise HTTPException(status_code=404, detail="Request not found")
+    if not _can_approve_reset(approver, req):
+        raise HTTPException(status_code=403, detail="You can't decide this request")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Request already {req.status}")
+    target = db.query(User).filter(User.id == req.user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User account no longer exists")
+
+    req.status = "approved" if approve else "denied"
+    req.processed_by_id = int(approver.id)
+    req.processed_at = _naive_utc_now()
+    req.decision_note = (note or "").strip() or None
+    emailed = False
+    if approve:
+        # A fresh recovery code, emailed only to the person: the approver never
+        # sees it. Their old code stops working; they reset with the new one.
+        code = _issue_recovery_code(target)
+        db.commit()
+        emailed = _queue_recovery_code_email(background_tasks, target, code, "your access reset request was approved")
+    else:
+        db.commit()
+        addr = (getattr(target, 'email', None) or "").strip()
+        if addr and _valid_email(addr):
+            paragraphs = ["Your request for a new Dilarion recovery code was not approved."]
+            if req.decision_note:
+                paragraphs.append(f"Note: {req.decision_note}")
+            paragraphs.append("If you still can't sign in, contact your organization's administrator.")
+            background_tasks.add_task(
+                _send_transactional_email, addr, "Your access reset request",
+                "Hello,\n\n" + "\n\n".join(paragraphs),
+                _email_template("Access reset request", "Hello,", paragraphs, eyebrow="Account security"))
+    await ws_manager.send_to_user(req.user_id, {
+        "type": "password_reset_approved" if approve else "password_reset_denied",
+        "data": {"request_id": req.id, "reason": req.decision_note},
+    })
+    AuditService.log_event(db, int(approver.id), "password_reset_approved" if approve else "password_reset_denied",
+                           f"Access reset for {target.username} {'approved: new recovery code emailed' if approve else 'denied'}")
+    return {"status": req.status, "username": str(target.username), "emailed": emailed,
+            "message": "A new recovery code was emailed to them." if approve else "Request denied."}
 
 
 class RecoveryCodeReset(BaseModel):
@@ -14760,25 +15007,11 @@ async def list_password_reset_requests(
 ):
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Admin only")
-    query = db.query(PasswordResetRequest)
+    query = db.query(PasswordResetRequest).filter(PasswordResetRequest.status.notin_(["verifying", "superseded"]))
     if status:
         query = query.filter(PasswordResetRequest.status == status)
     rows = query.order_by(PasswordResetRequest.requested_at.desc()).all()
-
-    result = []
-    for r in rows:
-        requester = db.query(User).filter(User.id == r.user_id).first()
-        processor = db.query(User).filter(User.id == r.processed_by_id).first() if r.processed_by_id else None
-        result.append({
-            "id": r.id,
-            "username": str(getattr(requester, 'username', '')) if requester else "unknown",
-            "phone_number": str(getattr(requester, 'phone_number', '')) if requester else None,
-            "reason": r.reason,
-            "status": r.status,
-            "requested_at": r.requested_at.isoformat() if r.requested_at else None,
-            "processed_by": str(getattr(processor, 'username', '')) if processor else None,
-            "processed_at": r.processed_at.isoformat() if r.processed_at else None,
-        })
+    result = [_reset_request_json(db, r) for r in rows]
     return {"requests": result, "count": len(result)}
 
 
@@ -14789,73 +15022,93 @@ async def approve_password_reset(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
 ):
-    """Approve a reset without exposing a credential to the administrator.
-    The user receives a one-time setup link over email and SMS."""
+    """Approve: the person is emailed a fresh recovery code (never shown here)."""
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Admin only")
-    admin_id = int(getattr(current_user, 'id', 0))
-
-    req = db.query(PasswordResetRequest).filter(PasswordResetRequest.id == request_id).first()
-    if not req:
-        raise HTTPException(status_code=404, detail="Request not found")
-    if req.status != "pending":
-        raise HTTPException(status_code=400, detail=f"Request already {req.status}")
-
-    target = db.query(User).filter(User.id == req.user_id).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="User account no longer exists")
-
-    invitation_code = secrets.token_urlsafe(32)
-    setattr(target, 'token', None)
-    setattr(target, 'password_hash', None)
-    setattr(target, 'invitation_token_hash', _invitation_digest(invitation_code))
-    setattr(target, 'invitation_expires_at', datetime.now(timezone.utc) + timedelta(hours=72))
-    setattr(target, 'invited_at', datetime.now(timezone.utc))
-    setattr(target, 'invitation_accepted_at', None)
-    setattr(req, 'status', 'approved')
-    setattr(req, 'processed_by_id', admin_id)
-    setattr(req, 'processed_at', datetime.now(timezone.utc))
-    db.commit()
-
-    # Every existing session for this account is now stale intentionally —
-    # a reset should log out anyone using the old (possibly compromised or
-    # simply forgotten) credential on every device.
-    db.query(UserSession).filter(UserSession.user_id == target.id).delete()
-    db.commit()
-
-    background_tasks.add_task(_deliver_invitation, int(target.id), invitation_code, "reset")
-
-    AuditService.log_event(db, admin_id, "password_reset_approved", f"Token reset for {target.username}, all sessions invalidated")
-    return {"status": "approved", "username": str(target.username), "message": "Private reset links were queued by email and SMS"}
+    return await _decide_reset(db, current_user, request_id, True, None, background_tasks)
 
 
 @app.post("/admin/password-reset-requests/{request_id}/deny")
 async def deny_password_reset(
     request_id: int,
     payload: PasswordResetDecision,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_database_session),
 ):
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Admin only")
-    admin_id = int(getattr(current_user, 'id', 0))
+    return await _decide_reset(db, current_user, request_id, False, payload.reason, background_tasks)
 
-    req = db.query(PasswordResetRequest).filter(PasswordResetRequest.id == request_id).first()
-    if not req:
-        raise HTTPException(status_code=404, detail="Request not found")
-    if req.status != "pending":
-        raise HTTPException(status_code=400, detail=f"Request already {req.status}")
 
-    setattr(req, 'status', 'denied')
-    setattr(req, 'processed_by_id', admin_id)
-    setattr(req, 'processed_at', datetime.now(timezone.utc))
-    db.commit()
+def _org_reset_rows(db: Session, org_id: int, status: Optional[str]):
+    q = db.query(PasswordResetRequest).join(User, User.id == PasswordResetRequest.user_id).filter(
+        User.organization_id == org_id,
+        PasswordResetRequest.status.notin_(["verifying", "superseded"]),
+    )
+    if status:
+        q = q.filter(PasswordResetRequest.status == status)
+    return q.order_by(PasswordResetRequest.requested_at.desc()).limit(200).all()
 
-    await ws_manager.send_to_user(req.user_id, {
-        "type": "password_reset_denied",
-        "data": {"request_id": req.id, "reason": payload.reason},
-    })
-    return {"status": "denied"}
+
+@app.get("/organization/password-reset-requests")
+async def organization_list_password_resets(
+    status: Optional[str] = Query(None),
+    current_user: User = Depends(get_organization_viewer),
+    db: Session = Depends(get_database_session),
+):
+    """Organization portal: this organization's staff asking for a new recovery code."""
+    rows = _org_reset_rows(db, int(current_user.organization_id), status)
+    return {"requests": [_reset_request_json(db, r) for r in rows]}
+
+
+@app.post("/organization/password-reset-requests/{request_id}/approve")
+async def organization_approve_password_reset(
+    request_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_organization_viewer),
+    db: Session = Depends(get_database_session),
+):
+    return await _decide_reset(db, current_user, request_id, True, None, background_tasks)
+
+
+@app.post("/organization/password-reset-requests/{request_id}/deny")
+async def organization_deny_password_reset(
+    request_id: int,
+    payload: PasswordResetDecision,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_organization_viewer),
+    db: Session = Depends(get_database_session),
+):
+    return await _decide_reset(db, current_user, request_id, False, payload.reason, background_tasks)
+
+
+# In the app: the organization account and staff with "manage_staff".
+@app.get("/organization/staff/password-reset-requests")
+async def org_app_list_password_resets(
+    status: Optional[str] = Query("pending"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    if not (_is_org_account(current_user) or _has_org_privilege(current_user, "manage_staff")):
+        raise HTTPException(status_code=403, detail="Organization admin access required")
+    org_id = _require_org_context(current_user)
+    return {"requests": [_reset_request_json(db, r) for r in _org_reset_rows(db, org_id, status)]}
+
+
+@app.post("/organization/staff/password-reset-requests/{request_id}/{decision}")
+async def org_app_decide_password_reset(
+    request_id: int,
+    decision: str,
+    background_tasks: BackgroundTasks,
+    payload: Optional[PasswordResetDecision] = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database_session),
+):
+    if decision not in ("approve", "deny"):
+        raise HTTPException(status_code=404, detail="Not found")
+    return await _decide_reset(db, current_user, request_id, decision == "approve",
+                               payload.reason if payload else None, background_tasks)
 
 
 @app.post("/messages/cleanup")
