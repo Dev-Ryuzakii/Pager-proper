@@ -5147,6 +5147,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Base1 Watch: unhandled errors, error logs and slow requests, linked to the
+# app session that caused them (X-Watch-Session). See watch_setup.py.
+from watch_setup import install_watch, set_watch_user
+install_watch(app, default_release=app.version)
+
 
 # ── Per-endpoint traffic metrics ─────────────────────────────────────────────
 #
@@ -5629,7 +5634,9 @@ async def _user_for_session_token(db: Session, token: str) -> User:
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security),
                           db: Session = Depends(get_database_session)) -> User:
     """Get current authenticated user"""
-    return await _user_for_session_token(db, credentials.credentials)
+    user = await _user_for_session_token(db, credentials.credentials)
+    set_watch_user(getattr(user, "username", None))
+    return user
 
 
 async def get_onboarding_user(
