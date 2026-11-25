@@ -1,5 +1,5 @@
 #!/bin/bash
-# READ-ONLY. Why can't a user read their OWN sent messages?
+# READ-ONLY. Why can't a user (or the people they message) read their sent messages?
 # Shows the user's device keys and, for their last sent DMs, which device
 # entries each message was encrypted for. Changes nothing.
 # On the server, from the repo folder:
@@ -57,4 +57,38 @@ for m in db.query(Message).filter(Message.sender_id == u.id).order_by(Message.id
           f"entries={len(keys)} his={own_txt} current_phone={'yes' if phone_ok else 'NO'}")
 print("\ncurrent_phone=NO means the message was never encrypted for the phone key he has now,"
       "\nso that phone can't open it (the recipient still can).")
+
+# ── Recipient side: can the people he writes to open his messages? ──
+print("\n=== RECIPIENTS of his last 30 DMs ===")
+sent = (db.query(Message).filter(Message.sender_id == u.id, Message.recipient_id.isnot(None))
+        .order_by(Message.id.desc()).limit(30).all())
+by_rcpt = {}
+for m in sent:
+    by_rcpt.setdefault(m.recipient_id, []).append(m)
+for rid, msgs in by_rcpt.items():
+    r = db.query(User).filter(User.id == rid).first()
+    if not r:
+        continue
+    rdevs = db.query(LinkedDevice).filter(LinkedDevice.user_id == rid).order_by(LinkedDevice.id).all()
+    ractive = {d.device_uuid: d for d in rdevs if not d.revoked_at}
+    rall = {d.device_uuid: d for d in rdevs}
+    print(f"\n@{r.username} ({r.full_name}) id={rid}  users.public_key key={fp(r.public_key)}")
+    if not rdevs:
+        print("  NO devices registered at all -> senders have no key for this person")
+    for d in rdevs:
+        state = "REVOKED " + str(d.revoked_at) if d.revoked_at else "active"
+        print(f"  {d.device_uuid[:8]}  {d.platform:8} {str(d.device_name or '')[:22]:22} key={fp(d.public_key)} "
+              f"created={d.created_at} last_seen={d.last_seen} {state}")
+    for m in msgs[:8]:
+        try:
+            keys = list(json.loads(m.encrypted_key).keys()) if (m.encrypted_key or "").startswith("{") else ["<single key>"]
+        except Exception:
+            keys = ["<unreadable>"]
+        cov = [k for k in keys if k in rall]
+        cov_txt = ", ".join(f"{k[:8]}({rall[k].platform}{'' if k in ractive else ', revoked'})" for k in cov) or "NONE"
+        by_name = "yes" if r.username in keys else "no"
+        print(f"    #{m.id} {m.timestamp} entries={len(keys)} for_recipient={cov_txt} by_username={by_name} "
+              f"current_device={'yes' if any(k in ractive for k in keys) else 'NO'}")
+print("\nfor_recipient=NONE / current_device=NO: the message was never encrypted for any key"
+      "\nthe recipient has now, so they see Decryption Failed.")
 PY
