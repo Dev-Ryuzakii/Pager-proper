@@ -2,25 +2,20 @@
 # READ-ONLY. Why can't a user read their OWN sent messages?
 # Shows the user's device keys and, for their last sent DMs, which device
 # entries each message was encrypted for. Changes nothing.
-# Run from your laptop (pass the username or email). Copy it up first so the
-# remote shell keeps a terminal for sudo:
-#   scp scripts/diagnose_sender_decrypt.sh cmdops@41.242.60.238:/tmp/ && ssh -t cmdops@41.242.60.238 'bash /tmp/diagnose_sender_decrypt.sh dombo'
+# On the server, from the repo folder:
+#   bash scripts/diagnose_sender_decrypt.sh dombo
 set -euo pipefail
-WHO="${1:?pass a username or email}"
+trap 'echo "!! stopped at line $LINENO: $BASH_COMMAND" >&2' ERR
+WHO="${1:?pass a username, email or part of a name}"
 
-SERVICE=pager_backend
-DIR=$(systemctl show "$SERVICE" -p WorkingDirectory --value)
-EXEC=$(systemctl show "$SERVICE" -p ExecStart --value | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)
-PY=$(dirname "$EXEC")/python
-[ -x "$PY" ] || PY="$DIR/venv/bin/python"
-ENVFILE=$(systemctl show "$SERVICE" -p EnvironmentFiles --value | awk '{print $1}')
-[ -n "$ENVFILE" ] || ENVFILE="$DIR/.env"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$DIR"
-set -a
-if [ -r "$ENVFILE" ]; then . "$ENVFILE"
-elif [ -f "$ENVFILE" ]; then sudo cat "$ENVFILE" > /tmp/.diag_env.$$; . /tmp/.diag_env.$$; rm -f /tmp/.diag_env.$$
-fi
-set +a
+PY=""
+for c in "$DIR/venv/bin/python" "$DIR/.venv/bin/python" "$DIR/env/bin/python"; do
+  [ -x "$c" ] && { PY="$c"; break; }
+done
+[ -n "$PY" ] || PY="$(command -v python3)"
+set -a; [ -f "$DIR/.env" ] && . "$DIR/.env"; set +a
 
 WHO="$WHO" "$PY" - <<'PY'
 import os, json, hashlib
