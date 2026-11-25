@@ -31,7 +31,8 @@ echo "== deps"
 "$PY" -m pip install -q -r requirements.txt
 
 echo "== schema (adds missing tables/columns, all nullable)"
-set -a; [ -f "$ENVFILE" ] && . "$ENVFILE"; set +a
+# No need to source .env: database_models.py loads it (load_dotenv), and
+# values with $ in them would break a shell `source`.
 "$PY" schema_sync.py --apply
 
 echo "== Base1 Watch env"
@@ -83,6 +84,7 @@ if [ -z "$restarted" ]; then
 fi
 
 echo "== health"
+PORT=$(grep -E '^PORT=' "$ENVFILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"\r ' || true)
 sleep 2
 curl -fsS -m 10 http://127.0.0.1:${PORT:-8000}/health 2>/dev/null && echo || \
   echo "(no answer on 127.0.0.1:${PORT:-8000}/health; check the logs above)"

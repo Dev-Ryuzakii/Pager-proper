@@ -15,7 +15,7 @@ for c in "$DIR/venv/bin/python" "$DIR/.venv/bin/python" "$DIR/env/bin/python"; d
   [ -x "$c" ] && { PY="$c"; break; }
 done
 [ -n "$PY" ] || PY="$(command -v python3)"
-set -a; [ -f "$DIR/.env" ] && . "$DIR/.env"; set +a
+# database_models.py loads .env itself (load_dotenv).
 
 WHO="$WHO" "$PY" - <<'PY'
 import os, json, hashlib
