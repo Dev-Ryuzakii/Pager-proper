@@ -147,6 +147,14 @@ def _generate_recovery_code() -> str:
     raw = secrets.token_hex(6).upper()
     return f"{raw[0:4]}-{raw[4:8]}-{raw[8:12]}"
 
+def _normalize_recovery_code(code: str) -> str:
+    """Accept the code as typed: any case, with or without dashes or spaces.
+    12 hex characters are put back into the stored XXXX-XXXX-XXXX form."""
+    raw = re.sub(r"[^0-9A-Za-z]", "", code or "").upper()
+    if len(raw) == 12:
+        return f"{raw[0:4]}-{raw[4:8]}-{raw[8:12]}"
+    return (code or "").strip().upper()
+
 def _issue_recovery_code(user: "User") -> str:
     """Generates a fresh recovery code, stores only its bcrypt hash on the
     user, and returns the plaintext for the caller to show/return exactly
@@ -14438,7 +14446,7 @@ async def reset_mastertoken_2fa_with_recovery_code(
     if not user_row:
         raise HTTPException(status_code=404, detail="User not found")
     if not user_row.recovery_code_hash or not verify_password(
-            payload.recovery_code.strip().upper(), user_row.recovery_code_hash):
+            _normalize_recovery_code(payload.recovery_code), user_row.recovery_code_hash):
         AuditService.log_event(db, user_id, "mastertoken_2fa_recovery_failed", "Wrong recovery code for 2FA reset")
         raise HTTPException(status_code=403, detail="Incorrect recovery code")
 
@@ -14975,10 +14983,20 @@ async def reset_with_recovery_code(
     existing session so a lost/stolen old token stops working immediately."""
     generic_error = HTTPException(status_code=400, detail="Invalid username or recovery code")
 
-    user = db.query(User).filter(User.username == payload.username, User.is_active == True).first()
+    # People reach this after an emailed approval and often don't know the
+    # exact case of their username ("Dele" vs "dele"), so match it without
+    # case, and accept the account email in the same field.
+    ident = (payload.username or "").strip().lower()
+    if not ident:
+        raise generic_error
+    user_q = db.query(User).filter(User.is_active == True)
+    if "@" in ident:
+        user = user_q.filter(func.lower(User.email) == ident).first()
+    else:
+        user = user_q.filter(func.lower(User.username) == ident).first()
     if not user or not user.recovery_code_hash:
         raise generic_error
-    if not verify_password(payload.recovery_code.strip().upper(), user.recovery_code_hash):
+    if not verify_password(_normalize_recovery_code(payload.recovery_code), user.recovery_code_hash):
         raise generic_error
 
     # New credentials are hashed. Unlike the legacy plaintext User.token
@@ -14999,11 +15017,11 @@ async def reset_with_recovery_code(
     db.commit()
 
     AuditService.log_event(db, int(getattr(user, 'id', 0)), "self_password_reset",
-                           f"{payload.username} self-reset their password via recovery code")
+                           f"{user.username} self-reset their password via recovery code")
     monitor_record_event("auth", "self_reset", user_id=int(getattr(user, 'id', 0)))
 
     _queue_recovery_code_email(background_tasks, user, new_recovery_code, "login token reset with recovery code")
-    return {"username": payload.username, "recovery_code": new_recovery_code}
+    return {"username": str(user.username), "recovery_code": new_recovery_code}
 
 
 @app.post("/users/me/recovery-code/regenerate")
