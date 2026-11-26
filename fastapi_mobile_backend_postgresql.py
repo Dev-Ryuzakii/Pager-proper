@@ -9207,6 +9207,26 @@ async def _send_meeting_card(
             await push_to_user(db, recipient_id, "Meeting", f"{sender_username} scheduled a meeting", sound="beep.caf")
 
 
+async def _send_meeting_card_in_background(
+    sender_id: int,
+    sender_username: str,
+    meeting_payload: dict,
+    group_id: Optional[int],
+    dm_usernames: List[str],
+):
+    """_send_meeting_card with its own DB session, for use after the response."""
+    db = next(get_database_session())
+    try:
+        await _send_meeting_card(
+            db, sender_id, sender_username, meeting_payload,
+            group_id=group_id, dm_usernames=dm_usernames,
+        )
+    except Exception as e:
+        logger.warning(f"Meeting card delivery failed (meeting_id={meeting_payload.get('meeting_id')}): {e}")
+    finally:
+        db.close()
+
+
 @app.post("/copilot/parse-schedule")
 async def copilot_parse_schedule(
     payload: CopilotScheduleRequest,
@@ -9582,8 +9602,12 @@ async def create_meeting(
         db.add(MeetingParticipant(meeting_id=meeting.id, user_id=uid))
     db.commit()
 
-    await _send_meeting_card(
-        db, creator_id, str(getattr(current_user, 'username', '')),
+    # Invitee cards and pushes go out after the response. Sending them first
+    # made the app wait on one push per offline invitee, and it gave up with
+    # "Can't reach the server" even though the meeting was already saved.
+    background_tasks.add_task(
+        _send_meeting_card_in_background,
+        creator_id, str(getattr(current_user, 'username', '')),
         {
             "kind": "scheduled",
             "meeting_id": meeting.id,
@@ -9592,8 +9616,8 @@ async def create_meeting(
             "scheduled_at": _iso(meeting.scheduled_at),
             "duration_minutes": meeting.duration_minutes,
         },
-        group_id=payload.group_id,
-        dm_usernames=payload.invitee_usernames,
+        payload.group_id,
+        list(payload.invitee_usernames or []),
     )
 
     await _fire_webhooks(db, "meeting.scheduled", {
