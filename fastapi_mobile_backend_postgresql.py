@@ -6995,6 +6995,83 @@ async def admin_list_organizations(
     } for org in organizations]
 
 
+class AdminDeleteOrganization(BaseModel):
+    confirm_name: str = Field(..., min_length=1, max_length=255,
+                              description="The organization's name, typed again to confirm")
+
+
+@app.delete("/admin/organizations/{organization_id}")
+async def admin_delete_organization(
+    organization_id: int,
+    payload: AdminDeleteOrganization = Body(...),
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_database_session),
+):
+    """Permanently delete an organization, approved or not, with every account
+    in it (staff and its organization account) and all their data. Each
+    account goes through AdminService.delete_user, the same full purge as
+    deleting one user. Records that only point at the organization are removed
+    (announcements, access requests, reset requests) or detached (groups
+    created by someone outside it, uptime targets/events).
+
+    Accounts are deleted one at a time and each commits on its own. If one
+    fails, the ones before it stay deleted and the organization remains, so
+    running the delete again finishes the job."""
+    org = db.query(Organization).filter(Organization.id == organization_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if payload.confirm_name.strip().lower() != str(org.name or "").strip().lower():
+        raise HTTPException(status_code=400, detail="Type the organization's name exactly to confirm")
+    admin_id = int(current_user.id)
+    if getattr(current_user, "organization_id", None) == org.id:
+        raise HTTPException(status_code=400, detail="You can't delete the organization your own account belongs to")
+
+    org_name = str(org.name)
+    members = db.query(User.id, User.phone_number).filter(User.organization_id == org.id).all()
+    deleted_users = 0
+    for member_id, phone in members:
+        # Cut off live sockets first; delete_user removes sessions and devices.
+        try:
+            await ws_manager.disconnect_user(int(member_id))
+        except Exception as e:
+            logger.warning(f"disconnect before org delete failed for user {member_id}: {e}")
+        try:
+            AdminService.delete_user(db, admin_id, str(phone))
+            deleted_users += 1
+        except HTTPException as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Deleted {deleted_users} of {len(members)} accounts, then failed: {e.detail}. "
+                       "Run the delete again to finish.",
+            )
+
+    try:
+        db.query(Group).filter(Group.organization_id == org.id).update(
+            {"organization_id": None}, synchronize_session=False)
+        db.query(OrgAnnouncement).filter(OrgAnnouncement.organization_id == org.id).delete(synchronize_session=False)
+        db.query(OrganizationAccessRequest).filter(
+            OrganizationAccessRequest.organization_id == org.id).delete(synchronize_session=False)
+        db.query(PasswordResetRequest).filter(
+            PasswordResetRequest.organization_id == org.id).delete(synchronize_session=False)
+        db.query(ServiceEvent).filter(ServiceEvent.organization_id == org.id).update(
+            {"organization_id": None}, synchronize_session=False)
+        db.query(UptimeTarget).filter(UptimeTarget.organization_id == org.id).update(
+            {"organization_id": None}, synchronize_session=False)
+        db.flush()
+        db.delete(org)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Delete organization {organization_id} failed after removing its accounts: {e}")
+        raise HTTPException(status_code=500, detail=f"Accounts were deleted but the organization could not be: {e}")
+
+    AuditService.log_event(db, admin_id, "admin_delete_organization",
+                           f"Organization '{org_name}' (id {organization_id}) and {deleted_users} account(s) permanently deleted",
+                           severity="warning")
+    logger.info(f"Organization deleted by admin {admin_id}: {org_name} ({deleted_users} accounts)")
+    return {"deleted": True, "organization": org_name, "accounts_deleted": deleted_users}
+
+
 @app.post("/admin/organizations", status_code=201)
 async def admin_create_organization(
     payload: AdminCreateOrganization,
