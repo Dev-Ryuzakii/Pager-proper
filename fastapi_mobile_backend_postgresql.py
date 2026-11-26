@@ -5795,10 +5795,50 @@ async def create_ws_ticket(response: Response,
                            current_user: User = Depends(get_current_user),
                            db: Session = Depends(get_database_session)):
     session = SessionService.validate_session(db, credentials.credentials)
+    if not session:
+        session = _linked_device_session(db, credentials.credentials, int(current_user.id))
     if not session or session.user_id != current_user.id:
         raise HTTPException(status_code=401, detail="Invalid session")
     response.headers["Cache-Control"] = "no-store"
     return {"ticket": _make_ws_ticket(session), "expires_in": 30}
+
+
+def _linked_device_session(db: Session, token: str, user_id: int) -> Optional[UserSession]:
+    """A device signed in by QR link holds a LinkedDevice token, not a
+    UserSession. HTTP accepts that token, but WebSocket tickets are signed from
+    a UserSession, so without one the ticket request failed with 401 and the
+    desktop signed itself out ("session expired") right after linking.
+    While the linked device is not revoked, keep a UserSession for its token."""
+    device = db.query(LinkedDevice).filter(
+        LinkedDevice.session_token == token,
+        LinkedDevice.user_id == user_id,
+        LinkedDevice.revoked_at.is_(None),
+    ).first()
+    if not device:
+        return None
+    expires = datetime.now(timezone.utc) + timedelta(hours=24)
+    row = db.query(UserSession).filter(UserSession.session_token == token).first()
+    if row:
+        if int(row.user_id) != user_id:
+            return None
+        row.is_active = True
+        row.expires_at = expires
+        row.logout_reason = None
+    else:
+        row = UserSession(
+            user_id=user_id,
+            session_token=token,
+            session_type="linked_device",
+            expires_at=expires,
+            is_active=True,
+            device_id=str(device.device_uuid),
+            device_name=(device.device_name or None),
+            platform=(device.platform or None),
+        )
+        db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
 
 
 @app.websocket("/ws")
