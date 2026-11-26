@@ -17751,7 +17751,26 @@ async def upload_raw_media(
         db.refresh(media)
         
         logger.info(f"📤 Raw media uploaded: {sender_id} → {recipient.id} ({unique_filename})")
-        
+
+        # Tell the recipient right away, same as /messages/send does for text.
+        # Without this, pictures, documents and voice notes only showed up after
+        # the recipient left the chat and came back.
+        try:
+            sender_username = str(getattr(current_user, 'username', ''))
+            fanout = self_dm.dm_fanout(sender_username, username, str(message.content_type or "media/raw"))
+            ws_sent = await ws_manager.send_to_user(int(recipient.id), {
+                "type": "new_message",
+                "data": {
+                    "message_id": int(message.id),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    **fanout["ws"],
+                },
+            })
+            if fanout["push"] and not ws_sent:
+                await push_to_user(db, int(recipient.id), "New message", "You have a new message", sound="beep.caf")
+        except Exception as e:
+            logger.warning(f"media new_message notify failed for message {message.id}: {e}")
+
         # Create success response with file info
         response = {
             "media_id": unique_filename,
